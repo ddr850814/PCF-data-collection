@@ -256,6 +256,8 @@ class Projector:
         # Page transform, set by fit():
         self.scale = 1.0
         self.offset = (0.0, 0.0)
+        # 偏心变径正算出口带动小端侧管线的图面平移（世界坐标键）。
+        self.point_offsets: dict[Vec3, Vec2] = {}
 
     def set_skew(self, degrees: float) -> None:
         """Tilt the plan diagonal that projects vertical by ``degrees``.
@@ -298,9 +300,13 @@ class Projector:
         cy = (max(ys) + min(ys)) / 2 if ys else 0.0
         self.offset = (rx + rw / 2 - cx * self.scale, ry + rh / 2 - cy * self.scale)
 
-    def page(self, p: Vec3) -> Vec2:
+    def page(self, p: Vec3, *, apply_offset: bool = True) -> Vec2:
         sx, sy = self.raw(p)
-        return (sx * self.scale + self.offset[0], sy * self.scale + self.offset[1])
+        page = (sx * self.scale + self.offset[0], sy * self.scale + self.offset[1])
+        if apply_offset:
+            dx, dy = self.point_offsets.get(p, (0.0, 0.0))
+            page = (page[0] + dx, page[1] + dy)
+        return page
 
     def north_arrow_angle(self) -> float:
         """Screen angle (degrees, CCW from +x) of the north direction."""
@@ -1082,6 +1088,10 @@ def render_pdf(
     draw_centre = (draw_region[0] + draw_region[2] / 2,
                    draw_region[1] + draw_region[3] / 2)
 
+    # 正算偏心变径后，小端连通侧整体接到符号 EXIT；变径自身不偏移。
+    projector.point_offsets = _eccentric_small_side_offsets(
+        projector, doc, comps, reducer_runs)
+
     # ---- symbol pass -----------------------------------------------------
     flange_face_pts = _flange_faces(doc)
     _FLANGE_BANDS.clear()      # 每张图重置接带注册表（焊点吸附用）
@@ -1102,7 +1112,8 @@ def render_pdf(
             anchors[idx] = anchor
 
     if equip_recs:
-        _draw_equipment_connections(canvas, projector, equip_recs, comps)
+        _draw_equipment_connections(canvas, projector, equip_recs, comps,
+                                    draw_centre)
 
     # ---- welds (dots only) ------------------------------------------------
     # The numbered balloons are drawn as an overlay layer by the weld-tracking
@@ -1594,6 +1605,77 @@ def _reducer_runs(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     return out
 
 
+def _eccentric_small_side_offsets(
+        proj: Projector, doc: PcfDocument,
+        comps: list[tuple[Component, str | None]],
+        runs: dict[int, tuple[Vec3, Vec3]]) -> dict[Vec3, Vec2]:
+    """正算偏心变径出口带动小端连通侧的图面平移。
+
+    符号保持 4.5 mm 大端和口径比小端；小端侧后续管线整体平移到正算
+    EXIT，不画折线连接。变径自身不偏移，尺寸/BOM 仍取真实模型值。
+    """
+    from .asc_symbols import find_symbol_full
+
+    real = [comp for comp, _ref in comps]
+    tol = geometry.model_tolerance(doc)
+    graph = geometry.ConnectivityGraph(real, tol)
+    offsets: dict[Vec3, Vec2] = {}
+    for idx, comp in enumerate(real):
+        if ("ECCENTRIC" not in comp.type.upper()
+                or len(comp.end_points) < 2 or id(comp) not in runs):
+            continue
+        first, last = comp.end_points[0], comp.end_points[1]
+        if not first.bore or not last.bore or first.bore <= last.bore:
+            continue
+        found = find_symbol_full(comp.skey or "")
+        if not found:
+            continue
+        sym, _orient, stop = found
+        if not stop or abs(stop[1]) <= 1e-9:
+            continue
+        ys = [c for seg in sym for c in (seg[1], seg[3])]
+        big_half = (max(ys) - min(ys)) / 2.0
+        small_half = big_half * last.bore / first.bore
+        centre = math.copysign(big_half - small_half, stop[1])
+        p0 = proj.page(first.xyz, apply_offset=False)
+        p1 = proj.page(last.xyz, apply_offset=False)
+        a = proj.page(runs[id(comp)][0], apply_offset=False)
+        b = proj.page(runs[id(comp)][1], apply_offset=False)
+        run = _v2_sub(b, a)
+        ln = _v2_len(run)
+        if ln <= 1e-9:
+            continue
+        u = (run[0] / ln, run[1] / ln)
+        diff = _v2_sub(p1, p0)
+        if u[0] * diff[0] + u[1] * diff[1] < 0:
+            u = (-u[0], -u[1])
+        run3 = tuple(last.xyz[i] - first.xyz[i] for i in range(3))
+        v = _across_v(proj, run3, first.xyz, u) or _v2_perp(u)
+        d = (diff[0] * u[0] + diff[1] * u[1]) or _v2_len(diff)
+        sx = (1.0 if stop[0] > 0 else -1.0) * d / abs(stop[0])
+        sy = 4.5 / (2.0 * big_half)
+        exit_pt = (p0[0] + stop[0] * sx * u[0] + centre * sy * v[0],
+                   p0[1] + stop[0] * sx * u[1] + centre * sy * v[1])
+        delta = _v2_sub(exit_pt, p1)
+        if _v2_len(delta) <= 0.001:
+            continue
+        starts = [j for j in graph.adjacency.get(idx, ())
+                  if any(geometry.dist(pt.xyz, last.xyz) <= tol * 4
+                         for pt in real[j].connection_points())]
+        seen = set(starts)
+        stack = list(starts)
+        while stack:
+            current = stack.pop()
+            for nxt in graph.adjacency.get(current, ()):
+                if nxt != idx and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        for j in seen:
+            for pt in real[j].all_points():
+                offsets[pt.xyz] = delta
+    return offsets
+
+
 def _eccentric_offset_pairs(doc: PcfDocument,
                             runs: dict[int, tuple[Vec3, Vec3]],
                             ) -> list[set[tuple[float, float]]]:
@@ -1718,8 +1800,45 @@ def _flange_faces(doc: PcfDocument) -> dict[int, Vec3]:
     return faces
 
 
+def _draw_nozzle_tag(canvas: _Canvas, anchor: Vec2, ref: str,
+                     draw_centre: Vec2) -> None:
+    """设备管口信息块：CONNECTION-REFERENCE 拆成"管口号/连接信息"两行。
+
+    PCF 的 CONNECTION-REFERENCE 形如 ``P39004/Suction$80 mm RFFE 150``：
+    ``$`` 前是 设备号/管口号，后是 尺寸 连接型式 压力等级。画成带边框的
+    两行块并引线指向管口，先于尺寸/球标放置并注册进避让集合。
+    """
+    tag, _, info = ref.partition("$")
+    lines = [tag.strip()]
+    if info.strip():
+        lines.append(info.strip())
+    if not lines[0]:
+        return
+    size = 4.5
+    canvas.pdf.set_font("Helvetica", size=size)
+    cap = _cap_height_mm(size)
+    pad = 0.6
+    line_h = cap * 1.45
+    box_w = max(canvas.pdf.get_string_width(t) for t in lines) + 2 * pad
+    box_h = len(lines) * line_h + 2 * pad
+    pos = canvas.place_label(anchor, box_w, box_h, draw_centre,
+                             min_leader=4.0, avoid_geometry=True,
+                             clearance=0.6)
+    edge = _box_edge_toward(pos, anchor, box_w, box_h)
+    canvas.line(anchor, edge, width=0.15)
+    with canvas.pdf.local_context():
+        canvas.pdf.set_fill_color(255, 255, 255)
+        canvas.pdf.set_line_width(0.25)
+        canvas.pdf.rect(pos[0] - box_w / 2, pos[1] - box_h / 2,
+                        box_w, box_h, style="DF")
+    top = pos[1] - box_h / 2 + pad + cap
+    for i, text in enumerate(lines):
+        canvas.text((pos[0], top + i * line_h), text, size=size)
+
+
 def _draw_equipment_connections(canvas: _Canvas, proj: Projector,
-                                equip_recs: list, comps: list) -> None:
+                                equip_recs: list, comps: list,
+                                draw_centre: Vec2) -> None:
     """设备管口：官方 NZ 符号以虚线画在设备侧，法兰面落在连接点。"""
     ends: list[tuple[Vec2, Vec2, Vec3, Vec3]] = []   # (端点, 来向, 3D 端, 3D 来向)
     for comp, _ref in comps:
@@ -1784,6 +1903,9 @@ def _draw_equipment_connections(canvas: _Canvas, proj: Projector,
         _draw_symbol_2pt(canvas, skey, p0, nz, proj=proj,
                          run3=run3, wp=we, across=across, height_mm=h,
                          width=0.3, dashed=True)
+        # 管口信息块：锚在设备侧颈端，引线指向管口本体
+        if ref:
+            _draw_nozzle_tag(canvas, p0, ref, draw_centre)
 
 
 def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
@@ -1795,7 +1917,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     reducer_runs: dict[int, tuple[Vec3, Vec3]] | None = None,
                     ) -> Vec2 | None:
     cls = classify(comp.type)
-    eps = [proj.page(p.xyz) for p in comp.end_points]
+    eccentric = cls == "REDUCER" and "ECCENTRIC" in comp.type.upper()
+    eps = [proj.page(p.xyz, apply_offset=not eccentric) for p in comp.end_points]
     cps = [proj.page(p.xyz) for p in comp.centre_points]
     b1s = [proj.page(p.xyz) for p in comp.branch1_points]
     b2s = [proj.page(p.xyz) for p in comp.branch2_points]
@@ -1871,11 +1994,17 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     if ax[0] * diff0[0] + ax[1] * diff0[1] < 0:
                         ax = (-ax[0], -ax[1])
                     axis_override = ax
+        bore_ratio = None
+        if cls == "REDUCER" and "ECCENTRIC" in comp.type.upper():
+            bore0, bore1 = ep3[0].bore, ep3[1].bore
+            if bore0 and bore1 and bore0 > bore1:
+                bore_ratio = bore1 / bore0
         if _draw_symbol_2pt(canvas, comp.skey, sp0, sp1,
                             proj=proj, run3=run3, axis=axis_override,
                             wp=ep3[0].xyz if ep3 else None,
                             drop_isolated=(cls == "REDUCER"
-                                           and not (b1s or b2s))):
+                                           and not (b1s or b2s)),
+                            bore_ratio=bore_ratio):
             return cps[0] if cps else _v2_mid(eps[0], eps[1])
 
     face_pt = (flange_face_pts or {}).get(id(comp))
@@ -1904,9 +2033,9 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     wp = comp.co_ords[0].xyz
                     axis = max(range(3), key=lambda i: abs(dw[i]))
                     across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
-                    a2 = proj.page(wp)
+                    a2 = proj.page(wp, apply_offset=False)
                     b2 = proj.page((wp[0] + across[0], wp[1] + across[1],
-                                    wp[2] + across[2]))
+                                    wp[2] + across[2]), apply_offset=False)
                     vn = (b2[0] - a2[0]) ** 2 + (b2[1] - a2[1]) ** 2
                     if vn > 1e-12:
                         vn = vn ** 0.5
@@ -2297,8 +2426,11 @@ def _across_v(proj: "Projector | None", run3: tuple | None,
         return None
     axis = max(range(3), key=lambda i: abs(run3[i]))
     across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
-    a2 = proj.page(wp)
-    b2 = proj.page((wp[0] + across[0], wp[1] + across[1], wp[2] + across[2]))
+    # 点偏移只平移最终图面位置；方向两点必须同时取原始投影，
+    # 否则单侧偏移会被误算成旋转（法兰端面因此竖直）。
+    a2 = proj.page(wp, apply_offset=False)
+    b2 = proj.page((wp[0] + across[0], wp[1] + across[1], wp[2] + across[2]),
+                   apply_offset=False)
     dx, dy = b2[0] - a2[0], b2[1] - a2[1]
     ln = (dx * dx + dy * dy) ** 0.5
     if ln <= 1e-12:
@@ -2317,7 +2449,8 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      width: float = 0.4,
                      height_mm: float = 4.5,
                      across: Vec2 | None = None,
-                     dashed: bool = False) -> bool:
+                     dashed: bool = False,
+                     bore_ratio: float | None = None) -> bool:
     """SKEY 符号库双接点对齐绘制（ASC 优先 → skeys.json 官方库）。
 
     符号 START(首点) → p0，EXIT(收笔点) → p1。符号 X 轴直接映射管轴 u
@@ -2325,11 +2458,9 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     u=p0→p1。横向 v 默认取"垂直于管轴的世界轴"的图面投影（等轴测 30°
     斜向族，与支撑符号同规则）；调用方可用 across 直接指定横向方向
     （设备管口符号与管线法兰杠同用 _iso_cross_dir，保证法兰面对齐同一
-    斜向族）。符号整体高度（Y 跨度）固定 height_mm；axis 分支（大小头）
-    在此基础上加 X 方向线性
-    渐变剪切 s=(R-stop_y·sy·v)/span，R=页面残差=模型偏心投影——端面线
-    仍沿轴测斜向族，小端整体向偏心方向平移，EXIT 恒等落在 p1，出口管道
-    从小端接出，偏心方向由端点自带。
+    斜向族）。符号整体高度（Y 跨度）固定 height_mm；偏心大小头按口径比
+    正算小端高度和偏心量，X 基始终沿主管轴，平齐底边保持平行。小端侧
+    管线由 Projector.point_offsets 整体接到正算出口，不画折线连接。
     未查到符号或几何退化时返回 False，调用方走手写回退分支。
     drop_isolated：剔除与任何其他腿不共端点的孤立腿——大小头的 tap 标记
     线（支管接入位置指示，RE** 中部短竖线），PCF 无 BRANCH-POINT 时不画
@@ -2343,6 +2474,29 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     if not found:
         return False
     sym, orient, stop = found
+    if (axis is not None and bore_ratio is not None and stop
+            and 0.0 < bore_ratio < 1.0 and abs(stop[1]) > 1e-9):
+        # 偏心变径正算：大端全高固定 height_mm，小端全高=大端×口径比，
+        # 小端中心偏移=(大端高-小端高)/2。保留 RE** 轮廓与平齐边，
+        # 不用页面端点残差反推高度。
+        ys0 = [c for seg in sym for c in (seg[1], seg[3])]
+        big_half = (max(ys0) - min(ys0)) / 2.0
+        small_half = big_half * bore_ratio
+        centre = math.copysign(big_half - small_half, stop[1])
+        if centre < 0:
+            small_bottom, small_top = -big_half, centre + small_half
+        else:
+            small_bottom, small_top = centre - small_half, big_half
+        x1 = stop[0]
+        x2 = max(c for seg in sym for c in (seg[0], seg[2]))
+        sym = [
+            (0.0, -big_half, 0.0, big_half),
+            (0.0, big_half, x1, small_top),
+            (x1, small_top, x2, small_bottom),
+            (x2, small_bottom, 0.0, -big_half),
+            *sym[4:],
+        ]
+        stop = (x1, centre)
     diff = _v2_sub(p1, p0)
     d = (diff[0] * diff[0] + diff[1] * diff[1]) ** 0.5
     # 轴向跨度取收笔点的 X 分量：偏心大小头（RE** EXIT=(548,-136)）的
@@ -2377,22 +2531,12 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     # 符号基向量：P = p0 + x·bx + y·by（普通符号 bx=sx·u, by=sy·v）
     bx = (sx * u[0], sx * u[1])
     by = (sy * v[0], sy * v[1])
-    if axis is not None:
-        # 偏心大小头剪切画法：模型偏心可以在任意世界方向（X/Y/Z），若把
-        # 符号横向扭到偏心方向，端面线就脱离轴测斜向族（图面竖直端面很
-        # 突兀）。改为保持端面线沿跨管世界轴投影，偏心由 X 方向的线性
-        # 渐变剪切表达——腰线不对称、小端整体向偏心方向平移，正是模型
-        # 投影的仿射像（直线仍映成直线）：
-        #   P = p0 + x·(sx·u + s) + y·sy·v，s = (R - stop_y·sy·v)/span
-        # 其中 R = diff - d·u 是页面残差 = 模型偏心的真实投影。EXIT 恒等：
-        #   p0 + span·(sx·u + s) + stop_y·sy·v = p0 + d·u + R = p1
-        # 出口管道正好从小端接出，端面方向不受偏心方向影响。
-        stop_y = stop[1] if stop else 0.0
+    if axis is not None and abs(stop[1]) <= 1e-9:
+        # 同心符号仅校正轴向数值残差；偏心符号不做任何 X 剪切，
+        # bx=sx·u、by=sy·v，平齐边自然与主管平行。
         rx = diff[0] - d * u[0]
         ry = diff[1] - d * u[1]
-        shx = (rx - stop_y * sy * v[0]) / span
-        shy = (ry - stop_y * sy * v[1]) / span
-        bx = (bx[0] + shx, bx[1] + shy)
+        bx = (bx[0] + rx / span, bx[1] + ry / span)
     x0, y0 = p0
     if drop_isolated and len(sym) > 1:
         # 孤立腿 = 与其他任何腿都不共端点的腿：轮廓腿围成闭环共端点，
@@ -2415,12 +2559,14 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
             sym = kept
     draw = canvas.dashed if dashed else canvas.line
     for x1, y1, x2, y2 in sym:
+        # 虚线符号（设备管口）是实体几何：记入 segments，尺寸放置与
+        # 球标布线才会避让——否则 goalpost 直接压在管口符号上。
         draw(
             (x0 + x1 * bx[0] + y1 * by[0],
              y0 + x1 * bx[1] + y1 * by[1]),
             (x0 + x2 * bx[0] + y2 * by[0],
              y0 + x2 * bx[1] + y2 * by[1]),
-            width=width)
+            width=width, record=True)
     return True
 
 
@@ -2701,6 +2847,31 @@ def _segs_cross(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool:
     return False
 
 
+def _segs_close(a: Vec2, b: Vec2, c: Vec2, d: Vec2, tol: float = 0.35) -> bool:
+    """True when the segments pass within ``tol`` mm of each other.
+
+    ``_segs_cross`` misses the skew-past-an-endpoint case -- a goalpost
+    whose tip grazes a nozzle stroke at 0.05mm without either segment
+    crossing the other's line. This tests true minimum distance with a
+    bounding-box prefilter, so the per-candidate cost stays bounded.
+    """
+    if (max(a[0], b[0]) + tol < min(c[0], d[0])
+            or max(c[0], d[0]) + tol < min(a[0], b[0])
+            or max(a[1], b[1]) + tol < min(c[1], d[1])
+            or max(c[1], d[1]) + tol < min(a[1], b[1])):
+        return False
+
+    def pt_seg(p: Vec2, s: Vec2, e: Vec2) -> float:
+        se = _v2_sub(e, s)
+        length = _v2_len(se) or 1e-9
+        v = _v2_sub(p, s)
+        t = max(0.0, min(1.0, (v[0] * se[0] + v[1] * se[1]) / (length * length)))
+        return _v2_len(_v2_sub(p, _v2_add(s, _v2_scale(se, t))))
+
+    return (pt_seg(c, a, b) <= tol or pt_seg(d, a, b) <= tol
+            or pt_seg(a, c, d) <= tol or pt_seg(b, c, d) <= tol)
+
+
 def _seg_hits_box(p: Vec2, q: Vec2,
                   box: tuple[float, float, float, float]) -> bool:
     bx, by, bw, bh = box
@@ -2855,7 +3026,8 @@ def _score_dim_geometry(canvas: _Canvas, geom: dict, away: Vec2) -> float:
         if _seg_hits_box(seg[0], seg[1], geom["text_box"]):
             score += 2.0
         for e in geom["ext"]:
-            if _segs_cross(e[0], e[1], seg[0], seg[1]):
+            if (_segs_cross(e[0], e[1], seg[0], seg[1])
+                    or _segs_close(e[0], e[1], seg[0], seg[1])):
                 score += 1.0
         if edge is not None and _segs_cross(edge, geom["leader"], seg[0], seg[1]):
             score += 1.0
@@ -2905,9 +3077,58 @@ def _plan_best_dim(canvas: _Canvas, proj: Projector, p3a: Vec3, p3b: Vec3,
     return best, best_score
 
 
+def _goalpost_pieces(a: Vec2, b: Vec2,
+                     segments: list[tuple[Vec2, Vec2]]) -> list[tuple[Vec2, Vec2]]:
+    """Trim a goalpost against near-parallel strokes it would duplicate.
+
+    An equipment nozzle's face bar is centred on the gasket face -- exactly
+    where a "to equipment face" dimension's endpoint sits -- and often runs
+    the same direction as that end's goalpost. Drawing both puts two lines
+    0.05mm apart on the sheet. The bar already serves as the extension
+    line, so the goalpost draws only the part the bar does not cover.
+    Perpendicular structures (pipes, elbow legs) are never parallel enough
+    to trim, so ordinary goalposts pass through untouched.
+    """
+    ab = _v2_sub(b, a)
+    length = _v2_len(ab)
+    if length <= 1e-6:
+        return [(a, b)]
+    u = (ab[0] / length, ab[1] / length)
+    cuts: list[tuple[float, float]] = []
+    for s, e in segments:
+        se = _v2_sub(e, s)
+        sl = _v2_len(se)
+        if sl <= 1e-6:
+            continue
+        v = (se[0] / sl, se[1] / sl)
+        if abs(u[0] * v[0] + u[1] * v[1]) < 0.98:
+            continue                      # not near-parallel
+        if not _segs_close(a, b, s, e, 0.3):
+            continue                      # not alongside it
+        t1 = (s[0] - a[0]) * u[0] + (s[1] - a[1]) * u[1]
+        t2 = (e[0] - a[0]) * u[0] + (e[1] - a[1]) * u[1]
+        lo, hi = min(t1, t2), max(t1, t2)
+        if hi > 0.1 and lo < length - 0.1:
+            cuts.append((max(lo, 0.0), min(hi, length)))
+    if not cuts:
+        return [(a, b)]
+    cuts.sort()
+    pieces: list[tuple[Vec2, Vec2]] = []
+    start = 0.0
+    for lo, hi in cuts:
+        if lo > start + 0.1:
+            pieces.append((_v2_add(a, _v2_scale(u, start)),
+                           _v2_add(a, _v2_scale(u, lo))))
+        start = max(start, hi)
+    if start < length - 0.1:
+        pieces.append((_v2_add(a, _v2_scale(u, start)), b))
+    return pieces
+
+
 def _render_dim(canvas: _Canvas, geom: dict) -> None:
     for e in geom["ext"]:
-        canvas.line(e[0], e[1], width=0.15, record=False)
+        for p, q in _goalpost_pieces(e[0], e[1], canvas.segments):
+            canvas.line(p, q, width=0.15, record=False)
     for p, q in geom["segs"]:
         canvas.line(p, q, width=0.2)  # recorded: later dims avoid it
     for tip, direction in geom["arrows"]:
@@ -3153,9 +3374,9 @@ def _draw_support_symbol(canvas: _Canvas, at: Vec2, comp,
                     across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
                 if comp.co_ords:
                     wp = comp.co_ords[0].xyz
-                    a2 = proj.page(wp)
+                    a2 = proj.page(wp, apply_offset=False)
                     b2 = proj.page((wp[0] + across[0], wp[1] + across[1],
-                                    wp[2] + across[2]))
+                                    wp[2] + across[2]), apply_offset=False)
                     vn = math.hypot(b2[0] - a2[0], b2[1] - a2[1])
                     if vn > 1e-9:
                         v = ((b2[0] - a2[0]) / vn, (b2[1] - a2[1]) / vn)
