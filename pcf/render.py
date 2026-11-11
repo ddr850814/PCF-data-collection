@@ -1052,7 +1052,13 @@ def render_pdf(
         # Deterministic -- same model and options always converge identically.
         tiny_world = _NTS_TINY_INCHES / coord_to_inch_factor(doc.units_coords)
         keep = _eccentric_offset_pairs(doc, reducer_runs)
-        centrelines = _straight_runs(comps)
+        fitting_keep = _fitting_proportion_pairs(comps)
+        for ax in range(3):
+            keep[ax].update(fitting_keep[ax])
+        # 只有直管/短管参与非比例伸缩；弯头腿和其他零件保持刚性。
+        centrelines = [(comp.end_points[0].xyz, comp.end_points[1].xyz)
+                       for comp, _ref in comps
+                       if classify(comp.type) == "PIPE" and len(comp.end_points) >= 2]
         skew_segments = _skew_segments(
             centrelines, all_points, geometry.model_tolerance(doc),
             coord_to_inch_factor(doc.units_coords))
@@ -1631,6 +1637,29 @@ def _eccentric_offset_pairs(doc: PcfDocument,
                 continue
             lo, hi = sorted((round(first.xyz[ax], 6), round(last.xyz[ax], 6)))
             if lo != hi:
+                keep[ax].add((lo, hi))
+    return keep
+
+
+def _fitting_proportion_pairs(comps: list[tuple[Component, str]]
+                              ) -> list[set[tuple[float, float]]]:
+    """非比例伸缩时，所有非管件的坐标区间都保持原比例。
+
+    直管可以压缩或拉长，但阀门、法兰、弯头等零件不是可伸缩管段。
+    对每个坐标轴保护零件点集的完整跨度；区间内的细分间隔也一并保护，
+    避免中心点或相邻零件把阀体拆成两段后分别放大。
+    """
+    keep: list[set[tuple[float, float]]] = [set(), set(), set()]
+    for comp, _ref in comps:
+        if classify(comp.type) == "PIPE":
+            continue
+        points = [p.xyz for p in comp.all_points()]
+        for ax in range(3):
+            vals = [round(p[ax], 6) for p in points]
+            if not vals:
+                continue
+            lo, hi = min(vals), max(vals)
+            if lo < hi:
                 keep[ax].add((lo, hi))
     return keep
 
@@ -2340,12 +2369,10 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     perp = (max(ys) - min(ys)) if ys else 1.0
     sy = height_mm / max(perp, 1e-6)
     if axis is None:
-        # 双向保底：端距过小（平焊法兰两端点重合）不压扁；端距过大（盲板
-        # 细长条符号遇长端距）不拉成宽扁形——拉伸比限制在等比的 2 倍以内
+        # 长端距最多拉到等比的 2 倍；短端距必须尊重真实端点。
+        # 若强制最小长度，短阀会越过自身端点并侵入相邻法兰/垫片。
         ax_ = abs(sx)
-        if ax_ < sy:
-            sx = math.copysign(sy, sx)
-        elif ax_ > sy * 2.0:
+        if ax_ > sy * 2.0:
             sx = math.copysign(sy * 2.0, sx)
     # 符号基向量：P = p0 + x·bx + y·by（普通符号 bx=sx·u, by=sy·v）
     bx = (sx * u[0], sx * u[1])
