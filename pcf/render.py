@@ -3402,7 +3402,7 @@ def _draw_callout_box(canvas: _Canvas, anchor: Vec2, label: str,
                       draw_centre: Vec2,
                       options: list[Vec2] | None = None,
                       occupied: list[Vec2] | None = None) -> tuple[Vec2, Vec2]:
-    """One square callout box, standing off the run with a leader to it.
+    """One square or rectangular callout box with a leader to the run.
 
     The single style used for **everything the shop has to identify** -- a
     fitting's item number and a cut piece's label alike. They are the same
@@ -3418,26 +3418,27 @@ def _draw_callout_box(canvas: _Canvas, anchor: Vec2, label: str,
     """
     canvas.pdf.set_font("Helvetica", size=_CALLOUT_FONT)
     tw = canvas.pdf.get_string_width(label)
-    side = max(tw, _CALLOUT_CAP) + 2 * _CALLOUT_PAD_MM
+    box_h = _CALLOUT_CAP + 2 * _CALLOUT_PAD_MM
+    box_w = max(tw, _CALLOUT_CAP) + 2 * _CALLOUT_PAD_MM
     if options:
         anchor, pos = canvas.place_label_multi(
-            options, side, side, draw_centre,
+            options, box_w, box_h, draw_centre,
             min_leader=_CALLOUT_LEADER_MM, avoid_geometry=True,
             clearance=_CALLOUT_CLEARANCE_MM,
             anchor_cost=lambda p: _crowding_cost(p, occupied or []))
     else:
-        pos = canvas.place_label(anchor, side, side, draw_centre,
+        pos = canvas.place_label(anchor, box_w, box_h, draw_centre,
                                  min_leader=_CALLOUT_LEADER_MM,
                                  avoid_geometry=True,
                                  clearance=_CALLOUT_CLEARANCE_MM)
     # Leader to the box *edge*, so the run of it is visible rather than
     # buried under the knockout, then the box over the top of it.
-    edge = _box_edge_toward(pos, anchor, side, side)
+    edge = _box_edge_toward(pos, anchor, box_w, box_h)
     canvas.line(anchor, edge, width=0.15)
     with canvas.pdf.local_context():
         canvas.pdf.set_fill_color(255, 255, 255)
         canvas.pdf.set_line_width(0.3)
-        canvas.pdf.rect(pos[0] - side / 2, pos[1] - side / 2, side, side,
+        canvas.pdf.rect(pos[0] - box_w / 2, pos[1] - box_h / 2, box_w, box_h,
                         style="DF")
     canvas.text((pos[0], pos[1] + _CALLOUT_CAP / 2), label, size=_CALLOUT_FONT)
     return anchor, pos
