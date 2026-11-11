@@ -1747,9 +1747,27 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                 off = _v2_scale(u_ax, _GASKET_GAP_MM)
                 sp0 = _v2_add(sp0, off)
                 sp1 = _v2_add(sp1, off)
+        axis_override = None
+        if cls == "REDUCER":
+            # 偏心大小头：管轴取主管走向（原项目 reducer_runs，两端同轴
+            # 导出的场合），符号 X→管轴，偏心量按符号 Y 保留——不能沿
+            # p0→p1 对角线对齐（会扭斜端面）
+            run = (reducer_runs or {}).get(id(comp))
+            if run is not None:
+                a3 = proj.page(run[0])
+                b3 = proj.page(run[1])
+                ln = _v2_len(_v2_sub(b3, a3))
+                if ln > 1e-9:
+                    ax = ((b3[0] - a3[0]) / ln, (b3[1] - a3[1]) / ln)
+                    diff0 = _v2_sub(eps[1], eps[0])
+                    if ax[0] * diff0[0] + ax[1] * diff0[1] < 0:
+                        ax = (-ax[0], -ax[1])
+                    axis_override = ax
         if _draw_symbol_2pt(canvas, comp.skey, sp0, sp1,
-                            proj=proj, run3=run3,
-                            wp=ep3[0].xyz if ep3 else None):
+                            proj=proj, run3=run3, axis=axis_override,
+                            wp=ep3[0].xyz if ep3 else None,
+                            drop_isolated=(cls == "REDUCER"
+                                           and not (b1s or b2s))):
             return cps[0] if cps else _v2_mid(eps[0], eps[1])
 
     face_pt = (flange_face_pts or {}).get(id(comp))
@@ -2160,19 +2178,49 @@ def _flange_band(proj, doc, comp, flange_face_pts):
     return top, _v2_add(top, _v2_scale(uu, span)), uu
 
 
+def _across_v(proj: "Projector | None", run3: tuple | None,
+              wp: tuple | None, u: Vec2) -> Vec2 | None:
+    """垂直于管轴的世界轴的图面投影（X 向管跨 Y，Y/Z 向管跨 X）。
+
+    与支撑符号同规则：阀体端面线等横向笔画沿等轴测 30° 斜向族。无投影
+    信息、投影退化或与管轴近平行（异常投影）时返回 None，调用方保持
+    图面垂直回退。
+    """
+    if proj is None or run3 is None or wp is None:
+        return None
+    axis = max(range(3), key=lambda i: abs(run3[i]))
+    across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
+    a2 = proj.page(wp)
+    b2 = proj.page((wp[0] + across[0], wp[1] + across[1], wp[2] + across[2]))
+    dx, dy = b2[0] - a2[0], b2[1] - a2[1]
+    ln = (dx * dx + dy * dy) ** 0.5
+    if ln <= 1e-12:
+        return None
+    vv = (dx / ln, dy / ln)
+    if abs(vv[0] * u[0] + vv[1] * u[1]) >= 0.99:
+        return None
+    return vv
+
+
 def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      proj: "Projector | None" = None,
                      run3: tuple | None = None, wp: tuple | None = None,
+                     axis: Vec2 | None = None,
+                     drop_isolated: bool = False,
                      width: float = 0.4) -> bool:
     """SKEY 符号库双接点对齐绘制（ASC 优先 → skeys.json 官方库）。
 
-    符号 START(首点) → p0，EXIT(收笔点) → p1。
-    轴向：符号自身轴向 e1=START→EXIT 先转正（偏心大小头离轴出口也能精确落点），
-    再对准管轴 u=p0→p1，EXIT 精确落在 p1。
-    横向 v：取"垂直于管轴的世界轴"的图面投影（等轴测中为 30° 斜向，与
-    支撑符号同规则）——保证阀体两端面线与轴测坐标轴平行，而不是图面
-    垂直方向。无投影信息时回退为图面垂直方向。
+    符号 START(首点) → p0，EXIT(收笔点) → p1。符号 X 轴直接映射管轴 u
+    （span 取 EXIT 的 X 分量，偏心大小头离轴出口不扭斜端面），普通符号
+    u=p0→p1。横向 v 取"垂直于管轴的世界轴"的图面投影（等轴测 30° 斜向
+    族，与支撑符号同规则）；axis 分支（大小头）在此基础上加 X 方向线性
+    渐变剪切 s=(R-stop_y·sy·v)/span，R=页面残差=模型偏心投影——端面线
+    仍沿轴测斜向族，小端整体向偏心方向平移，EXIT 恒等落在 p1，出口管道
+    从小端接出，偏心方向由端点自带。
     未查到符号或几何退化时返回 False，调用方走手写回退分支。
+    drop_isolated：剔除与任何其他腿不共端点的孤立腿——大小头的 tap 标记
+    线（支管接入位置指示，RE** 中部短竖线），PCF 无 BRANCH-POINT 时不画
+    （ISOGEN 同约定：真有支管接上才显示）。
     """
     try:
         from .asc_symbols import find_symbol_full
@@ -2184,49 +2232,77 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     sym, orient, stop = found
     diff = _v2_sub(p1, p0)
     d = (diff[0] * diff[0] + diff[1] * diff[1]) ** 0.5
-    ex, ey = stop
-    slen = (ex * ex + ey * ey) ** 0.5
-    if d <= 1e-6 or slen <= 1e-6:
+    # 轴向跨度取收笔点的 X 分量：偏心大小头（RE** EXIT=(548,-136)）的
+    # 出口离轴，若用 START→EXIT 对角线对准管轴会把整个符号扭斜、端面
+    # 不再垂直管轴——直接映射符号 X→管轴，偏心量保留为侧向偏移
+    span = abs(stop[0]) if stop else 0.0
+    if d <= 1e-6 or span <= 1e-6:
         return False
-    e1 = (ex / slen, ey / slen)
-    e2 = (-e1[1], e1[0])
-    u = (diff[0] / d, diff[1] / d)
-    v = _v2_perp(u)
-    if proj is not None and run3 is not None and wp is not None:
-        # 与支撑分支同规则：X 向管跨 Y，Y/Z 向管跨 X（跨管轴取水平世界轴）
-        axis = max(range(3), key=lambda i: abs(run3[i]))
-        across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
-        a2 = proj.page(wp)
-        b2 = proj.page((wp[0] + across[0], wp[1] + across[1], wp[2] + across[2]))
-        vn = (b2[0] - a2[0]) ** 2 + (b2[1] - a2[1]) ** 2
-        if vn > 1e-12:
-            vn = vn ** 0.5
-            vv = ((b2[0] - a2[0]) / vn, (b2[1] - a2[1]) / vn)
-            # 与管轴近平行（异常投影）时保持图面垂直回退
-            if abs(vv[0] * u[0] + vv[1] * u[1]) < 0.99:
-                v = vv
-    sx = d / slen
-    bs = [c for seg in sym for c in
-          (seg[0] * e2[0] + seg[1] * e2[1], seg[2] * e2[0] + seg[3] * e2[1])]
-    perp = (max(bs) - min(bs)) if bs else 1.0
+    # axis：外部指定的管轴（偏心大小头用主管走向，不用 p0→p1 对角线）
+    if axis is not None:
+        u = axis
+        d = (diff[0] * u[0] + diff[1] * u[1]) or d   # 轴向投影距离
+    else:
+        u = (diff[0] / d, diff[1] / d)
+    # 横向与支撑分支同规则：端面线沿"垂直于管轴的世界轴"的图面投影
+    # （等轴测 30° 斜向族，与图上其他符号同角度）；无投影信息时回退图面垂直
+    v = _across_v(proj, run3, wp, u) or _v2_perp(u)
+    sx = d / span
+    ys = [c for seg in sym for c in (seg[1], seg[3])]
+    perp = (max(ys) - min(ys)) if ys else 1.0
     sy = 4.5 / max(perp, 1e-6)
-    # 双向保底：端距过小（平焊法兰两端点重合）不压扁；端距过大（盲板细长条
-    # 符号遇长端距）不拉成宽扁形——拉伸比限制在等比的 2 倍以内
-    if sx < sy:
-        sx = sy
-    elif sx > sy * 2.0:
-        sx = sy * 2.0
+    if axis is None:
+        # 双向保底：端距过小（平焊法兰两端点重合）不压扁；端距过大（盲板
+        # 细长条符号遇长端距）不拉成宽扁形——拉伸比限制在等比的 2 倍以内
+        if sx < sy:
+            sx = sy
+        elif sx > sy * 2.0:
+            sx = sy * 2.0
+    # 符号基向量：P = p0 + x·bx + y·by（普通符号 bx=sx·u, by=sy·v）
+    bx = (sx * u[0], sx * u[1])
+    by = (sy * v[0], sy * v[1])
+    if axis is not None:
+        # 偏心大小头剪切画法：模型偏心可以在任意世界方向（X/Y/Z），若把
+        # 符号横向扭到偏心方向，端面线就脱离轴测斜向族（图面竖直端面很
+        # 突兀）。改为保持端面线沿跨管世界轴投影，偏心由 X 方向的线性
+        # 渐变剪切表达——腰线不对称、小端整体向偏心方向平移，正是模型
+        # 投影的仿射像（直线仍映成直线）：
+        #   P = p0 + x·(sx·u + s) + y·sy·v，s = (R - stop_y·sy·v)/span
+        # 其中 R = diff - d·u 是页面残差 = 模型偏心的真实投影。EXIT 恒等：
+        #   p0 + span·(sx·u + s) + stop_y·sy·v = p0 + d·u + R = p1
+        # 出口管道正好从小端接出，端面方向不受偏心方向影响。
+        stop_y = stop[1] if stop else 0.0
+        rx = diff[0] - d * u[0]
+        ry = diff[1] - d * u[1]
+        shx = (rx - stop_y * sy * v[0]) / span
+        shy = (ry - stop_y * sy * v[1]) / span
+        bx = (bx[0] + shx, bx[1] + shy)
     x0, y0 = p0
+    if drop_isolated and len(sym) > 1:
+        # 孤立腿 = 与其他任何腿都不共端点的腿：轮廓腿围成闭环共端点，
+        # tap 标记线浮在体内（端点落在轮廓边线内部）——按 ISOGEN 约定，
+        # 组件没有 BRANCH-POINT 时不画
+        def _near(p, q, tol=1.0):
+            return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
+        kept = []
+        for i, s1 in enumerate(sym):
+            a1, b1 = (s1[0], s1[1]), (s1[2], s1[3])
+            touches = any(
+                i != j and (_near(a1, (s2[0], s2[1]))
+                            or _near(a1, (s2[2], s2[3]))
+                            or _near(b1, (s2[0], s2[1]))
+                            or _near(b1, (s2[2], s2[3])))
+                for j, s2 in enumerate(sym))
+            if touches:
+                kept.append(s1)
+        if kept:
+            sym = kept
     for x1, y1, x2, y2 in sym:
-        a1 = x1 * e1[0] + y1 * e1[1]
-        b1 = x1 * e2[0] + y1 * e2[1]
-        a2 = x2 * e1[0] + y2 * e1[1]
-        b2 = x2 * e2[0] + y2 * e2[1]
         canvas.line(
-            (x0 + a1 * sx * u[0] + b1 * sy * v[0],
-             y0 + a1 * sx * u[1] + b1 * sy * v[1]),
-            (x0 + a2 * sx * u[0] + b2 * sy * v[0],
-             y0 + a2 * sx * u[1] + b2 * sy * v[1]),
+            (x0 + x1 * bx[0] + y1 * by[0],
+             y0 + x1 * bx[1] + y1 * by[1]),
+            (x0 + x2 * bx[0] + y2 * by[0],
+             y0 + x2 * bx[1] + y2 * by[1]),
             width=width)
     return True
 
