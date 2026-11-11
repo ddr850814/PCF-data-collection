@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from . import geometry
 from .model import Component, PcfDocument, Point
 from .skeys import classify
-from .units import bore_to_nps, coord_to_inch_factor, format_feet_inches, format_nps
+from .units import coord_to_inch_factor, format_bore, format_length
 from .welds import _is_gap_coupling
 
 
@@ -69,8 +69,7 @@ class CutPiece:
     #                                 matching a pipe back to its drawn symbol
 
     def cut_length_text(self, units_coords: str) -> str:
-        factor = coord_to_inch_factor(units_coords)
-        return format_feet_inches(self.cut_length * factor)
+        return format_length(self.cut_length, units_coords)
 
 
 def _end_info(
@@ -147,7 +146,7 @@ def _branches_on(
         out.append(BranchInfo(
             description=comp.description,
             bore=bore,
-            nps=format_nps(bore_to_nps(bore, units_bore)) if bore is not None else "?",
+            nps=format_bore(bore, units_bore) if bore is not None else "?",
             distance_from_end1=max(t, 0.0),
             direction=direction,
         ))
@@ -215,7 +214,7 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
                     length_source = "geometry-minus-gap"
 
         bore = end1.bore if end1.bore is not None else comp.bore
-        nps = format_nps(bore_to_nps(bore, doc.units_bore)) if bore is not None else "?"
+        nps = format_bore(bore, doc.units_bore) if bore is not None else "?"
 
         pieces.append(CutPiece(
             label="",

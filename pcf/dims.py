@@ -54,7 +54,7 @@ from pathlib import Path
 from . import geometry
 from .model import Component, PcfDocument
 from .skeys import classify, is_annotation_symbol, looks_like_flange
-from .units import coord_to_inch_factor, format_feet_inches
+from .units import format_length
 
 Vec3 = tuple[float, float, float]
 
@@ -100,8 +100,7 @@ class Dimension:
     def computed_text(self, units_coords: str) -> str:
         if self.text:
             return self.text
-        inches = geometry.dist(self.p_from, self.p_to) * coord_to_inch_factor(units_coords)
-        return format_feet_inches(inches)
+        return format_length(geometry.dist(self.p_from, self.p_to), units_coords)
 
 
 def _dim_id(a: Vec3, b: Vec3) -> str:

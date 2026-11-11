@@ -33,6 +33,19 @@ def coord_to_mm_factor(units_co_ords: str) -> float:
     return _COORD_TO_MM.get(units_co_ords.upper(), 25.4)
 
 
+def is_metric_units(units_coords: str) -> bool:
+    """英寸原生文件按车间惯例显示英尺-英寸，其余单位一律显示毫米。"""
+    return coord_to_inch_factor(units_coords) != 1.0
+
+
+def format_length(value: float, units_coords: str, *, force_feet: bool = False) -> str:
+    """原生坐标长度 → 图面显示：跟随 UNITS-CO-ORDS（英寸 ft-in，其余 mm）。"""
+    if is_metric_units(units_coords):
+        return format_mm(value * coord_to_mm_factor(units_coords))
+    return format_feet_inches(value * coord_to_inch_factor(units_coords),
+                              force_feet=force_feet)
+
+
 def bore_to_inch(bore: float, units_bore: str) -> float:
     units = units_bore.upper()
     if units in ("INCH", "INCHES"):
@@ -73,6 +86,15 @@ def format_nps(nps_inches: float) -> str:
     if whole == 0:
         return f'{rem.numerator}/{rem.denominator}"'
     return f'{whole}-{rem.numerator}/{rem.denominator}"'
+
+
+def format_bore(bore: float, units_bore: str) -> str:
+    """口径显示跟随 UNITS-BORE：MM 文件显示 DN，英寸文件保持 NPS 写法。"""
+    if units_bore.upper() == "MM":
+        dn = round(bore)
+        if dn in _NPS_FROM_MM:
+            return f"DN{dn}"
+    return format_nps(bore_to_nps(bore, units_bore))
 
 
 def format_feet_inches(

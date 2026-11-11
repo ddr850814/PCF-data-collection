@@ -67,7 +67,8 @@ from .dims import (DEFAULT_OFFSET_MM, Dimension, flange_face,
 from .model import Component, PcfDocument, Point
 from .skeys import (classify, is_annotation_symbol, is_slip_on_flange,
                     is_weld_coupling, looks_like_flange, valve_subtype)
-from .units import bore_to_nps, coord_to_inch_factor, format_feet_inches, format_nps
+from .units import (coord_to_inch_factor, format_bore, format_feet_inches,
+                    format_length, format_mm, is_metric_units)
 from .welds import (GAP_COUPLING_MAX_INCHES, Weld, component_spools,
                     derive_welds)
 
@@ -1108,7 +1109,7 @@ def render_pdf(
                 break
         weld_dots.append(dot)
         _draw_weld_symbol(canvas, projector, weld, dot)
-        nps = format_nps(bore_to_nps(weld.bore, doc.units_bore)) if weld.bore else "?"
+        nps = format_bore(weld.bore, doc.units_bore) if weld.bore else "?"
         weld_positions.append(WeldPosition(
             number=weld.number, label=weld.label, joint=weld.joint, nps=nps,
             x_mm=round(dot[0], 2), y_mm=round(dot[1], 2),
@@ -1387,10 +1388,9 @@ def _coordinate_lines(point: Vec3, doc: PcfDocument,
     drawing is seen from and moves nothing in the plant.
     """
     east, north = _orient_plan(point[0], point[1], options.north_axis)
-    inch = coord_to_inch_factor(doc.units_coords)
 
     def fmt(value: float) -> str:
-        return format_feet_inches(value * inch, force_feet=True)
+        return format_length(value, doc.units_coords, force_feet=True)
 
     return [f"N {fmt(north)}   E {fmt(east)}", f"EL {fmt(point[2])}"]
 
@@ -3152,10 +3152,8 @@ def _draw_offset_box(canvas: _Canvas, proj: Projector, dim: Dimension,
         if _v2_len(_v2_sub(b, a)) > 0.4:
             canvas.dashed(a, b, width=0.22, dash=1.4, record=True)
 
-    inch = coord_to_inch_factor(units_coords)
-
     def leg_text(ax: int) -> str:
-        return format_feet_inches(abs(delta[ax]) * inch)
+        return format_length(abs(delta[ax]), units_coords)
 
     best_order: tuple[int, ...] | None = None
     best_cost = 0.0
@@ -3235,7 +3233,7 @@ def _build_bom(doc: PcfDocument, comps: list[tuple[Component, str]]) -> dict:
         row = rows.get(key)
         if row is None:
             bore = comp.bore
-            nps = format_nps(bore_to_nps(bore, doc.units_bore)) if bore else ""
+            nps = format_bore(bore, doc.units_bore) if bore else ""
             description = comp.description or materials.get(comp.item_code or "", "") \
                 or comp.type
             row = rows[key] = {
@@ -3509,6 +3507,7 @@ def _draw_bom_panel(canvas: _Canvas, bom_rows: dict, cut_pieces: list[CutPiece],
     pdf.line(x, y, x, y + h)
 
     cursor = y + 4
+    metric_qty = is_metric_units(doc.units_coords)
     canvas.text((x + w / 2, cursor), "BILL OF MATERIALS", size=7.5)
     cursor += 2.0
 
@@ -3533,8 +3532,11 @@ def _draw_bom_panel(canvas: _Canvas, bom_rows: dict, cut_pieces: list[CutPiece],
             cursor += 3.0
             bom_truncated = True
             break
-        qty = (format_feet_inches(row["length_in"]) if row["class"] == "PIPE"
-               else str(row["qty"]))
+        if row["class"] == "PIPE":
+            qty = (format_mm(row["length_in"] * 25.4) if metric_qty
+                   else format_feet_inches(row["length_in"]))
+        else:
+            qty = str(row["qty"])
         # 图面 BOM：描述前带料号（项号列已是顺序号）
         desc = row["description"]
         if row["code"]:

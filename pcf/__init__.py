@@ -114,8 +114,12 @@ from .units import (
     bore_to_nps,
     coord_to_inch_factor,
     coord_to_mm_factor,
+    format_bore,
     format_feet_inches,
+    format_length,
+    format_mm,
     format_nps,
+    is_metric_units,
 )
 from .welds import Weld, component_spools, derive_welds
 
@@ -142,9 +146,9 @@ __all__ = [
     "default_split_distance", "derive_welds", "distance_drawing_count",
     "drawings_dir_for", "find_project_root", "find_stray_archives",
     "flood_values",
-    "format_feet_inches",
+    "format_bore", "format_feet_inches", "format_length", "format_mm",
     "format_nps", "infer_dimensions", "init_project", "is_archive",
-    "is_sheet_pcf",
+    "is_metric_units", "is_sheet_pcf",
     "joint_from_skey",
     "load", "load_config", "load_sidecar", "log_to_wiki",
     "match_map_items", "merge_documents", "merge_with_sidecar",

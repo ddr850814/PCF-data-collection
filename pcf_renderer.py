@@ -21,12 +21,14 @@ from pcf import (
     RenderOptions,
     build_continuation_map,
     default_split_distance,
+    format_feet_inches,
+    format_mm,
+    is_metric_units,
     is_sheet_pcf,
     load,
     render_pdf,
     sidecar_path,
     write_sidecar,
-    format_feet_inches,
 )
 
 
@@ -66,15 +68,19 @@ def _write_welds_csv(result, path: Path) -> Path:
     return path
 
 
-def _write_bom_csv(result, path: Path) -> Path:
+def _write_bom_csv(result, doc, path: Path) -> Path:
     fields = ["item", "code", "description", "nps", "class", "qty", "length_text",
               "length_in", "weight", "ucis"]
+    metric = is_metric_units(doc.units_coords)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(fields)
         for line in result.bom:
-            length_text = (format_feet_inches(line.length_in)
-                           if line.cls == "PIPE" else "")
+            if line.cls == "PIPE":
+                length_text = (format_mm(line.length_in * 25.4) if metric
+                               else format_feet_inches(line.length_in))
+            else:
+                length_text = ""
             writer.writerow([
                 line.item, getattr(line, "code", ""), line.description, line.nps,
                 line.cls, line.qty,
@@ -268,7 +274,7 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
 
         result = render_pdf(doc, pdf_path, options)
         _write_welds_csv(result, _welds_csv_path(pdf_path))
-        _write_bom_csv(result, _bom_csv_path(pdf_path))
+        _write_bom_csv(result, doc, _bom_csv_path(pdf_path))
         _write_cuts_csv(result, doc, _cuts_csv_path(pdf_path))
         write_sidecar(dims_file, result.dimensions, doc.units_coords)
 
