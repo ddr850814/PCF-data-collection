@@ -64,7 +64,9 @@ def classify(component_type: str) -> str:
         return "TEE"
     if t.startswith("VALVE"):
         return "VALVE"
-    if t.startswith("FLANGE") or t.startswith("LAPJOINT") or t.startswith("LAP-JOINT"):
+    # SP3D 标准为 FLANGE-BLIND，部分导出也写成 BLIND-FLANGE。
+    if (t.startswith("FLANGE") or t.startswith("BLIND-FLANGE")
+            or t.startswith("LAPJOINT") or t.startswith("LAP-JOINT")):
         return "FLANGE"
     if t.startswith("REDUCER"):
         return "REDUCER"

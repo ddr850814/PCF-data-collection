@@ -1034,6 +1034,13 @@ def render_pdf(
 
     all_points = [p.xyz for comp, _ in comps for p in comp.all_points()]
 
+    # 设备管口（END-CONNECTION-EQUIPMENT 伪组件）：管口点属于本图画面，
+    # 纳入投影范围；画法见 _draw_equipment_connections。
+    equip_recs = [rec for pipeline in doc.pipelines
+                  for rec in pipeline.components
+                  if rec.type == "END-CONNECTION-EQUIPMENT"]
+    all_points += [p.xyz for rec in equip_recs for p in rec.co_ords]
+
     projector = Projector(options)
     projector.fit(all_points, draw_region)
 
@@ -1087,6 +1094,9 @@ def render_pdf(
             anchor = None
         if anchor is not None:
             anchors[idx] = anchor
+
+    if equip_recs:
+        _draw_equipment_connections(canvas, projector, equip_recs, comps)
 
     # ---- welds (dots only) ------------------------------------------------
     # The numbered balloons are drawn as an overlay layer by the weld-tracking
@@ -1173,7 +1183,8 @@ def render_pdf(
         callouts = _draw_callouts(canvas, projector, comps, anchors,
                                   bom_rows, pipe_labels, draw_centre,
                                   every_instance=options.balloon_every_instance,
-                                  weld_dots=weld_dots)
+                                  weld_dots=weld_dots,
+                                  tolerance=geometry.model_tolerance(doc) * 4)
 
     # ---- furniture ----------------------------------------------------------
     _draw_border(canvas, page_w, page_h, border)
@@ -1678,6 +1689,74 @@ def _flange_faces(doc: PcfDocument) -> dict[int, Vec3]:
     return faces
 
 
+def _draw_equipment_connections(canvas: _Canvas, proj: Projector,
+                                equip_recs: list, comps: list) -> None:
+    """设备管口：官方 NZ 符号以虚线画在设备侧，法兰面落在连接点。"""
+    ends: list[tuple[Vec2, Vec2, Vec3, Vec3]] = []   # (端点, 来向, 3D 端, 3D 来向)
+    for comp, _ref in comps:
+        ep3 = comp.end_points
+        if len(ep3) < 2:
+            continue
+        e0, e1 = proj.page(ep3[0].xyz), proj.page(ep3[1].xyz)
+        ends.append((e0, e1, ep3[0].xyz, ep3[1].xyz))
+        ends.append((e1, e0, ep3[1].xyz, ep3[0].xyz))
+    for rec in equip_recs:
+        pts = rec.co_ords
+        if not pts:
+            continue
+        nz = proj.page(pts[0].xyz)
+        best = None
+        for pe, ps, we, ws in ends:
+            d2 = (pe[0] - nz[0]) ** 2 + (pe[1] - nz[1]) ** 2
+            if best is None or d2 < best[0]:
+                best = (d2, pe, ps, we, ws)
+        if best is None:
+            continue
+        _, pe, ps, we, ws = best
+        dx, dy = pe[0] - nz[0], pe[1] - nz[1]
+        gap = (dx * dx + dy * dy) ** 0.5
+        if gap > 1e-6:
+            u = (dx / gap, dy / gap)     # 管口 → 管线
+        else:
+            sx, sy = ps[0] - pe[0], ps[1] - pe[1]
+            sl = (sx * sx + sy * sy) ** 0.5
+            u = (sx / sl, sy / sl) if sl > 1e-6 else (1.0, 0.0)
+        ref = rec.get("CONNECTION-REFERENCE") or ""
+        tail = ref.split("$")[-1].split()
+        face = next((t.upper() for t in tail
+                     if t.isalpha() and t.upper() != "MM"), "")
+        skey = "NZWS" if ("W" in face or face.startswith("B")) else "NZFE"
+        try:
+            from .asc_symbols import find_symbol_full
+            found = find_symbol_full(skey)
+        except Exception:
+            found = None
+        run3 = tuple(ws[i] - we[i] for i in range(3))
+        # 与普通 SKEY 零件一致：端面沿垂直于管轴的世界横轴投影，
+        # 不强制采用法兰标注的竖直面杠，避免管口与相邻零件不在同一平面。
+        across = _across_v(proj, run3, we, u) or _v2_perp(u)
+        h = 4.5                           # 与普通 SKEY 符号一致的图面高度
+        if found is None:
+            canvas.dashed(_v2_add(nz, _v2_scale(across, h / 2)),
+                          _v2_sub(nz, _v2_scale(across, h / 2)), width=0.3)
+            continue
+        segs, _orient, stop = found
+        span = abs(stop[0]) if stop else 0.0
+        ys = [c for seg in segs for c in (seg[1], seg[3])]
+        perp = (max(ys) - min(ys)) if ys else 1.0
+        if span <= 1e-6 or perp <= 1e-6:
+            continue
+        d = span * (h / perp)                # 等比缩放后的 START→EXIT 距离
+        # NZ 的 EXIT 是法兰面，START 是设备侧颈端；颈端必须远离管线，
+        # 不能叠画到法兰、垫片和管道内部。
+        p0 = _v2_sub(nz, _v2_scale(u, d))
+        if gap > 1.0:
+            canvas.dashed(pe, nz, width=0.3)
+        _draw_symbol_2pt(canvas, skey, p0, nz, proj=proj,
+                         run3=run3, wp=we, across=across, height_mm=h,
+                         width=0.3, dashed=True)
+
+
 def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     doc: PcfDocument,
                     flange_face_pts: dict[int, Vec3] | None = None,
@@ -1929,10 +2008,9 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             return _v2_mid(eps[0], eps[1])
 
     elif cls == "GASKET":
-        # 垫片不再画杠：法兰符号已外移 _GASKET_GAP_MM 表现垫片间隙，
-        # 手画杠会压在阀体/法兰面 上（垫片模型厚度≈0，中点即贴合面）
+        # 垫片不另画符号或球标，其项号合并到父件球标。
         if len(eps) >= 2:
-            return None  # gaskets are not ballooned on the face
+            return None
 
     elif cls == "CAP":
         if eps:
@@ -2207,13 +2285,19 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      run3: tuple | None = None, wp: tuple | None = None,
                      axis: Vec2 | None = None,
                      drop_isolated: bool = False,
-                     width: float = 0.4) -> bool:
+                     width: float = 0.4,
+                     height_mm: float = 4.5,
+                     across: Vec2 | None = None,
+                     dashed: bool = False) -> bool:
     """SKEY 符号库双接点对齐绘制（ASC 优先 → skeys.json 官方库）。
 
     符号 START(首点) → p0，EXIT(收笔点) → p1。符号 X 轴直接映射管轴 u
     （span 取 EXIT 的 X 分量，偏心大小头离轴出口不扭斜端面），普通符号
-    u=p0→p1。横向 v 取"垂直于管轴的世界轴"的图面投影（等轴测 30° 斜向
-    族，与支撑符号同规则）；axis 分支（大小头）在此基础上加 X 方向线性
+    u=p0→p1。横向 v 默认取"垂直于管轴的世界轴"的图面投影（等轴测 30°
+    斜向族，与支撑符号同规则）；调用方可用 across 直接指定横向方向
+    （设备管口符号与管线法兰杠同用 _iso_cross_dir，保证法兰面对齐同一
+    斜向族）。符号整体高度（Y 跨度）固定 height_mm；axis 分支（大小头）
+    在此基础上加 X 方向线性
     渐变剪切 s=(R-stop_y·sy·v)/span，R=页面残差=模型偏心投影——端面线
     仍沿轴测斜向族，小端整体向偏心方向平移，EXIT 恒等落在 p1，出口管道
     从小端接出，偏心方向由端点自带。
@@ -2238,26 +2322,31 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     span = abs(stop[0]) if stop else 0.0
     if d <= 1e-6 or span <= 1e-6:
         return False
+    # 收笔点在 -X 侧（官方 NZFE 定义 EXIT=(-800,0)，面杠在 START 的负向）
+    # 时镜像符号 X 轴：START 仍落 p0，EXIT 仍精确落 p1，形状左右翻转
+    sgn = 1.0 if (stop and stop[0] > 0) else -1.0
     # axis：外部指定的管轴（偏心大小头用主管走向，不用 p0→p1 对角线）
     if axis is not None:
         u = axis
         d = (diff[0] * u[0] + diff[1] * u[1]) or d   # 轴向投影距离
     else:
         u = (diff[0] / d, diff[1] / d)
-    # 横向与支撑分支同规则：端面线沿"垂直于管轴的世界轴"的图面投影
-    # （等轴测 30° 斜向族，与图上其他符号同角度）；无投影信息时回退图面垂直
-    v = _across_v(proj, run3, wp, u) or _v2_perp(u)
-    sx = d / span
+    # 横向：调用方指定（管口符号与管线法兰杠同族）优先，否则端面线沿
+    # "垂直于管轴的世界轴"的图面投影（等轴测 30° 斜向族）；无投影信息时
+    # 回退图面垂直
+    v = across or (_across_v(proj, run3, wp, u) or _v2_perp(u))
+    sx = sgn * d / span
     ys = [c for seg in sym for c in (seg[1], seg[3])]
     perp = (max(ys) - min(ys)) if ys else 1.0
-    sy = 4.5 / max(perp, 1e-6)
+    sy = height_mm / max(perp, 1e-6)
     if axis is None:
         # 双向保底：端距过小（平焊法兰两端点重合）不压扁；端距过大（盲板
         # 细长条符号遇长端距）不拉成宽扁形——拉伸比限制在等比的 2 倍以内
-        if sx < sy:
-            sx = sy
-        elif sx > sy * 2.0:
-            sx = sy * 2.0
+        ax_ = abs(sx)
+        if ax_ < sy:
+            sx = math.copysign(sy, sx)
+        elif ax_ > sy * 2.0:
+            sx = math.copysign(sy * 2.0, sx)
     # 符号基向量：P = p0 + x·bx + y·by（普通符号 bx=sx·u, by=sy·v）
     bx = (sx * u[0], sx * u[1])
     by = (sy * v[0], sy * v[1])
@@ -2297,8 +2386,9 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                 kept.append(s1)
         if kept:
             sym = kept
+    draw = canvas.dashed if dashed else canvas.line
     for x1, y1, x2, y2 in sym:
-        canvas.line(
+        draw(
             (x0 + x1 * bx[0] + y1 * by[0],
              y0 + x1 * bx[1] + y1 * by[1]),
             (x0 + x2 * bx[0] + y2 * by[0],
@@ -3356,7 +3446,8 @@ def _draw_callout_box(canvas: _Canvas, anchor: Vec2, label: str,
 def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
                    pipe_labels: dict[int, str], draw_centre,
                    every_instance: bool = True,
-                   weld_dots: list[Vec2] | None = None) -> list[Callout]:
+                   weld_dots: list[Vec2] | None = None,
+                   tolerance: float = 1e-3) -> list[Callout]:
     """Draw component callouts -- one style for materials and cut pieces.
 
     Pipe pieces carry their cut-list name (e.g. "2A") and everything else its
@@ -3402,9 +3493,44 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
             leadered=True))
 
     # -- pass 2: material item-number callouts ------------------------------
+    # 垫片/螺栓优先并入任一端实际相邻的法兰，顺序为“法兰/螺栓/垫片”；
+    # 两端都没有法兰时不并入阀门、三通等父件，而单独出“螺栓/垫片”球标。
+    flanges = [(i, comp) for i, (comp, _ref) in enumerate(comps)
+               if looks_like_flange(comp.type, comp.description, comp.skey)]
+    flange_children: dict[int, dict[str, str]] = {}
+    loose_children: dict[tuple[str, str], dict[str, str]] = {}
+    loose_anchors: dict[tuple[str, str], Vec2] = {}
+    for idx, (child, child_ref) in enumerate(comps):
+        child_type = child.type.upper()
+        if child_type not in ("GASKET", "BOLT"):
+            continue
+        child_row = bom_rows.get(_bom_key(child))
+        child_points = child.all_points()
+        if child_row is None or not child_points:
+            continue
+        near_flange = next((
+            i for i, flange in flanges
+            if any(geometry.dist(p.xyz, q.xyz) <= tolerance
+                   for p in child_points for q in flange.all_points())
+        ), None)
+        if near_flange is not None:
+            group = flange_children.setdefault(near_flange, {})
+        else:
+            master = (child.get("MASTER-COMPONENT-IDENTIFIER") or "").strip()
+            group_key = (child_ref, master or f"#{idx}")
+            group = loose_children.setdefault(group_key, {})
+            if group_key not in loose_anchors:
+                projected = [proj.page(p.xyz) for p in child_points]
+                loose_anchors[group_key] = (
+                    sum(p[0] for p in projected) / len(projected),
+                    sum(p[1] for p in projected) / len(projected))
+        group[child_type] = str(child_row["item"])
+
     done: set[tuple] = set()
     for idx, (comp, _ref) in enumerate(comps):
         if idx not in anchors or classify(comp.type) == "PIPE":
+            continue
+        if comp.type.upper() in ("GASKET", "BOLT"):
             continue
         key = _bom_key(comp)
         row = bom_rows.get(key)
@@ -3414,11 +3540,26 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
             if key in done:
                 continue
             done.add(key)
+        label = str(row["item"])
+        children = flange_children.get(idx, {})
+        label = "/".join([label] + [children[k] for k in ("BOLT", "GASKET")
+                                    if k in children])
         anchor = anchors[idx]
-        _anchor, pos = _draw_callout_box(canvas, anchor, str(row["item"]),
-                                         draw_centre)
+        _anchor, pos = _draw_callout_box(canvas, anchor, label, draw_centre)
         callouts.append(Callout(
-            item=str(row["item"]), kind="material",
+            item=label, kind="material",
+            x_mm=round(pos[0], 2), y_mm=round(pos[1], 2),
+            anchor_x_mm=round(anchor[0], 2), anchor_y_mm=round(anchor[1], 2),
+            leadered=True))
+
+    for group_key, children in loose_children.items():
+        anchor = loose_anchors.get(group_key)
+        if anchor is None:
+            continue
+        label = "/".join(children[k] for k in ("BOLT", "GASKET") if k in children)
+        _anchor, pos = _draw_callout_box(canvas, anchor, label, draw_centre)
+        callouts.append(Callout(
+            item=label, kind="material",
             x_mm=round(pos[0], 2), y_mm=round(pos[1], 2),
             anchor_x_mm=round(anchor[0], 2), anchor_y_mm=round(anchor[1], 2),
             leadered=True))

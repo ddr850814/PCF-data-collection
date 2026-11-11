@@ -236,8 +236,50 @@ def _build_parts(
     owner: list[tuple[int, int]],
 ) -> list[PcfDocument]:
     """One new document per component group (header/materials shared)."""
+    # 管口等连接记录不参与连通分组和材料统计，但它们是图面的一部分：
+    # 按坐标跟随最近的实组件，且只进入其所在分图，不能复制到每一张图。
+    component_group = {
+        owner[i]: group_idx
+        for group_idx, group in enumerate(groups)
+        for i in group
+    }
+    positions = list(component_group)
+    real_points = {
+        pos: [p.xyz for p in work.pipelines[pos[0]].components[pos[1]].all_points()]
+        for pos in positions
+    }
+    record_groups: dict[tuple[int, int], int] = {}
+    for p_idx, pipeline in enumerate(work.pipelines):
+        for c_idx, comp in enumerate(pipeline.components):
+            if not comp.is_connection_record:
+                continue
+            rec_points = [p.xyz for p in comp.all_points()]
+            best_position: tuple[int, int] | None = None
+            if rec_points:
+                best_distance = float("inf")
+                for pos in positions:
+                    points = real_points[pos]
+                    if not points:
+                        continue
+                    distance = min(
+                        geometry.dist(a, b) for a in rec_points for b in points
+                    )
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_position = pos
+            if best_position is None:
+                # 无坐标的 MESSAGE 等记录跟随同管段中文件位置最近的实组件。
+                candidates = [pos for pos in positions if pos[0] == p_idx] or positions
+                if candidates:
+                    best_position = min(
+                        candidates,
+                        key=lambda pos: (abs(pos[1] - c_idx), pos[0], pos[1]),
+                    )
+            if best_position is not None:
+                record_groups[(p_idx, c_idx)] = component_group[best_position]
+
     parts: list[PcfDocument] = []
-    for group in groups:
+    for group_idx, group in enumerate(groups):
         part = PcfDocument(
             header_lines=list(work.header_lines),
             newline=work.newline,
@@ -255,11 +297,15 @@ def _build_parts(
                 raw_line=pipeline.raw_line,
             )
             for c_idx, comp in enumerate(pipeline.components):
-                if comp.is_connection_record or (p_idx, c_idx) in keep:
-                    new_pipeline.components.append(Component(
-                        type=comp.type,
-                        attributes=[AttrLine(a.raw) for a in comp.attributes],
-                    ))
+                if comp.is_connection_record:
+                    if record_groups.get((p_idx, c_idx)) != group_idx:
+                        continue
+                elif (p_idx, c_idx) not in keep:
+                    continue
+                new_pipeline.components.append(Component(
+                    type=comp.type,
+                    attributes=[AttrLine(a.raw) for a in comp.attributes],
+                ))
             part.pipelines.append(new_pipeline)
         part.materials_lines = list(work.materials_lines)
         parts.append(part)
