@@ -152,7 +152,7 @@ class PcfApp:
         self.render_settings = {
             "north": "Y", "quadrant": "SE", "paper": "tabloid",
             "to_scale": False, "nts_min": 8.0, "nts_max": 70.0,
-            "skew": 10.0, "spool": "", "ffw": False,
+            "skew": 10.0, "spool": "", "ffw": False, "encoding": "auto",
         }
         self.btn_render_settings = ttkb.Button(render_frame, text="出图设置...",
                                                command=self._open_render_settings,
@@ -561,7 +561,7 @@ class PcfApp:
                     pcf_path, north_axis=s["north"], quadrant=s["quadrant"],
                     paper=s["paper"], to_scale=s["to_scale"],
                     nts_min_mm=s["nts_min"], nts_max_mm=s["nts_max"],
-                    skew_deg=s["skew"])
+                    skew_deg=s["skew"], encoding=s.get("encoding", "auto"))
                 if token == self._preview_token:
                     self.root.after(0, lambda: self._show_preview_bytes(data, ref))
             except Exception as exc:
@@ -742,8 +742,10 @@ class PcfApp:
         s = self.render_settings
         nts = "按比例" if s["to_scale"] else f"NTS {s['nts_min']:g}-{s['nts_max']:g}mm"
         spool = s["spool"] or "-"
+        enc_label = next((lb for lb, v in self.encoding_options
+                          if v == s.get("encoding", "auto")), "自动（GBK 优先）")
         self.render_summary.configure(
-            text=f"{s['north']}/{s['quadrant']} · {s['paper']} · {nts} · 斜倾{s['skew']:g}° · 分段:{spool}")
+            text=f"{s['north']}/{s['quadrant']} · {s['paper']} · {nts} · 斜倾{s['skew']:g}° · 分段:{spool} · 编码:{enc_label.split('（')[0]}")
 
     def _open_render_settings(self):
         """出图设置弹窗：全部渲染参数集中于此"""
@@ -775,6 +777,18 @@ class PcfApp:
         paper_var = tk.StringVar(value=s["paper"])
         ttkb.Combobox(f, state="readonly", width=8, values=["tabloid", "a3", "letter", "a4"],
                       textvariable=paper_var, bootstyle=PRIMARY).pack(side=LEFT)
+        # 编码：与收集一致的选项；影响 PCF 读入与 CSV 导出（auto → CSV utf-8-sig）
+        enc_labels = [label for label, _ in self.encoding_options]
+        enc_value = next((v for lb, v in self.encoding_options
+                          if v == s.get("encoding", "auto")), "auto")
+        ttkb.Label(f, text="编码:", bootstyle=PRIMARY).pack(side=LEFT, padx=(12, 2))
+        enc_var = tk.StringVar(value=next(lb for lb, v in self.encoding_options if v == enc_value))
+        ttkb.Combobox(f, state="readonly", width=14, values=enc_labels,
+                      textvariable=enc_var, bootstyle=PRIMARY).pack(side=LEFT)
+
+        def enc_selected():
+            label = enc_var.get()
+            return next((v for lb, v in self.encoding_options if lb == label), "auto")
 
         # --- 非比例伸缩 ---
         g2 = ttkb.Labelframe(dlg, text="非比例伸缩 (NOT TO SCALE)", padding=10)
@@ -816,6 +830,7 @@ class PcfApp:
                 s["skew"] = float(skew_var.get() or 10.0)
                 s["spool"] = spool_var.get().strip()
                 s["ffw"] = bool(ffw_var.get())
+                s["encoding"] = enc_selected()
             except ValueError:
                 messagebox.showwarning("出图设置", "数值参数必须是数字", parent=dlg)
                 return
@@ -875,11 +890,12 @@ class PcfApp:
             target=self._render_iso_worker,
             args=(folder, pcf_files, s["north"], s["quadrant"], s["spool"] or None,
                   s["ffw"], s["paper"], s["to_scale"], s["nts_min"], s["nts_max"],
-                  s["skew"]), daemon=True)
+                  s["skew"], s.get("encoding", "auto")), daemon=True)
         thread.start()
 
     def _render_iso_worker(self, folder, pcf_files, north, quadrant, spool_key,
-                           detect_ffw, paper, to_scale, nts_min, nts_max, skew):
+                           detect_ffw, paper, to_scale, nts_min, nts_max, skew,
+                           encoding="auto"):
         """后台渲染（工作线程）"""
         try:
             import pcf_renderer
@@ -890,6 +906,7 @@ class PcfApp:
                 paper=paper, to_scale=to_scale,
                 spool_key=spool_key, detect_ffw=detect_ffw,
                 nts_min_mm=nts_min, nts_max_mm=nts_max, skew_deg=skew,
+                encoding=encoding,
                 progress_cb=lambda msg, cur, tot: self.root.after(
                     0, lambda m=msg, c=cur, t=tot: self.status_var.set(f"{m} ({c}/{t})")))
 

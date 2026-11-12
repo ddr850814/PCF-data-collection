@@ -46,14 +46,23 @@ def _cuts_csv_path(pdf_path: Path) -> Path:
     return pdf_path.with_name(pdf_path.stem + "_cuts.csv")
 
 
-def _write_welds_csv(result, path: Path) -> Path:
+def csv_output_encoding(encoding: str) -> str:
+    """CSV 写出编码：跟随所选编码；auto（读入时自动识别）→ utf-8-sig。
+
+    utf-8-sig 带 BOM，中文 Excel 双击即可正确显示；显式选了 GBK 等编码
+    时 CSV 也用同一编码写出，保持与收集/读入编码体系一致。
+    """
+    return "utf-8-sig" if encoding == "auto" else encoding
+
+
+def _write_welds_csv(result, path: Path, encoding: str = "utf-8-sig") -> Path:
     fields = [
         "weld_number", "label", "joint", "nps", "x_mm", "y_mm",
         "page_width_mm", "page_height_mm",
         "world_x", "world_y", "world_z", "pipeline", "description", "uci",
         "neighbors", "spool", "notes", "map_item_id",
     ]
-    with open(path, "w", newline="", encoding="utf-8") as handle:
+    with open(path, "w", newline="", encoding=encoding, errors="replace") as handle:
         writer = csv.writer(handle)
         writer.writerow(fields)
         for weld in result.welds:
@@ -68,11 +77,11 @@ def _write_welds_csv(result, path: Path) -> Path:
     return path
 
 
-def _write_bom_csv(result, doc, path: Path) -> Path:
+def _write_bom_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Path:
     fields = ["item", "code", "description", "nps", "class", "qty", "length_text",
               "length_in", "weight", "ucis"]
     metric = is_metric_units(doc.units_coords)
-    with open(path, "w", newline="", encoding="utf-8") as handle:
+    with open(path, "w", newline="", encoding=encoding, errors="replace") as handle:
         writer = csv.writer(handle)
         writer.writerow(fields)
         for line in result.bom:
@@ -90,13 +99,13 @@ def _write_bom_csv(result, doc, path: Path) -> Path:
     return path
 
 
-def _write_cuts_csv(result, doc, path: Path) -> Path:
+def _write_cuts_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Path:
     units = doc.units_coords
     fields = ["cut", "item_code", "description", "spool", "pipeline", "nps",
               "cut_length", "cut_length_text", "raw_length", "length_source",
               "direction", "end1_connection", "end1_joins", "end1_weld_gap",
               "end2_connection", "end2_joins", "end2_weld_gap", "uci"]
-    with open(path, "w", newline="", encoding="utf-8") as handle:
+    with open(path, "w", newline="", encoding=encoding, errors="replace") as handle:
         writer = csv.writer(handle)
         writer.writerow(fields)
         for piece in sorted(result.cut_pieces, key=lambda p: -p.cut_length):
@@ -179,7 +188,7 @@ def collect_pcf_files(paths) -> list[Path]:
 
 def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
                          to_scale=False, nts_min_mm=None, nts_max_mm=None,
-                         skew_deg=None):
+                         skew_deg=None, encoding="auto"):
     """实时预览：渲染单条管线的纯图面（无图框/标题栏/材料表），返回 PDF 字节。
 
     供 GUI 管线清单点击时后台调用，不出文件、不带图纸家具。
@@ -201,7 +210,7 @@ def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
     if skew_deg is not None:
         options.skew_deg = float(skew_deg)
 
-    doc = load(pcf_path)
+    doc = load(pcf_path, encoding=encoding)
     import tempfile
     fd, tmp = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
@@ -221,6 +230,7 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      notes=None, properties=None, to_scale=False,
                      spool_key=None, detect_ffw=False,
                      nts_min_mm=None, nts_max_mm=None, skew_deg=None,
+                     encoding="auto", csv_encoding=None,
                      progress_cb=None) -> list[dict]:
     """批量渲染 PCF 为轴测图。
 
@@ -235,10 +245,16 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
         spool_key:   分段属性名（如 SPOOL-IDENTIFIER）。设置后按该属性值标注分段，
                      跨段焊缝自动判定为现场焊（F.W.）。仅影响图面，不改数据
         detect_ffw:  检测现场调整焊（端面刚好贴合、无焊缝记录的接头）
+        encoding:    PCF 读入编码（auto/gbk/utf-8/utf-8-sig/latin-1，
+                     auto=GBK 优先，同收集器）
+        csv_encoding: CSV 导出编码；默认跟随 encoding（auto → utf-8-sig，
+                     带 BOM，中文 Excel 双击可读）
         progress_cb: 可选回调 cb(msg, current, total)
 
     返回: 每个文件的摘要列表 [{pcf, pdf, welds, bom, cuts, warnings}, ...]
     """
+    if csv_encoding is None:
+        csv_encoding = csv_output_encoding(encoding)
     files = collect_pcf_files(pcf_paths)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -254,7 +270,7 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     loaded = []
     for i, path in enumerate(files):
         report(f"解析 {path.name}", i)
-        loaded.append((path, load(path)))
+        loaded.append((path, load(path, encoding=encoding)))
 
     # 渲染前断连预检（只读检查，不改数据）：文件包含多个不连通管段组时给出警告
     split_warnings: dict[str, str] = {}
@@ -320,9 +336,9 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
             options.dims_sidecar = str(dims_file)  # 已有的人工标注覆写继续生效
 
         result = render_pdf(doc, pdf_path, options)
-        _write_welds_csv(result, _welds_csv_path(pdf_path))
-        _write_bom_csv(result, doc, _bom_csv_path(pdf_path))
-        _write_cuts_csv(result, doc, _cuts_csv_path(pdf_path))
+        _write_welds_csv(result, _welds_csv_path(pdf_path), encoding=csv_encoding)
+        _write_bom_csv(result, doc, _bom_csv_path(pdf_path), encoding=csv_encoding)
+        _write_cuts_csv(result, doc, _cuts_csv_path(pdf_path), encoding=csv_encoding)
         write_sidecar(dims_file, result.dimensions, doc.units_coords)
 
         warnings = list(result.warnings)
@@ -355,6 +371,12 @@ def main(argv=None) -> int:
     parser.add_argument("--spool-key", metavar="KEY",
                         help="分段属性名（如 SPOOL-IDENTIFIER），跨段焊缝自动判定为现场焊 F.W.")
     parser.add_argument("--detect-ffw", action="store_true", help="检测现场调整焊（贴合接头）")
+    parser.add_argument("--encoding", default="auto",
+                        choices=["auto", "gbk", "utf-8", "utf-8-sig", "latin-1"],
+                        help="PCF 读入编码（默认 auto=GBK 优先，同收集器）")
+    parser.add_argument("--csv-encoding", default=None,
+                        choices=["utf-8", "utf-8-sig", "gbk", "latin-1"],
+                        help="CSV 导出编码（默认跟随 --encoding，auto → utf-8-sig）")
     args = parser.parse_args(argv)
 
     summaries = render_pcf_files(
@@ -362,6 +384,7 @@ def main(argv=None) -> int:
         north_axis=args.north_axis, quadrant=args.quadrant, paper=args.paper,
         project=args.project, job=args.job, to_scale=args.to_scale,
         spool_key=args.spool_key, detect_ffw=args.detect_ffw,
+        encoding=args.encoding, csv_encoding=args.csv_encoding,
         progress_cb=lambda msg, cur, tot: print(f"[{cur}/{tot}] {msg}"))
 
     for s in summaries:

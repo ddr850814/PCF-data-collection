@@ -112,9 +112,28 @@ def write_document(doc: PcfDocument) -> str:
     return text
 
 
-def load(path: str | Path) -> PcfDocument:
+def decode_pcf_bytes(raw: bytes, encoding: str = "auto") -> str:
+    """PCF 字节 → 文本，与收集器（pcf_parser._open_file）同一套规则。
+
+    - 指定编码：按该编码解码，错误字符替换，不中断
+    - auto：BOM → UTF-8-SIG；否则 GBK → UTF-8 依次严格试解；latin-1 兜底
+      （中文项目多为 GBK，GBK 优先可避免中文描述被替换符污染）
+    """
+    if encoding != "auto":
+        return raw.decode(encoding, errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8", errors="replace")
+    for enc in ("gbk", "utf-8"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def load(path: str | Path, encoding: str = "auto") -> PcfDocument:
     path = Path(path)
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = decode_pcf_bytes(path.read_bytes(), encoding)
     return parse_document(text, source_path=str(path))
 
 

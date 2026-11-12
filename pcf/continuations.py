@@ -84,6 +84,23 @@ def _round(point: Vec3, quantum: float) -> tuple[int, int, int]:
             round(point[2] / quantum))
 
 
+def reference_names(ref: str) -> list[str]:
+    """An ISOGEN reference split into the names it shows, one per line.
+
+    In PCF text ``$`` is ISOGEN's line-break within a printed field, so a
+    connection reference like ``2105\\21053000$2105-BR3R-30001`` displays as
+    two lines -- a sheet/area reference and the line it hands over to. Each
+    line is stripped of any ``path\\sheet`` prefix so what survives is usable
+    both as a pipeline name to match against and as clean display text.
+    """
+    names: list[str] = []
+    for part in ref.split("$"):
+        part = part.strip().rsplit("\\", 1)[-1].strip()
+        if part:
+            names.append(part)
+    return names
+
+
 class _PointIndex:
     """Spatial hash of every sheet's connection points, for cross matching.
 

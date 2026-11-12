@@ -60,7 +60,7 @@ from itertools import permutations
 from pathlib import Path
 
 from . import geometry
-from .continuations import Continuation
+from .continuations import Continuation, reference_names
 from .cutlist import CutPiece, build_cutlist
 from .dims import (DEFAULT_OFFSET_MM, Dimension, flange_face,
                    infer_dimensions, load_sidecar, merge_with_sidecar)
@@ -1032,17 +1032,29 @@ def render_pdf(
 ) -> RenderResult:
     try:
         from fpdf import FPDF
+        from fpdf.errors import FPDFUnicodeEncodingException
     except ImportError as exc:  # pragma: no cover
         raise ImportError(
             "fpdf2 is required for PDF rendering: pip install fpdf2"
         ) from exc
+
+    class _Pdf(FPDF):
+        """内置 helvetica 只支持 cp1252：PCF 文本经 errors=replace 读取可能
+        混入 U+FFFD 等超范围字符，整张图会因此渲染失败。这里把写不出
+        的字符降级为 '?'，保证出图不中断。"""
+
+        def normalize_text(self, text: str) -> str:
+            try:
+                return super().normalize_text(text)
+            except FPDFUnicodeEncodingException:
+                return text.encode("cp1252", "replace").decode("cp1252")
 
     options = options or RenderOptions()
     output_path = Path(output_path)
     warnings: list[str] = []
 
     page_w, page_h = _PAPERS.get(options.paper.lower(), _PAPERS["tabloid"])
-    pdf = FPDF(orientation="landscape" if page_w >= page_h else "portrait",
+    pdf = _Pdf(orientation="landscape" if page_w >= page_h else "portrait",
                unit="mm", format=(page_h, page_w) if page_w >= page_h else (page_w, page_h))
     pdf.set_auto_page_break(False)
     pdf.add_page()
@@ -1219,9 +1231,10 @@ def render_pdf(
         _draw_continuation(canvas, projector, cont, doc, options, draw_centre)
         drawn_continuations.append(cont)
         if not cont.resolved:
+            names = " / ".join(reference_names(cont.reference)) or cont.reference
             warnings.append(
                 f"continuation at {_coordinate_text(cont.point, doc, options)} "
-                f"is labelled from the PCF's own reference ({cont.reference}) "
+                f"is labelled from the PCF's own reference ({names}) "
                 "-- no drawing in this render set owns the other side of that "
                 "joint")
 
@@ -1497,7 +1510,16 @@ def _draw_continuation(canvas: _Canvas, proj: Projector, cont: Continuation,
     canvas.line(at, tip, width=0.35)
     _draw_arrowhead(canvas, tip, _v2_scale(out, -1.0))
 
-    lines = [f"CONT ON {cont.label}", *_coordinate_lines(cont.point, doc, options)]
+    if cont.resolved:
+        lines = [f"CONT ON {cont.label}",
+                 *_coordinate_lines(cont.point, doc, options)]
+    else:
+        # ISOGEN 的 $ 是字段内的分行显示符：未解析的 fallback 引用按原意
+        # 拆成多行，还原它在 ISOGEN 图面上的两行显示（图纸/区域引用 + 管线号）。
+        parts = [p.strip() for p in cont.label.split("$") if p.strip()]
+        lines = [f"CONT ON {parts[0]}",
+                 *parts[1:],
+                 *_coordinate_lines(cont.point, doc, options)]
     canvas.pdf.set_font("Helvetica", size=_CONT_FONT)
     text_w = max(canvas.pdf.get_string_width(line) for line in lines)
     w = text_w + 2 * _CONT_PAD_MM
