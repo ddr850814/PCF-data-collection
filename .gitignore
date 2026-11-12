@@ -4,3 +4,4 @@ dist/
 preview/
 .screenshots/
 *.pdf
+build/

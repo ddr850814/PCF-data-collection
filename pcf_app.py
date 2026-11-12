@@ -6,6 +6,7 @@
 3. 右键导出数据到 Excel
 """
 
+import io
 import os
 import re
 import threading
@@ -25,6 +26,14 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
+
+# 图面预览：PyMuPDF 渲染 PDF + Pillow 显示（ttkbootstrap 自带 Pillow）
+try:
+    import fitz  # PyMuPDF
+    from PIL import Image, ImageTk
+    HAS_PREVIEW = True
+except ImportError:
+    HAS_PREVIEW = False
 
 
 class PcfApp:
@@ -67,36 +76,29 @@ class PcfApp:
         main_paned = ttkb.Panedwindow(self.root, orient=tk.HORIZONTAL, bootstyle=SECONDARY)
         main_paned.pack(fill=BOTH, expand=YES, padx=6, pady=6)
 
-        # ========== 左侧：数据表格 ==========
+        # ========== 左侧：图面预览（不含图框） ==========
         left_frame = ttkb.Frame(main_paned)
-        main_paned.add(left_frame, weight=2)
+        main_paned.add(left_frame, weight=3)
 
-        # 数据表格标题
-        ttkb.Label(left_frame, text="数据列表", font=("-size", 11, "-weight", "bold"),
+        ttkb.Label(left_frame, text="图面预览（Ctrl+滚轮缩放 / 拖动平移 / 双击复位）",
+                   font=("-size", 11, "-weight", "bold"),
                    bootstyle=INVERSE).pack(fill=X, pady=(0, 4))
 
-        # DataGridView 等价物 - Treeview
-        tree_container = ttkb.Frame(left_frame)
-        tree_container.pack(fill=BOTH, expand=YES)
-
-        self.tree = ttkb.Treeview(tree_container, show="headings", bootstyle=PRIMARY, style="Grid.Treeview")
-        tree_scroll_y = ttkb.Scrollbar(tree_container, orient=VERTICAL, command=self.tree.yview, bootstyle=ROUND)
-        tree_scroll_x = ttkb.Scrollbar(tree_container, orient=HORIZONTAL, command=self.tree.xview, bootstyle=ROUND)
-        self.tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
-
-        self.tree.grid(row=0, column=0, sticky=NSEW)
-        tree_scroll_y.grid(row=0, column=1, sticky=NS)
-        tree_scroll_x.grid(row=1, column=0, sticky=EW)
-        tree_container.grid_rowconfigure(0, weight=1)
-        tree_container.grid_columnconfigure(0, weight=1)
-
-        # 右键菜单
-        self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="导出 Excel", command=self._on_export)
-        self.tree.bind("<Button-3>", self._on_right_click)
-
-        # 选中行变化事件
-        self.tree.bind("<<TreeviewSelect>>", self._on_cell_changed)
+        self.preview_canvas = tk.Canvas(left_frame, bg="#404040", highlightthickness=0)
+        self.preview_canvas.pack(fill=BOTH, expand=YES)
+        self._preview_photo = None
+        self._preview_pdf = None
+        if not HAS_PREVIEW:
+            self.preview_canvas.create_text(
+                200, 60, text="缺少 PyMuPDF/Pillow，无法预览\npip install pymupdf",
+                fill="white", anchor="nw")
+        self.preview_canvas.bind("<Configure>", lambda e: self._on_preview_resize())
+        # Ctrl+滚轮缩放 / 左键拖动平移 / 双击复位 fit
+        self.preview_canvas.bind("<MouseWheel>", self._on_preview_wheel)
+        self.preview_canvas.bind("<Button-1>", self._on_preview_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_preview_motion)
+        self.preview_canvas.bind("<Double-Button-1>",
+                                 lambda e: self._reset_preview_view())
 
         # ========== 右侧：控制面板 + 属性面板 ==========
         right_frame = ttkb.Frame(main_paned)
@@ -133,6 +135,11 @@ class PcfApp:
         self.combo_encoding.current(0)
         self.combo_encoding.pack(side=LEFT, fill=X, expand=YES)
 
+        # 导出表格：独立按钮（原数据表右键导出）
+        self.btn_export = ttkb.Button(btn_frame, text="导出表格", command=self._on_export,
+                                      bootstyle=(DANGER, OUTLINE))
+        self.btn_export.pack(side=LEFT, padx=4)
+
         # 绘图面板：PCF -> 轴测图 PDF（基于 pcf2iso）
         render_frame = ttkb.Labelframe(right_frame, text="绘图", padding=8)
         render_frame.pack(fill=X, padx=4, pady=4)
@@ -141,64 +148,56 @@ class PcfApp:
                                       bootstyle=(WARNING, OUTLINE))
         self.btn_render.pack(side=LEFT, padx=4)
 
-        ttkb.Label(render_frame, text="北向轴:", bootstyle=PRIMARY).pack(side=LEFT, padx=(8, 2))
-        self.north_options = [("Y", "Y"), ("X", "X"), ("Y-递减", "Y-decreasing"), ("X-递减", "X-decreasing")]
-        self.north_var = tk.StringVar(value="Y")
-        self.combo_north = ttkb.Combobox(render_frame, state="readonly", width=8,
-                                         values=[label for label, _ in self.north_options],
-                                         textvariable=self.north_var, bootstyle=PRIMARY)
-        self.combo_north.current(0)
-        self.combo_north.pack(side=LEFT)
-
-        ttkb.Label(render_frame, text="象限:", bootstyle=PRIMARY).pack(side=LEFT, padx=(8, 2))
-        self.quadrant_var = tk.StringVar(value="NE")
-        self.combo_quadrant = ttkb.Combobox(render_frame, state="readonly", width=6,
-                                            values=["NE", "NW", "SW", "SE"],
-                                            textvariable=self.quadrant_var, bootstyle=PRIMARY)
-        self.combo_quadrant.current(0)
-        self.combo_quadrant.pack(side=LEFT)
-
-        # 第二行：分段属性（现场焊判定）+ 现场调整焊检测
-        render_row2 = ttkb.Frame(render_frame)
-        render_row2.pack(fill=X, pady=(6, 0))
-
-        ttkb.Label(render_row2, text="分段属性(如SPOOL-IDENTIFIER):",
-                   bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
-        self.spool_var = tk.StringVar(value="")
-        self.entry_spool = ttkb.Entry(render_row2, textvariable=self.spool_var, width=18)
-        self.entry_spool.pack(side=LEFT)
-
-        self.ffw_var = tk.BooleanVar(value=False)
-        self.chk_ffw = ttkb.Checkbutton(render_row2, text="检测现场调整焊",
-                                        variable=self.ffw_var, bootstyle=PRIMARY)
-        self.chk_ffw.pack(side=LEFT, padx=(8, 0))
+        # 出图设置：全部渲染参数集中到一个弹窗按钮里
+        self.render_settings = {
+            "north": "Y", "quadrant": "SE", "paper": "tabloid",
+            "to_scale": False, "nts_min": 8.0, "nts_max": 70.0,
+            "skew": 10.0, "spool": "", "ffw": False,
+        }
+        self.btn_render_settings = ttkb.Button(render_frame, text="出图设置...",
+                                               command=self._open_render_settings,
+                                               bootstyle=(PRIMARY, OUTLINE))
+        self.btn_render_settings.pack(side=LEFT, padx=4)
+        self.render_summary = ttkb.Label(render_frame, text="", bootstyle=SECONDARY)
+        self.render_summary.pack(side=LEFT, padx=6)
+        self._update_render_summary()
 
         # 下拉框
-        combo_frame = ttkb.Frame(right_frame, padding=(8, 4))
-        combo_frame.pack(fill=X)
+        # ========== 管线清单（原类型下拉+属性详情位置） ==========
+        list_frame = ttkb.Labelframe(right_frame, text="管线清单", padding=4)
+        list_frame.pack(fill=BOTH, expand=YES, padx=4, pady=4)
 
-        ttkb.Label(combo_frame, text="类型:", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 4))
-        self.combo_type = ttkb.Combobox(combo_frame, state="readonly", values=["COUNT"], bootstyle=PRIMARY)
-        self.combo_type.current(0)
-        self.combo_type.state(["disabled"])
-        self.combo_type.pack(side=LEFT, fill=X, expand=YES)
-        self.combo_type.bind("<<ComboboxSelected>>", self._on_combo_changed)
+        list_btns = ttkb.Frame(list_frame)
+        list_btns.pack(fill=X, pady=(0, 3))
+        ttkb.Button(list_btns, text="全选", command=lambda: self._select_all(True),
+                    bootstyle=(INFO, OUTLINE), width=6).pack(side=LEFT, padx=2)
+        ttkb.Button(list_btns, text="清空", command=lambda: self._select_all(False),
+                    bootstyle=(SECONDARY, OUTLINE), width=6).pack(side=LEFT, padx=2)
+        ttkb.Label(list_btns, text="（勾选后生成轴测图）", bootstyle=SECONDARY).pack(side=LEFT, padx=6)
 
-        # PropertyGrid 等价物 - 属性 Treeview
-        prop_labelframe = ttkb.Labelframe(right_frame, text="属性详情", padding=4)
-        prop_labelframe.pack(fill=BOTH, expand=YES, padx=4, pady=4)
-
-        self.prop_tree = ttkb.Treeview(prop_labelframe, columns=("value",), show="tree headings",
-                                       bootstyle=INFO, style="Grid.Treeview")
-        prop_scroll = ttkb.Scrollbar(prop_labelframe, orient=VERTICAL, command=self.prop_tree.yview,
-                                     bootstyle=ROUND)
-        self.prop_tree.configure(yscrollcommand=prop_scroll.set)
-        self.prop_tree.heading("#0", text="属性")
-        self.prop_tree.heading("value", text="值")
-        self.prop_tree.column("#0", width=150)
-        self.prop_tree.column("value", width=200)
-        self.prop_tree.pack(side=LEFT, fill=BOTH, expand=YES)
-        prop_scroll.pack(side=RIGHT, fill=Y)
+        list_container = ttkb.Frame(list_frame)
+        list_container.pack(fill=BOTH, expand=YES)
+        self.pipe_tree = ttkb.Treeview(list_container, columns=("chk", "ref", "name", "has"),
+                                       show="headings", bootstyle=PRIMARY)
+        self.pipe_tree.heading("chk", text="选")
+        self.pipe_tree.heading("ref", text="管线号")
+        self.pipe_tree.heading("name", text="文件")
+        self.pipe_tree.heading("has", text="图")
+        self.pipe_tree.column("chk", width=34, anchor=CENTER, stretch=False)
+        self.pipe_tree.column("ref", width=130, stretch=True)
+        self.pipe_tree.column("name", width=130, stretch=True)
+        self.pipe_tree.column("has", width=30, anchor=CENTER, stretch=False)
+        list_scroll = ttkb.Scrollbar(list_container, orient=VERTICAL,
+                                     command=self.pipe_tree.yview, bootstyle=ROUND)
+        self.pipe_tree.configure(yscrollcommand=list_scroll.set)
+        self.pipe_tree.grid(row=0, column=0, sticky=NSEW)
+        list_scroll.grid(row=0, column=1, sticky=NS)
+        list_container.grid_rowconfigure(0, weight=1)
+        list_container.grid_columnconfigure(0, weight=1)
+        # 单击：切换勾选并预览已有图面
+        self.pipe_tree.bind("<ButtonRelease-1>", self._on_pipeline_click)
+        # 管线清单数据：[{path, name, ref, checked, pdf}]
+        self.pipeline_rows = []
 
         # 状态栏
         self.status_var = tk.StringVar()
@@ -208,11 +207,6 @@ class PcfApp:
         status_bar.pack(fill=X, side=BOTTOM)
 
     # ==================== 事件处理 ====================
-
-    def _on_right_click(self, event):
-        """右键菜单"""
-        if self.db_helper is not None and self.db_path is not None:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
 
     def _on_new_database(self):
         """新建数据库 - 选择文件夹并处理 PCF 文件"""
@@ -461,7 +455,7 @@ class PcfApp:
         elif self.success_count > 0:
             messagebox.showinfo("PCF处理完成", f"所有 {self.success_count} 个文件处理成功！")
 
-        self._populate_combo_and_load()
+        self._refresh_pipeline_list()
 
     def _on_processing_error(self, err_msg):
         """处理过程中出错回调（显示真实异常，避免线程静默退出）"""
@@ -479,82 +473,413 @@ class PcfApp:
 
         self.db_path = db_file
         self.db_helper = DatabaseHelper(db_file)
-        self._populate_combo_and_load()
-
-    def _populate_combo_and_load(self):
-        """动态填充下拉框并加载数据"""
-        # 获取有数据的组件类型
-        values = ["COUNT"]
-        for comp_type in self.COMPONENT_TYPES:
-            view_name = "X_UNION" if comp_type == "_UNION" else f"X{comp_type}"
-            try:
-                count = self.db_helper.execute_scalar(f"SELECT COUNT(*) FROM {view_name}")
-                if count and count > 0:
-                    display_name = comp_type.replace("_", "-")
-                    values.append(display_name)
-            except Exception:
-                continue
-
-        self.combo_type.state(["!disabled"])
-        self.combo_type["values"] = values
-        if self.combo_type.get() not in values:
-            self.combo_type.current(0)
-        self._load_data()
+        self._refresh_pipeline_list()
 
     # ==================== 数据加载 ====================
 
-    def _on_combo_changed(self, event):
-        self._load_data()
+    # ==================== 管线清单与图面预览 ====================
+
+    def _refresh_pipeline_list(self):
+        """从数据库导入来源重建管线清单（新建/打开数据库后调用）"""
+        self.pipeline_rows = []
+        folder, files = None, []
+        if self.db_helper is not None and self.db_path:
+            try:
+                import pcf_renderer
+                got = pcf_renderer.sources_from_db(self.db_path)
+                if got:
+                    folder, files = got
+            except Exception:
+                pass
+        ref_map = {}
+        if self.db_helper is not None:
+            try:
+                _cols, rows = self.db_helper.fill_data_table(
+                    "SELECT FILENAME, REFERENCE FROM PIPELINE")
+                for r in rows:
+                    if r[0] is not None:
+                        ref_map[str(r[0])] = "" if r[1] is None else str(r[1])
+            except Exception:
+                pass
+        for f in files:
+            base = os.path.basename(f)
+            stem = os.path.splitext(base)[0]
+            ref = next((v for k, v in ref_map.items()
+                        if k == base or k.endswith(base) or base.endswith(k)), "")
+            pdf = os.path.join(folder, "drawings", stem + ".pdf") if folder else None
+            self.pipeline_rows.append({
+                "path": f, "name": stem, "ref": ref or stem, "folder": folder,
+                "checked": True,
+                "pdf": pdf if (pdf and os.path.isfile(pdf)) else None,
+            })
+        self._redraw_list()
+        self.status_var.set(
+            f"管线清单：{len(self.pipeline_rows)} 条（来源 {folder or '—'}）")
+
+    def _redraw_list(self):
+        self.pipe_tree.delete(*self.pipe_tree.get_children())
+        for i, r in enumerate(self.pipeline_rows):
+            self.pipe_tree.insert("", tk.END, iid=str(i),
+                                  values=("☑" if r["checked"] else "☐",
+                                          r["ref"], r["name"],
+                                          "✓" if r["pdf"] else ""))
+
+    def _refresh_pdf_flags(self):
+        """出图后刷新"图"列与预览（保留勾选状态）"""
+        for r in self.pipeline_rows:
+            folder = r.get("folder") or os.path.dirname(r["path"])
+            f = os.path.join(folder, "drawings", r["name"] + ".pdf")
+            r["pdf"] = f if os.path.isfile(f) else None
+        self._redraw_list()
+
+    def _select_all(self, on):
+        for r in self.pipeline_rows:
+            r["checked"] = on
+        self._redraw_list()
+
+    def _on_pipeline_click(self, event):
+        iid = self.pipe_tree.identify_row(event.y)
+        if not iid:
+            return
+        r = self.pipeline_rows[int(iid)]
+        if self.pipe_tree.identify_column(event.x) == "#1":   # "选"列
+            r["checked"] = not r["checked"]
+            self._redraw_list()
+        self._start_live_preview(r["path"], r["ref"])
+
+    def _start_live_preview(self, pcf_path, ref=""):
+        """后台实时渲染该管线的纯图面（不出文件、无图框/材料表）"""
+        self._preview_token = getattr(self, "_preview_token", 0) + 1
+        token = self._preview_token
+        s = self.render_settings
+        self.status_var.set(f"预览渲染中：{ref or pcf_path} ...")
+
+        def work():
+            try:
+                import pcf_renderer
+                data = pcf_renderer.render_preview_bytes(
+                    pcf_path, north_axis=s["north"], quadrant=s["quadrant"],
+                    paper=s["paper"], to_scale=s["to_scale"],
+                    nts_min_mm=s["nts_min"], nts_max_mm=s["nts_max"],
+                    skew_deg=s["skew"])
+                if token == self._preview_token:
+                    self.root.after(0, lambda: self._show_preview_bytes(data, ref))
+            except Exception as exc:
+                err = str(exc)
+
+                def fail():
+                    self.status_var.set(f"预览失败：{err[:120]}")
+                if token == self._preview_token:
+                    self.root.after(0, fail)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_preview_bytes(self, pdf_bytes, label=""):
+        """把内存 PDF 画到预览画布：内容 bbox 裁剪 + 适配缩放"""
+        if not HAS_PREVIEW:
+            return
+        c = self.preview_canvas
+        c.delete("all")
+        cw, ch = max(c.winfo_width(), 80), max(c.winfo_height(), 60)
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page = doc[0]
+            # 预览模式无图框：直接取全部墨迹 bbox（矢量 + 文字——注释、
+            # NOT TO SCALE 戳等是纯文字，漏掉会被裁掉）
+            x0, y0, x1, y1 = page.rect.width, page.rect.height, 0.0, 0.0
+            rects = [dr["rect"] for dr in page.get_drawings()]
+            rects += [fitz.Rect(w[:4]) for w in page.get_text("words")]
+            for r in rects:
+                x0, y0 = min(x0, r.x0), min(y0, r.y0)
+                x1, y1 = max(x1, r.x1), max(y1, r.y1)
+            if x1 <= x0 or y1 <= y0:
+                c.create_text(cw // 2, ch // 2, text="（该管线无图面内容）",
+                              fill="#c0c0c0")
+                return
+            pad = 6 / 25.4 * 72
+            clip = fitz.Rect(max(0, x0 - pad), max(0, y0 - pad),
+                             min(page.rect.width, x1 + pad),
+                             min(page.rect.height, y1 + pad))
+            pix = page.get_pixmap(dpi=150, clip=clip)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            doc.close()
+            # 缓存高清位图：窗口尺寸变化时只重缩放，不再重渲染
+            self._preview_img = img
+            self._preview_label = label
+            # 新图重置视图：清空画布条目引用并回到 fit
+            self._preview_item = None
+            self._preview_photo = None
+            self._preview_zoom = None
+            self._draw_preview_img()
+            self.status_var.set(f"预览：{label}" if label else "预览完成")
+        except Exception:
+            c.create_text(cw // 2, ch // 2, text="预览失败", fill="white")
+
+    def _draw_preview_img(self):
+        """按当前缩放/平移状态把缓存位图画到画布（缩放变化时重缩放，平移时只挪坐标）"""
+        img = getattr(self, "_preview_img", None)
+        if img is None:
+            return
+        c = self.preview_canvas
+        cw, ch = max(c.winfo_width(), 80), max(c.winfo_height(), 60)
+        # 视图状态：zoom None = 自动 fit；否则 k 为对原图的缩放系数
+        if getattr(self, "_preview_zoom", None) is None:
+            k = min(cw / img.width, ch / img.height)
+            ox = (cw - img.width * k) / 2
+            oy = (ch - img.height * k) / 2
+        else:
+            k = self._preview_zoom
+            ox, oy = self._preview_off
+        self._preview_view = (k, ox, oy)
+        w, h = max(1, int(img.width * k)), max(1, int(img.height * k))
+        # 仅在目标尺寸变化时才重缩放位图（平移不触发）
+        if getattr(self, "_preview_photo", None) is None or \
+                (self._preview_photo.width(), self._preview_photo.height()) != (w, h):
+            self._preview_photo = ImageTk.PhotoImage(img.resize((w, h)))
+        if getattr(self, "_preview_item", None) is None:
+            self._preview_item = c.create_image(ox, oy, image=self._preview_photo,
+                                                anchor="nw")
+        else:
+            c.itemconfigure(self._preview_item, image=self._preview_photo)
+            c.coords(self._preview_item, ox, oy)
+
+    def _reset_preview_view(self):
+        """双击复位：回到自动 fit 居中"""
+        self._preview_zoom = None
+        self._preview_off = (0.0, 0.0)
+        self._draw_preview_img()
+
+    def _on_preview_wheel(self, e):
+        """Ctrl+滚轮缩放（以光标位置为锚点）；未按 Ctrl 不响应"""
+        if getattr(self, "_preview_img", None) is None or not (e.state & 0x0004):
+            return
+        if getattr(self, "_preview_zoom", None) is None:
+            # 从 fit 状态进入缩放：先把当前 fit 参数固化为视图状态
+            self._draw_preview_img()
+            k, ox, oy = self._preview_view
+            self._preview_zoom, self._preview_off = k, (ox, oy)
+        k = self._preview_zoom
+        ox, oy = self._preview_off
+        factor = 1.15 if e.delta > 0 else 1 / 1.15
+        nk = max(0.05, min(10.0, k * factor))
+        if nk == k:
+            return
+        # 保持光标下的图像点不动：img = (cursor - off) / k
+        self._preview_zoom = nk
+        self._preview_off = (e.x - (e.x - ox) * nk / k,
+                             e.y - (e.y - oy) * nk / k)
+        self._draw_preview_img()
+
+    def _on_preview_press(self, e):
+        self._preview_drag = (e.x, e.y, *self._preview_off) \
+            if getattr(self, "_preview_zoom", None) is not None else None
+
+    def _on_preview_motion(self, e):
+        if getattr(self, "_preview_drag", None) is None:
+            return
+        sx, sy, ox, oy = self._preview_drag
+        self._preview_off = (ox + e.x - sx, oy + e.y - sy)
+        self._draw_preview_img()
+
+    def _on_preview_resize(self):
+        """窗口/分栏变化：防抖后用缓存位图重绘（无需重新渲染 PDF）"""
+        if getattr(self, "_preview_img", None) is None:
+            self._show_preview(self._preview_pdf)
+            return
+        if getattr(self, "_preview_resize_job", None):
+            self.root.after_cancel(self._preview_resize_job)
+        self._preview_resize_job = self.root.after(
+            120, lambda: (setattr(self, "_preview_resize_job", None),
+                          self._draw_preview_img()))
+
+    def _show_preview(self, pdf_path):
+        """图面预览：渲染 PDF 首页，裁掉贴边的图框/标题栏，只留图面内容"""
+        self._preview_pdf = pdf_path
+        if not HAS_PREVIEW:
+            return
+        c = self.preview_canvas
+        c.delete("all")
+        cw, ch = max(c.winfo_width(), 80), max(c.winfo_height(), 60)
+        if not pdf_path or not os.path.isfile(pdf_path):
+            c.create_text(cw // 2, ch // 2, text="（无图面——勾选管线后点“生成轴测图”）",
+                          fill="#c0c0c0")
+            return
+        try:
+            doc = fitz.open(pdf_path)
+            page = doc[0]
+            W, H = page.rect.width, page.rect.height
+            margin = 8 / 25.4 * 72          # 距页边 8mm 内的线视为图框/表格骨架
+            x0, y0, x1, y1 = W, H, 0.0, 0.0
+            for dr in page.get_drawings():
+                r = dr["rect"]
+                if r.x0 < margin or r.y0 < margin or r.x1 > W - margin or r.y1 > H - margin:
+                    continue
+                x0, y0 = min(x0, r.x0), min(y0, r.y0)
+                x1, y1 = max(x1, r.x1), max(y1, r.y1)
+            if x1 <= x0 or y1 <= y0:
+                x0, y0, x1, y1 = margin, margin, W - margin, H - margin
+            pad = 6 / 25.4 * 72
+            clip = fitz.Rect(max(0, x0 - pad), max(0, y0 - pad),
+                             min(W, x1 + pad), min(H, y1 + pad))
+            pix = page.get_pixmap(dpi=150, clip=clip)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            doc.close()
+            # 缓存高清位图：窗口尺寸变化时只重缩放，不再重渲染
+            self._preview_img = img
+            self._preview_label = ""
+            # 新图重置视图：清空画布条目引用并回到 fit
+            self._preview_item = None
+            self._preview_photo = None
+            self._preview_zoom = None
+            self._draw_preview_img()
+        except Exception:
+            c.create_text(cw // 2, ch // 2, text="预览失败", fill="white")
 
     # ==================== 轴测图渲染 ====================
 
+    def _update_render_summary(self):
+        """绘图面板上的当前出图设置摘要"""
+        s = self.render_settings
+        nts = "按比例" if s["to_scale"] else f"NTS {s['nts_min']:g}-{s['nts_max']:g}mm"
+        spool = s["spool"] or "-"
+        self.render_summary.configure(
+            text=f"{s['north']}/{s['quadrant']} · {s['paper']} · {nts} · 斜倾{s['skew']:g}° · 分段:{spool}")
+
+    def _open_render_settings(self):
+        """出图设置弹窗：全部渲染参数集中于此"""
+        dlg = ttkb.Toplevel(self.root)
+        dlg.title("出图设置")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        s = dict(self.render_settings)
+
+        def row(parent):
+            f = ttkb.Frame(parent)
+            f.pack(fill=X, pady=3)
+            return f
+
+        # --- 视角与图纸 ---
+        g1 = ttkb.Labelframe(dlg, text="视角与图纸", padding=10)
+        g1.pack(fill=X, padx=10, pady=6)
+        f = row(g1)
+        ttkb.Label(f, text="北向轴:", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        north_var = tk.StringVar(value=s["north"])
+        ttkb.Combobox(f, state="readonly", width=12, values=["Y", "X", "Y-decreasing", "X-decreasing"],
+                      textvariable=north_var, bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 12))
+        ttkb.Label(f, text="象限:", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        quadrant_var = tk.StringVar(value=s["quadrant"])
+        ttkb.Combobox(f, state="readonly", width=5, values=["NE", "NW", "SW", "SE"],
+                      textvariable=quadrant_var, bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 12))
+        ttkb.Label(f, text="图纸:", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        paper_var = tk.StringVar(value=s["paper"])
+        ttkb.Combobox(f, state="readonly", width=8, values=["tabloid", "a3", "letter", "a4"],
+                      textvariable=paper_var, bootstyle=PRIMARY).pack(side=LEFT)
+
+        # --- 非比例伸缩 ---
+        g2 = ttkb.Labelframe(dlg, text="非比例伸缩 (NOT TO SCALE)", padding=10)
+        g2.pack(fill=X, padx=10, pady=6)
+        f = row(g2)
+        to_scale_var = tk.BooleanVar(value=s["to_scale"])
+        ttkb.Checkbutton(f, text="按真实比例出图（关闭 NTS）", variable=to_scale_var,
+                         bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 12))
+        f = row(g2)
+        ttkb.Label(f, text="最短管段(mm):", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        nts_min_var = tk.StringVar(value=str(s["nts_min"]))
+        ttkb.Entry(f, textvariable=nts_min_var, width=6).pack(side=LEFT, padx=(0, 12))
+        ttkb.Label(f, text="最长管段(mm):", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        nts_max_var = tk.StringVar(value=str(s["nts_max"]))
+        ttkb.Entry(f, textvariable=nts_max_var, width=6).pack(side=LEFT, padx=(0, 12))
+        ttkb.Label(f, text="斜管倾斜(°):", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        skew_var = tk.StringVar(value=str(s["skew"]))
+        ttkb.Entry(f, textvariable=skew_var, width=6).pack(side=LEFT)
+
+        # --- 分段与焊缝 ---
+        g3 = ttkb.Labelframe(dlg, text="分段与焊缝", padding=10)
+        g3.pack(fill=X, padx=10, pady=6)
+        f = row(g3)
+        ttkb.Label(f, text="分段属性(如SPOOL-IDENTIFIER):", bootstyle=PRIMARY).pack(side=LEFT, padx=(0, 2))
+        spool_var = tk.StringVar(value=s["spool"])
+        ttkb.Entry(f, textvariable=spool_var, width=20).pack(side=LEFT, padx=(0, 12))
+        ffw_var = tk.BooleanVar(value=s["ffw"])
+        ttkb.Checkbutton(f, text="检测现场调整焊", variable=ffw_var,
+                         bootstyle=PRIMARY).pack(side=LEFT)
+
+        def on_ok():
+            try:
+                s["north"] = north_var.get()
+                s["quadrant"] = quadrant_var.get()
+                s["paper"] = paper_var.get()
+                s["to_scale"] = bool(to_scale_var.get())
+                s["nts_min"] = float(nts_min_var.get() or 8.0)
+                s["nts_max"] = float(nts_max_var.get() or 70.0)
+                s["skew"] = float(skew_var.get() or 10.0)
+                s["spool"] = spool_var.get().strip()
+                s["ffw"] = bool(ffw_var.get())
+            except ValueError:
+                messagebox.showwarning("出图设置", "数值参数必须是数字", parent=dlg)
+                return
+            self.render_settings.update(s)
+            self._update_render_summary()
+            dlg.destroy()
+
+        btns = ttkb.Frame(dlg)
+        btns.pack(fill=X, padx=10, pady=(2, 10))
+        ttkb.Button(btns, text="确定", command=on_ok, bootstyle=SUCCESS).pack(side=RIGHT, padx=4)
+        ttkb.Button(btns, text="取消", command=dlg.destroy, bootstyle=(SECONDARY, OUTLINE)).pack(side=RIGHT)
+        dlg.wait_window()
+
     def _on_render_iso(self):
-        """生成轴测图：优先用当前数据库（或选择的数据库）记录的来源定位 PCF，失败再选文件夹"""
+        """生成轴测图：按管线清单勾选项出图；无清单时回退数据库来源/选文件夹"""
         import pcf_renderer
 
-        sources = None
-        # 1) 当前已打开的数据库
-        if self.db_helper is not None and self.db_path:
-            sources = pcf_renderer.sources_from_db(self.db_path)
+        folder = None
+        pcf_files = []
+        # 1) 管线清单勾选项优先
+        checked = [r for r in self.pipeline_rows if r["checked"]]
+        if checked:
+            folder = checked[0].get("folder") or os.path.dirname(checked[0]["path"])
+            pcf_files = [r["path"] for r in checked]
+        else:
+            sources = None
+            # 2) 当前已打开的数据库
+            if self.db_helper is not None and self.db_path:
+                sources = pcf_renderer.sources_from_db(self.db_path)
 
-        # 2) 让用户选一个数据库文件（读取其导入来源）
-        if sources is None:
-            db_file = filedialog.askopenfilename(
-                title="选择收集数据库（定位其导入的 PCF 文件）",
-                filetypes=[("SQLite 数据库", "*.db"), ("所有文件", "*.*")])
-            if not db_file:
-                return
-            sources = pcf_renderer.sources_from_db(db_file)
+            # 3) 让用户选一个数据库文件（读取其导入来源）
+            if sources is None:
+                db_file = filedialog.askopenfilename(
+                    title="选择收集数据库（定位其导入的 PCF 文件）",
+                    filetypes=[("SQLite 数据库", "*.db"), ("所有文件", "*.*")])
+                if not db_file:
+                    return
+                sources = pcf_renderer.sources_from_db(db_file)
 
-        # 3) 数据库也定位不到来源（旧库/PCF 已移动）→ 回退选 PCF 文件夹
-        if sources is None:
-            folder = filedialog.askdirectory(title="数据库中无来源记录，请直接选择 PCF 文件夹")
-            if not folder:
-                return
-            sources = pcf_renderer.collect_pcf_files([folder])
-            sources = (folder, [str(p) for p in sources])
-            if not sources[1]:
-                messagebox.showwarning("提示", "所选文件夹中没有 .pcf 文件")
-                return
+            # 4) 数据库也定位不到来源（旧库/PCF 已移动）→ 回退选 PCF 文件夹
+            if sources is None:
+                sel = filedialog.askdirectory(title="数据库中无来源记录，请直接选择 PCF 文件夹")
+                if not sel:
+                    return
+                sources = pcf_renderer.collect_pcf_files([sel])
+                sources = (sel, [str(p) for p in sources])
+                if not sources[1]:
+                    messagebox.showwarning("提示", "所选文件夹中没有 .pcf 文件")
+                    return
+            folder, pcf_files = sources
 
-        folder, pcf_files = sources
-        north = "Y"
-        for label, value in self.north_options:
-            if label == self.north_var.get():
-                north = value
-                break
-        quadrant = self.quadrant_var.get()
-        spool_key = self.spool_var.get().strip() or None
-        detect_ffw = bool(self.ffw_var.get())
+        s = self.render_settings
 
         self.btn_render.state(["disabled"])
         self.status_var.set(f"正在生成轴测图（来源: {folder}）...")
         thread = threading.Thread(
             target=self._render_iso_worker,
-            args=(folder, pcf_files, north, quadrant, spool_key, detect_ffw), daemon=True)
+            args=(folder, pcf_files, s["north"], s["quadrant"], s["spool"] or None,
+                  s["ffw"], s["paper"], s["to_scale"], s["nts_min"], s["nts_max"],
+                  s["skew"]), daemon=True)
         thread.start()
 
-    def _render_iso_worker(self, folder, pcf_files, north, quadrant, spool_key, detect_ffw):
+    def _render_iso_worker(self, folder, pcf_files, north, quadrant, spool_key,
+                           detect_ffw, paper, to_scale, nts_min, nts_max, skew):
         """后台渲染（工作线程）"""
         try:
             import pcf_renderer
@@ -562,7 +887,9 @@ class PcfApp:
             out_dir = os.path.join(folder, "drawings")
             summaries = pcf_renderer.render_pcf_files(
                 pcf_files, out_dir, north_axis=north, quadrant=quadrant,
+                paper=paper, to_scale=to_scale,
                 spool_key=spool_key, detect_ffw=detect_ffw,
+                nts_min_mm=nts_min, nts_max_mm=nts_max, skew_deg=skew,
                 progress_cb=lambda msg, cur, tot: self.root.after(
                     0, lambda m=msg, c=cur, t=tot: self.status_var.set(f"{m} ({c}/{t})")))
 
@@ -584,6 +911,11 @@ class PcfApp:
                                 ("\n..." if len(warn_lines) > 8 else ""))
                     messagebox.showinfo("生成轴测图", msg)
                     os.startfile(out_dir)
+                # 出图后刷新清单"图"列并实时预览第一条管线
+                self._refresh_pdf_flags()
+                src = next((s["pcf"] for s in summaries), None)
+                if src:
+                    self._start_live_preview(src)
             self.root.after(0, done)
         except Exception:
             err = traceback.format_exc()
@@ -593,181 +925,6 @@ class PcfApp:
                 self.status_var.set("轴测图生成失败")
                 messagebox.showerror("生成轴测图失败", err[-1500:])
             self.root.after(0, fail)
-
-    def _load_data(self):
-        """根据选择加载表格数据"""
-        selected = self.combo_type.get()
-        if not selected or self.db_helper is None:
-            return
-
-        if selected == "COUNT":
-            sql = "SELECT * FROM COUNT;"
-        else:
-            db_type = selected.replace("-", "_")
-            if db_type == "UNION":
-                db_type = "_UNION"
-            view_name = f"X{db_type}"
-            sql = f"SELECT * FROM {view_name};"
-
-        try:
-            columns, rows = self.db_helper.fill_data_table(sql)
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
-            return
-
-        self.current_columns = columns
-        self.current_rows = rows
-
-        # 更新 Treeview（COUNT隐藏FILENAME，其他类型隐藏FILENAME和UCI）
-        self._update_treeview(columns, rows, hide_first_cols=(1 if selected == "COUNT" else 2))
-
-        # 选中第一行（触发选中事件加载属性）
-        children = self.tree.get_children()
-        if children:
-            self.tree.selection_set(children[0])
-            self.tree.focus(children[0])
-
-    def _update_treeview(self, columns, rows, hide_first_cols=0):
-        """更新 Treeview 数据。hide_first_cols 为要隐藏的前N列数量。"""
-        self.tree.delete(*self.tree.get_children())
-
-        # 先清 displaycolumns 再清 columns，避免 Tk 校验旧列名报错
-        self.tree.configure(displaycolumns=())
-        self.tree.configure(columns=())
-
-        # 列名加 "c_" 前缀，避免与 Tk 内部列名冲突
-        safe_cols = tuple(f"c_{i}" for i in range(len(columns)))
-        self.tree.configure(columns=safe_cols)
-
-        # 设置显示列（隐藏前N列）
-        display_indices = list(range(hide_first_cols, len(columns)))
-        self.tree.configure(displaycolumns=tuple(safe_cols[i] for i in display_indices))
-
-        # 设置列标题
-        for i, col in enumerate(columns):
-            self.tree.heading(safe_cols[i], text=str(col))
-            self.tree.column(safe_cols[i], width=100, minwidth=50)
-
-        # 配置交替行颜色（模拟网格线效果）
-        self.tree.tag_configure("evenrow", background="#f0f0f0")
-        self.tree.tag_configure("oddrow", background="#ffffff")
-
-        # 填充数据（交替行颜色）
-        for idx, row in enumerate(rows):
-            values = [str(v) if v is not None else "" for v in row]
-            tag = "evenrow" if idx % 2 == 0 else "oddrow"
-            self.tree.insert("", tk.END, values=values, tags=(tag,))
-
-    def _on_cell_changed(self, event):
-        """选中行变化时加载属性"""
-        selected = self.combo_type.get()
-        if not selected:
-            return
-
-        selection = self.tree.selection()
-        if not selection:
-            return
-
-        item = self.tree.selection()[0]
-        item_index = self.tree.index(item)
-        self._load_properties_for_row(item_index, selected, self.current_columns)
-
-    def _load_properties_for_row(self, row_index, selected_type, columns):
-        """加载选中行的属性详情"""
-        if row_index < 0 or row_index >= len(self.current_rows):
-            return
-
-        row_data = self.current_rows[row_index]
-
-        self.prop_tree.delete(*self.prop_tree.get_children())
-
-        if selected_type == "COUNT":
-            file_name = row_data[0] if row_data else None
-            if file_name is not None:
-                self._load_pipeline_specs(file_name)
-        else:
-            file_name = row_data[0] if len(row_data) > 0 else None
-            uci = row_data[1] if len(row_data) > 1 else None
-            if file_name is not None and uci is not None:
-                self._load_point_data(file_name, uci)
-
-    def _load_pipeline_specs(self, file_name):
-        """加载 PIPELINE 属性到属性面板"""
-        columns, rows = self.db_helper.fill_data_table(
-            "SELECT PIPINGSPEC, INSULATIONSPEC, PAINTINGSPEC, TRACINGSPEC, REFERENCE "
-            "FROM PIPELINE WHERE FILENAME=?", (file_name,))
-
-        if not rows:
-            return
-
-        row = rows[0]
-        # 基本属性分类
-        cat_basic = self.prop_tree.insert("", tk.END, text="基本信息", values=("",), open=True)
-        self.prop_tree.insert(cat_basic, tk.END, text="文件名", values=(str(file_name),))
-        self.prop_tree.insert(cat_basic, tk.END, text="管线编号", values=(self._safe_str(row[4]),))
-        self.prop_tree.insert(cat_basic, tk.END, text="管道等级", values=(self._safe_str(row[0]),))
-        self.prop_tree.insert(cat_basic, tk.END, text="保温等级", values=(self._safe_str(row[1]),))
-        self.prop_tree.insert(cat_basic, tk.END, text="油漆等级", values=(self._safe_str(row[2]),))
-        self.prop_tree.insert(cat_basic, tk.END, text="伴热等级", values=(self._safe_str(row[3]),))
-
-        # 动态属性
-        attr_cols, attr_rows = self.db_helper.fill_data_table(
-            "SELECT ATTRIBUTE_NAME, ATTRIBUTE_VALUE FROM COMPONENT_ATTRIBUTES "
-            "WHERE FILENAME=? AND UCI LIKE 'PIPELINE:%' ORDER BY ATTRIBUTE_NAME", (file_name,))
-
-        if attr_rows:
-            cat_attr = self.prop_tree.insert("", tk.END, text="属性", values=("",), open=True)
-            for ar in attr_rows:
-                attr_name = self._safe_str(ar[0])
-                attr_value = self._safe_str(ar[1])
-                self.prop_tree.insert(cat_attr, tk.END, text=attr_name, values=(attr_value,))
-
-    def _load_point_data(self, file_name, uci):
-        """加载坐标点数据到属性面板"""
-        params = (uci, file_name)
-
-        # END_POINT
-        self._add_points_to_tree("END_POINT", "端点", "END_POINTX", "END_POINTY", "END_POINTZ", params)
-        # CENTRE_POINT
-        self._add_points_to_tree("CENTRE_POINT", "中心点", "CENTRE_POINTX", "CENTRE_POINTY", "CENTRE_POINTZ", params)
-        # BRANCH1_POINT
-        self._add_points_to_tree("BRANCH1_POINT", "分支点", "BRANCH1_POINTX", "BRANCH1_POINTY", "BRANCH1_POINTZ", params)
-        # BRANCH2_POINT
-        self._add_points_to_tree("BRANCH2_POINT", "分支点2", "BRANCH2_POINTX", "BRANCH2_POINTY", "BRANCH2_POINTZ", params)
-        # PORT_POINTn（多端口组件，动态表）
-        try:
-            _, port_tables = self.db_helper.fill_data_table(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'PORT_POINT%' ORDER BY name", ())
-            for row in port_tables:
-                tname = self._safe_str(row[0])
-                self._add_points_to_tree(tname, "端口点", f"{tname}X", f"{tname}Y", f"{tname}Z", params)
-        except Exception:
-            pass
-        # JACKET_POINT
-        self._add_points_to_tree("JACKET_POINT", "夹套点", "JACKET_POINTX", "JACKET_POINTY", "JACKET_POINTZ", params)
-        # CO_ORDS
-        self._add_points_to_tree("CO_ORDS", "坐标点", "CO_ORDSX", "CO_ORDSY", "CO_ORDSZ", params)
-
-    def _add_points_to_tree(self, table_name, display_name, col_x, col_y, col_z, params):
-        """查询坐标点表并添加到属性树"""
-        try:
-            columns, rows = self.db_helper.fill_data_table(
-                f"SELECT {col_x}, {col_y}, {col_z}, NPD, TYPE FROM {table_name} WHERE UCI IS ? AND FILENAME=?",
-                params)
-        except Exception:
-            return
-
-        if not rows:
-            return
-
-        for i, row in enumerate(rows):
-            label = display_name if i == 0 else f"{display_name}{i + 1}"
-            parent = self.prop_tree.insert("", tk.END, text=label, values=("",), open=True)
-            self.prop_tree.insert(parent, tk.END, text="X坐标", values=(self._safe_str(row[0]),))
-            self.prop_tree.insert(parent, tk.END, text="Y坐标", values=(self._safe_str(row[1]),))
-            self.prop_tree.insert(parent, tk.END, text="Z坐标", values=(self._safe_str(row[2]),))
-            self.prop_tree.insert(parent, tk.END, text="公称直径", values=(self._safe_str(row[3]),))
-            self.prop_tree.insert(parent, tk.END, text="端面形式", values=(self._safe_str(row[4]),))
 
     # ==================== 导出 Excel ====================
 

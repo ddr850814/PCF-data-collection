@@ -177,10 +177,50 @@ def collect_pcf_files(paths) -> list[Path]:
     return out
 
 
+def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
+                         to_scale=False, nts_min_mm=None, nts_max_mm=None,
+                         skew_deg=None):
+    """实时预览：渲染单条管线的纯图面（无图框/标题栏/材料表），返回 PDF 字节。
+
+    供 GUI 管线清单点击时后台调用，不出文件、不带图纸家具。
+    """
+    from pcf import RenderOptions, load, render_pdf as _render_pdf
+
+    options = RenderOptions(preview=True)
+    if north_axis:
+        options.north_axis = north_axis
+    if quadrant:
+        options.quadrant = quadrant
+    if paper:
+        options.paper = paper
+    options.not_to_scale = not to_scale
+    if nts_min_mm is not None:
+        options.nts_min_mm = float(nts_min_mm)
+    if nts_max_mm is not None:
+        options.nts_max_mm = float(nts_max_mm)
+    if skew_deg is not None:
+        options.skew_deg = float(skew_deg)
+
+    doc = load(pcf_path)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        _render_pdf(doc, tmp, options)
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      paper=None, project="", job="", revision=None,
                      notes=None, properties=None, to_scale=False,
                      spool_key=None, detect_ffw=False,
+                     nts_min_mm=None, nts_max_mm=None, skew_deg=None,
                      progress_cb=None) -> list[dict]:
     """批量渲染 PCF 为轴测图。
 
@@ -260,6 +300,13 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
         if properties:
             options.properties = dict(properties)
         options.not_to_scale = not to_scale
+        # 非比例伸缩与斜管倾斜的可调参数（GUI 出图设置弹窗用）
+        if nts_min_mm is not None:
+            options.nts_min_mm = float(nts_min_mm)
+        if nts_max_mm is not None:
+            options.nts_max_mm = float(nts_max_mm)
+        if skew_deg is not None:
+            options.skew_deg = float(skew_deg)
         if spool_key:
             options.spool_key = spool_key.strip().upper()
         if detect_ffw:
@@ -299,7 +346,7 @@ def main(argv=None) -> int:
     parser.add_argument("--north-axis", choices=["Y", "X", "Y-decreasing", "X-decreasing"],
                         help="哪根 PCF 轴是 plant north（默认 Y）")
     parser.add_argument("--quadrant", choices=["NE", "NW", "SW", "SE"],
-                        help="轴测视角象限（默认 NE）")
+                        help="轴测视角象限（默认 SE：北向标指向左上，同 ISOGEN 默认西偏北30°）")
     parser.add_argument("--paper", choices=["tabloid", "a3", "letter", "a4"],
                         help="图纸尺寸（默认 tabloid = 11x17）")
     parser.add_argument("--project", default="", help="标题栏 PROJECT")

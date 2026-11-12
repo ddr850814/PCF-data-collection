@@ -93,7 +93,9 @@ class RenderOptions:
     # 11x17 (tabloid/ledger) is the construction-industry standard iso sheet.
     paper: str = "tabloid"
     north_axis: str = "Y"            # Y | X | Y-decreasing | X-decreasing
-    quadrant: str = "NE"             # NE | NW | SW | SE
+    # ISOGEN 默认视角：北向标指向图面左上（西偏北 30°）——对照实测
+    # 2105 参考图（Y/SE 组合：+Y→210°左上、+X→330°右上、EL→竖直）
+    quadrant: str = "SE"             # NE | NW | SW | SE
     logo_path: str | None = None
     company_lines: list[str] = field(default_factory=list)
     project: str = ""
@@ -149,6 +151,9 @@ class RenderOptions:
     # spools is declared a field weld: "F.W." tag at the dot, label FW, and
     # "Field Weld" in the welds CSV notes column.
     spool_key: str | None = None
+    # 管线清单实时预览：只画图面内容（管线/符号/焊点/尺寸/注释/北向标/
+    # NTS 戳），不出图框、标题栏、BOM/切割表等"图纸家具"。
+    preview: bool = False
     # Where the piping leaves this sheet, and for which drawing. Resolved by
     # continuations.build_continuation_map() over every document about to be
     # rendered together, because the answer is the name of the NEXT SHEET --
@@ -1046,8 +1051,8 @@ def render_pdf(
 
     # ---- layout regions -------------------------------------------------
     border = 6.0
-    bom_w = page_w * 0.24 if options.show_bom else 0.0
-    title_h = page_h * 0.16
+    bom_w = page_w * 0.24 if (options.show_bom and not options.preview) else 0.0
+    title_h = 0.0 if options.preview else page_h * 0.16
     draw_region = (
         border + 2, border + 2,
         page_w - 2 * border - bom_w - 4,
@@ -1250,23 +1255,26 @@ def render_pdf(
                                   tolerance=geometry.model_tolerance(doc) * 4)
 
     # ---- furniture ----------------------------------------------------------
-    _draw_border(canvas, page_w, page_h, border)
+    # 预览模式仍画北向标/注释/NTS 戳（属于图面内容），只跳过
+    # 图框/BOM/切割表/标题栏等图纸家具。
     _draw_north_arrow(canvas, projector, (draw_region[0] + 8, draw_region[1] + 10))
     bom_truncated = cut_truncated = False
-    if options.show_bom:
-        bom_truncated, cut_truncated = _draw_bom_panel(
-            canvas, bom_rows, cut_pieces, welds, doc,
-            x=page_w - border - bom_w, y=border + 2,
-            w=bom_w - 2, h=page_h - 2 * border - title_h - 4,
-            show_cut_table=options.show_cut_table)
-    if bom_truncated or cut_truncated:
-        which = " & ".join(name for name, hit in
-                           (("BOM", bom_truncated), ("CUT LIST", cut_truncated)) if hit)
-        warnings.append(f"{which} truncated on the sheet -- split this drawing "
-                        "into smaller spools")
-        _draw_overflow_warning(canvas, draw_region, which)
-    _draw_title_block(canvas, doc, options, x=border, y=page_h - border - title_h,
-                      w=page_w - 2 * border, h=title_h)
+    if not options.preview:
+        _draw_border(canvas, page_w, page_h, border)
+        if options.show_bom:
+            bom_truncated, cut_truncated = _draw_bom_panel(
+                canvas, bom_rows, cut_pieces, welds, doc,
+                x=page_w - border - bom_w, y=border + 2,
+                w=bom_w - 2, h=page_h - 2 * border - title_h - 4,
+                show_cut_table=options.show_cut_table)
+        if bom_truncated or cut_truncated:
+            which = " & ".join(name for name, hit in
+                               (("BOM", bom_truncated), ("CUT LIST", cut_truncated)) if hit)
+            warnings.append(f"{which} truncated on the sheet -- split this drawing "
+                            "into smaller spools")
+            _draw_overflow_warning(canvas, draw_region, which)
+        _draw_title_block(canvas, doc, options, x=border, y=page_h - border - title_h,
+                          w=page_w - 2 * border, h=title_h)
 
     pdf.output(str(output_path))
 
