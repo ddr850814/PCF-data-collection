@@ -6,12 +6,13 @@
 3. 右键导出数据到 Excel
 """
 
-import io
+import math
 import os
 import re
 import threading
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 
 import ttkbootstrap as ttkb
@@ -27,13 +28,15 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
-# 图面预览：PyMuPDF 渲染 PDF + Pillow 显示（ttkbootstrap 自带 Pillow）
+# 预览矢量层抗锯齿：有 Pillow 时走超采样位图（方案同管架册 dxf_canvas.py），
+# 缺 Pillow 自动回退 Tk 原生画法（边缘硬但功能不受影响）
 try:
-    import fitz  # PyMuPDF
-    from PIL import Image, ImageTk
-    HAS_PREVIEW = True
+    from PIL import Image, ImageDraw, ImageTk
+    HAS_AA = True
 except ImportError:
-    HAS_PREVIEW = False
+    HAS_AA = False
+
+_SS = 3   # 超采样倍数：按 3× 分辨率画矢量层后 LANCZOS 降采样，得到抗锯齿边缘
 
 
 class PcfApp:
@@ -84,19 +87,18 @@ class PcfApp:
                    font=("-size", 11, "-weight", "bold"),
                    bootstyle=INVERSE).pack(fill=X, pady=(0, 4))
 
-        self.preview_canvas = tk.Canvas(left_frame, bg="#404040", highlightthickness=0)
+        self.preview_canvas = tk.Canvas(left_frame, bg="white", highlightthickness=0)
         self.preview_canvas.pack(fill=BOTH, expand=YES)
-        self._preview_photo = None
-        self._preview_pdf = None
-        if not HAS_PREVIEW:
-            self.preview_canvas.create_text(
-                200, 60, text="缺少 PyMuPDF/Pillow，无法预览\npip install pymupdf",
-                fill="white", anchor="nw")
+        # 预览状态：矢量场景（后台线程产出）+ 视图状态机，见 _show_scene/_draw_scene
+        self._preview_scene = None
+        self._preview_result = None
+        self._font_cache = {}           # (bold, px) -> (tkfont.Font, ascent)
         self.preview_canvas.bind("<Configure>", lambda e: self._on_preview_resize())
-        # Ctrl+滚轮缩放 / 左键拖动平移 / 双击复位 fit
+        # Ctrl+滚轮缩放 / 左键拖动平移 / 双击复位 fit / 单击命中元素打印标签
         self.preview_canvas.bind("<MouseWheel>", self._on_preview_wheel)
         self.preview_canvas.bind("<Button-1>", self._on_preview_press)
         self.preview_canvas.bind("<B1-Motion>", self._on_preview_motion)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._on_preview_release)
         self.preview_canvas.bind("<Double-Button-1>",
                                  lambda e: self._reset_preview_view())
 
@@ -557,13 +559,13 @@ class PcfApp:
         def work():
             try:
                 import pcf_renderer
-                data = pcf_renderer.render_preview_bytes(
+                scene, result = pcf_renderer.render_preview_scene(
                     pcf_path, north_axis=s["north"], quadrant=s["quadrant"],
                     paper=s["paper"], to_scale=s["to_scale"],
                     nts_min_mm=s["nts_min"], nts_max_mm=s["nts_max"],
                     skew_deg=s["skew"], encoding=s.get("encoding", "auto"))
                 if token == self._preview_token:
-                    self.root.after(0, lambda: self._show_preview_bytes(data, ref))
+                    self.root.after(0, lambda: self._show_scene(scene, result, ref))
             except Exception as exc:
                 err = str(exc)
 
@@ -574,88 +576,275 @@ class PcfApp:
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_preview_bytes(self, pdf_bytes, label=""):
-        """把内存 PDF 画到预览画布：内容 bbox 裁剪 + 适配缩放"""
-        if not HAS_PREVIEW:
-            return
+    def _show_scene(self, scene, result=None, label=""):
+        """缓存矢量场景并回放到预览画布：按墨迹 bbox 裁剪 + 适配缩放"""
         c = self.preview_canvas
         c.delete("all")
         cw, ch = max(c.winfo_width(), 80), max(c.winfo_height(), 60)
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            page = doc[0]
-            # 预览模式无图框：直接取全部墨迹 bbox（矢量 + 文字——注释、
-            # NOT TO SCALE 戳等是纯文字，漏掉会被裁掉）
-            x0, y0, x1, y1 = page.rect.width, page.rect.height, 0.0, 0.0
-            rects = [dr["rect"] for dr in page.get_drawings()]
-            rects += [fitz.Rect(w[:4]) for w in page.get_text("words")]
-            for r in rects:
-                x0, y0 = min(x0, r.x0), min(y0, r.y0)
-                x1, y1 = max(x1, r.x1), max(y1, r.y1)
-            if x1 <= x0 or y1 <= y0:
-                c.create_text(cw // 2, ch // 2, text="（该管线无图面内容）",
-                              fill="#c0c0c0")
-                return
-            pad = 6 / 25.4 * 72
-            clip = fitz.Rect(max(0, x0 - pad), max(0, y0 - pad),
-                             min(page.rect.width, x1 + pad),
-                             min(page.rect.height, y1 + pad))
-            pix = page.get_pixmap(dpi=150, clip=clip)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            doc.close()
-            # 缓存高清位图：窗口尺寸变化时只重缩放，不再重渲染
-            self._preview_img = img
-            self._preview_label = label
-            # 新图重置视图：清空画布条目引用并回到 fit
-            self._preview_item = None
-            self._preview_photo = None
-            self._preview_zoom = None
-            self._draw_preview_img()
-            self.status_var.set(f"预览：{label}" if label else "预览完成")
-        except Exception:
-            c.create_text(cw // 2, ch // 2, text="预览失败", fill="white")
+        if not scene.items:
+            c.create_text(cw // 2, ch // 2, text="（该管线无图面内容）",
+                          fill="#c0c0c0")
+            return
+        self._preview_scene = scene
+        self._preview_result = result
+        self._preview_label = label
+        # 新图重置视图：回到自动 fit 居中
+        self._preview_zoom = None
+        self._preview_off = (0.0, 0.0)
+        self._draw_scene()
+        self.status_var.set(f"预览：{label}" if label else "预览完成")
 
-    def _draw_preview_img(self):
-        """按当前缩放/平移状态把缓存位图画到画布（缩放变化时重缩放，平移时只挪坐标）"""
-        img = getattr(self, "_preview_img", None)
-        if img is None:
+    def _scene_font(self, size_pt, bold, k):
+        """pt 字号 × 缩放系数 → Tk 像素字体（负字号=像素）。返回 (Font, ascent)，
+        ascent 用于把 fpdf 的基线 y 换算成 Tk 的文字顶 y。"""
+        px = max(4, round(size_pt / 72 * 25.4 * k))
+        key = (bool(bold), px)
+        cached = self._font_cache.get(key)
+        if cached is None:
+            f = tkfont.Font(family="Helvetica", size=-px,
+                            weight=("bold" if bold else "normal"))
+            cached = (f, f.metrics("ascent"))
+            self._font_cache[key] = cached
+        return cached
+
+    @staticmethod
+    def _scene_color(rgb):
+        return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+    def _draw_scene(self):
+        """按当前缩放/平移状态把缓存场景回放到画布（全矢量，缩放无损）"""
+        scene = getattr(self, "_preview_scene", None)
+        if scene is None:
             return
         c = self.preview_canvas
+        # 预览无图框：按全部墨迹 bbox 裁剪 + 6mm 外边距（同旧位图版）
+        x0, y0, x1, y1 = scene.ink_bbox_mm or (0.0, 0.0, scene.page_w_mm, scene.page_h_mm)
+        pad = 6.0
+        bx0, by0 = max(0.0, x0 - pad), max(0.0, y0 - pad)
+        bx1, by1 = min(scene.page_w_mm, x1 + pad), min(scene.page_h_mm, y1 + pad)
+        bw, bh = max(bx1 - bx0, 1e-6), max(by1 - by0, 1e-6)
         cw, ch = max(c.winfo_width(), 80), max(c.winfo_height(), 60)
-        # 视图状态：zoom None = 自动 fit；否则 k 为对原图的缩放系数
+        # 视图状态：zoom None = 自动 fit；否则 k 为 px/mm 缩放系数
         if getattr(self, "_preview_zoom", None) is None:
-            k = min(cw / img.width, ch / img.height)
-            ox = (cw - img.width * k) / 2
-            oy = (ch - img.height * k) / 2
+            k = min(cw / bw, ch / bh)
+            ox = (cw - bw * k) / 2 - bx0 * k
+            oy = (ch - bh * k) / 2 - by0 * k
         else:
             k = self._preview_zoom
             ox, oy = self._preview_off
         self._preview_view = (k, ox, oy)
-        w, h = max(1, int(img.width * k)), max(1, int(img.height * k))
-        # 仅在目标尺寸变化时才重缩放位图（平移不触发）
-        if getattr(self, "_preview_photo", None) is None or \
-                (self._preview_photo.width(), self._preview_photo.height()) != (w, h):
-            self._preview_photo = ImageTk.PhotoImage(img.resize((w, h)))
-        if getattr(self, "_preview_item", None) is None:
-            self._preview_item = c.create_image(ox, oy, image=self._preview_photo,
-                                                anchor="nw")
+        c.delete("all")
+        PX = lambda v: v * k + ox           # 页 mm → 画布 px
+        PY = lambda v: v * k + oy
+        if HAS_AA:
+            # 抗锯齿路径：矢量层画进 3× 超采样 PIL 图，LANCZOS 降采样贴底
+            self._draw_scene_vectors_pil(c, scene.items, PX, PY, k, cw, ch)
         else:
-            c.itemconfigure(self._preview_item, image=self._preview_photo)
-            c.coords(self._preview_item, ox, oy)
+            for i, item in enumerate(scene.items):
+                if item.kind == "text":
+                    continue
+                tag = ("elem", str(i), item.kind)
+                col = self._scene_color(item.color)
+                fill = self._scene_color(item.fill) if item.fill else ""
+                wpx = max(1, round(item.width * k))
+                if item.kind == "line":
+                    c.create_line(PX(item.pts[0][0]), PY(item.pts[0][1]),
+                                  PX(item.pts[1][0]), PY(item.pts[1][1]),
+                                  fill=col, width=wpx, tags=tag,
+                                  dash=(max(1, round(item.dash * k)),) * 2
+                                  if item.dash else None)
+                elif item.kind == "rect":
+                    x, y, w, h = item.box
+                    c.create_rectangle(PX(x), PY(y), PX(x + w), PY(y + h),
+                                       outline=col if item.stroke else "",
+                                       width=wpx, fill=fill, tags=tag)
+                elif item.kind == "ellipse":
+                    x, y, w, h = item.box
+                    c.create_oval(PX(x), PY(y), PX(x + w), PY(y + h),
+                                  outline=col if item.stroke else "",
+                                  width=wpx, fill=fill, tags=tag)
+                elif item.kind == "polygon":
+                    c.create_polygon(
+                        [v for p in item.pts for v in (PX(p[0]), PY(p[1]))],
+                        outline=col if item.stroke else "", width=wpx,
+                        fill=fill, tags=tag)
+        # 文字层两路共用：Tk 系统字体本就抗锯齿，且带矩阵的能整串旋转
+        for i, item in enumerate(scene.items):
+            if item.kind == "text":
+                self._draw_scene_text(c, item, PX, PY, k,
+                                      ("elem", str(i), "text"))
+
+    def _draw_scene_text(self, c, item, PX, PY, k, tag):
+        """文字回放。普通文字整串画；带矩阵的（尺寸标注 iso_text、F.W.
+        斜置标签等）整串旋转，基线顺着 CTM x 轴方向——与 PDF 出图一致，
+        文字方向跟着标注线走。PDF 的 iso_text 还有字形斜切，Tk 画不出
+        斜切字形，纯旋转是计划内的近似。"""
+        col = self._scene_color(item.color)
+        if item.matrix is None:
+            font, ascent = self._scene_font(item.size, item.bold, k)
+            x, y = item.pts[0]
+            # fpdf text() 的 y 是基线；Tk anchor=nw 从顶画，先减 ascent
+            c.create_text(PX(x), PY(y) - ascent, text=item.text,
+                          fill=col, font=font, anchor="nw", tags=tag)
+            return
+        m = item.matrix
+        dx, dy = m[0], m[1]             # CTM x 轴 = 基线方向（页 mm，y 向下）
+        ux, uy = -m[2], -m[3]           # CTM (0,-1) = 字形上方向
+        scale = math.hypot(dx, dy) or 1.0
+        font, ascent = self._scene_font(item.size * scale, item.bold, k)
+        descent = font.metrics("descent")
+        x, y = item.pts[0]              # 局部基线锚点，经 CTM 映射到页 mm
+        wmm = (sum(item.widths) if item.widths
+               else font.measure(item.text) / k)
+        sx = m[0] * x + m[2] * y + m[4]
+        sy = m[1] * x + m[3] * y + m[5]
+        ex = m[0] * (x + wmm) + m[2] * y + m[4]
+        ey = m[1] * (x + wmm) + m[3] * y + m[5]
+        # Tk angle 逆时针为正、屏幕 y 向下：基线方向 (dx,dy) → 角度 atan2(-dy,dx)
+        ang = math.degrees(math.atan2(-dy, dx))
+        # anchor="center" 把外接框中心放在锚点上，而基线中心在框中心沿
+        # 字形下方向偏 (ascent-descent)/2 处——锚点沿字形上方向抬同量，
+        # 基线段中点才落回 mid
+        mid = ((PX(sx) + PX(ex)) / 2, (PY(sy) + PY(ey)) / 2)
+        nun = math.hypot(ux, uy) or 1.0
+        off = (ascent - descent) / 2
+        c.create_text(mid[0] + ux / nun * off, mid[1] + uy / nun * off,
+                      text=item.text, fill=col, font=font,
+                      angle=ang, anchor="center", tags=tag)
+
+    @staticmethod
+    def _pil_dash_segment(d, p0, p1, col, w, dash):
+        """PIL 线段（支持等长 on/off 虚线，单位为超采样像素）。"""
+        if not dash or dash <= 0:
+            d.line([p0, p1], fill=col, width=w)
+            return
+        x0, y0 = p0
+        x1, y1 = p1
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length < 1e-9:
+            return
+        ux, uy = (x1 - x0) / length, (y1 - y0) / length
+        period = 2.0 * dash                     # on + off 等长（同 Tk dash=(n,n)）
+        start = 0.0
+        while start < length:
+            end = min(start + dash, length)
+            d.line([(x0 + ux * start, y0 + uy * start),
+                    (x0 + ux * end, y0 + uy * end)], fill=col, width=w)
+            start += period
+
+    def _draw_scene_vectors_pil(self, c, items, PX, PY, k, cw, ch):
+        """矢量层 → 3× 超采样 PIL 图 → LANCZOS 降采样 → 贴画布底层。
+        文字不进位图：继续用 Tk 系统字体渲染（本就抗锯齿，且支持旋转）。"""
+        ss = _SS
+        img = Image.new("RGB", (max(1, cw * ss), max(1, ch * ss)), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        for item in items:
+            col = tuple(item.color)
+            fill = tuple(item.fill) if item.fill else None
+            w = max(1, round(item.width * k * ss))
+            dash = item.dash * k * ss if item.dash else None
+            if item.kind == "line":
+                p0 = (PX(item.pts[0][0]) * ss, PY(item.pts[0][1]) * ss)
+                p1 = (PX(item.pts[1][0]) * ss, PY(item.pts[1][1]) * ss)
+                self._pil_dash_segment(d, p0, p1, col, w, dash)
+            elif item.kind == "rect":
+                x, y, bw, bh = item.box
+                box = [PX(x) * ss, PY(y) * ss, PX(x + bw) * ss, PY(y + bh) * ss]
+                if item.stroke:
+                    d.rectangle(box, fill=fill, outline=col, width=w)
+                elif fill:
+                    d.rectangle(box, fill=fill)
+            elif item.kind == "ellipse":
+                x, y, bw, bh = item.box
+                box = [PX(x) * ss, PY(y) * ss, PX(x + bw) * ss, PY(y + bh) * ss]
+                if item.stroke:
+                    d.ellipse(box, fill=fill, outline=col, width=w)
+                elif fill:
+                    d.ellipse(box, fill=fill)
+            elif item.kind == "polygon":
+                pts = [(PX(p[0]) * ss, PY(p[1]) * ss) for p in item.pts]
+                if fill:
+                    d.polygon(pts, fill=fill)
+                if item.stroke:
+                    for a, b in zip(pts, pts[1:] + pts[:1]):
+                        self._pil_dash_segment(d, a, b, col, w, dash)
+        img = img.resize((cw, ch), Image.LANCZOS)
+        self._preview_photo = ImageTk.PhotoImage(img)   # 持引用防垃圾回收
+        c.create_image(0, 0, anchor="nw", image=self._preview_photo)
+
+    @staticmethod
+    def _pt_seg_dist(px, py, ax, ay, bx, by):
+        """点到线段距离（页 mm）"""
+        dx, dy = bx - ax, by - ay
+        l2 = dx * dx + dy * dy
+        if l2 < 1e-12:
+            return math.hypot(px - ax, py - ay)
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    def _pick_scene_item(self, e):
+        """画布像素 → 页 mm，按屏幕 6px 阈值找最近场景图元索引。
+        抗锯齿路径下矢量在位图里，无法靠 Tk 条目命中，统一几何拾取。"""
+        scene = getattr(self, "_preview_scene", None)
+        view = getattr(self, "_preview_view", None)
+        if scene is None or view is None:
+            return None
+        k, ox, oy = view
+        x, y = (e.x - ox) / k, (e.y - oy) / k
+        best, best_d = None, 6.0 / k
+        for idx, item in enumerate(scene.items):
+            if item.kind == "line":
+                (ax, ay), (bx, by) = item.pts[0], item.pts[1]
+                dist = self._pt_seg_dist(x, y, ax, ay, bx, by)
+            elif item.kind in ("rect", "ellipse"):
+                bx_, by_, bw, bh = item.box
+                dx0 = max(bx_ - x, 0.0, x - (bx_ + bw))
+                dy0 = max(by_ - y, 0.0, y - (by_ + bh))
+                dist = math.hypot(dx0, dy0)
+            elif item.kind == "polygon":
+                pts = item.pts
+                n = len(pts)
+                dist = min(self._pt_seg_dist(x, y, pts[i][0], pts[i][1],
+                                             pts[(i + 1) % n][0],
+                                             pts[(i + 1) % n][1])
+                           for i in range(n))
+                # 填充多边形内部算命中（射线法判内）
+                inside, j = False, n - 1
+                for i in range(n):
+                    xi, yi = pts[i]
+                    xj, yj = pts[j]
+                    if (yi > y) != (yj > y) and \
+                            x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+                        inside = not inside
+                    j = i
+                if inside:
+                    dist = 0.0
+            else:  # text：基线锚点（有矩阵先映射），按字高放宽阈值
+                if item.matrix:
+                    m = item.matrix
+                    tx = m[0] * item.pts[0][0] + m[2] * item.pts[0][1] + m[4]
+                    ty = m[1] * item.pts[0][0] + m[3] * item.pts[0][1] + m[5]
+                else:
+                    tx, ty = item.pts[0]
+                dist = max(0.0, math.hypot(x - tx, y - ty)
+                           - item.size * 0.35)
+            if dist < best_d:
+                best, best_d = idx, dist
+        return best
 
     def _reset_preview_view(self):
         """双击复位：回到自动 fit 居中"""
         self._preview_zoom = None
         self._preview_off = (0.0, 0.0)
-        self._draw_preview_img()
+        self._draw_scene()
 
     def _on_preview_wheel(self, e):
         """Ctrl+滚轮缩放（以光标位置为锚点）；未按 Ctrl 不响应"""
-        if getattr(self, "_preview_img", None) is None or not (e.state & 0x0004):
+        if getattr(self, "_preview_scene", None) is None or not (e.state & 0x0004):
             return
         if getattr(self, "_preview_zoom", None) is None:
             # 从 fit 状态进入缩放：先把当前 fit 参数固化为视图状态
-            self._draw_preview_img()
+            self._draw_scene()
             k, ox, oy = self._preview_view
             self._preview_zoom, self._preview_off = k, (ox, oy)
         k = self._preview_zoom
@@ -664,76 +853,55 @@ class PcfApp:
         nk = max(0.05, min(10.0, k * factor))
         if nk == k:
             return
-        # 保持光标下的图像点不动：img = (cursor - off) / k
+        # 保持光标下的图面点不动：page = (cursor - off) / k
         self._preview_zoom = nk
         self._preview_off = (e.x - (e.x - ox) * nk / k,
                              e.y - (e.y - oy) * nk / k)
-        self._draw_preview_img()
+        self._draw_scene()
 
     def _on_preview_press(self, e):
-        self._preview_drag = (e.x, e.y, *self._preview_off) \
-            if getattr(self, "_preview_zoom", None) is not None else None
+        self._preview_dragged = False
+        self._preview_drag = (e.x, e.y) \
+            if getattr(self, "_preview_scene", None) is not None \
+            and getattr(self, "_preview_zoom", None) is not None else None
 
     def _on_preview_motion(self, e):
-        if getattr(self, "_preview_drag", None) is None:
+        d = getattr(self, "_preview_drag", None)
+        if d is None:
             return
-        sx, sy, ox, oy = self._preview_drag
-        self._preview_off = (ox + e.x - sx, oy + e.y - sy)
-        self._draw_preview_img()
+        dx, dy = e.x - d[0], e.y - d[1]
+        if dx or dy:
+            # 平移走增量 move（不重建条目），比整帧重画轻
+            self.preview_canvas.move("all", dx, dy)
+            self._preview_drag = (e.x, e.y)
+            ox, oy = self._preview_off
+            self._preview_off = (ox + dx, oy + dy)
+            self._preview_dragged = True
+
+    def _on_preview_release(self, e):
+        """单击（未拖动）：几何拾取最近图元，打印其语义标签（焊点/管线/元件/标注）"""
+        if getattr(self, "_preview_dragged", False):
+            return
+        scene = getattr(self, "_preview_scene", None)
+        if scene is None:
+            return
+        idx = self._pick_scene_item(e)
+        if idx is None:
+            return
+        item = scene.items[idx]
+        print(f"[预览] kind={item.kind} tags={item.tags} text={item.text!r}")
+        if item.tags:
+            self.status_var.set(f"选中：{item.tags[0]} {item.tags[1]}")
 
     def _on_preview_resize(self):
-        """窗口/分栏变化：防抖后用缓存位图重绘（无需重新渲染 PDF）"""
-        if getattr(self, "_preview_img", None) is None:
-            self._show_preview(self._preview_pdf)
+        """窗口/分栏变化：防抖后全量重放矢量（场景已缓存，无需重新渲染）"""
+        if getattr(self, "_preview_scene", None) is None:
             return
         if getattr(self, "_preview_resize_job", None):
             self.root.after_cancel(self._preview_resize_job)
         self._preview_resize_job = self.root.after(
             120, lambda: (setattr(self, "_preview_resize_job", None),
-                          self._draw_preview_img()))
-
-    def _show_preview(self, pdf_path):
-        """图面预览：渲染 PDF 首页，裁掉贴边的图框/标题栏，只留图面内容"""
-        self._preview_pdf = pdf_path
-        if not HAS_PREVIEW:
-            return
-        c = self.preview_canvas
-        c.delete("all")
-        cw, ch = max(c.winfo_width(), 80), max(c.winfo_height(), 60)
-        if not pdf_path or not os.path.isfile(pdf_path):
-            c.create_text(cw // 2, ch // 2, text="（无图面——勾选管线后点“生成轴测图”）",
-                          fill="#c0c0c0")
-            return
-        try:
-            doc = fitz.open(pdf_path)
-            page = doc[0]
-            W, H = page.rect.width, page.rect.height
-            margin = 8 / 25.4 * 72          # 距页边 8mm 内的线视为图框/表格骨架
-            x0, y0, x1, y1 = W, H, 0.0, 0.0
-            for dr in page.get_drawings():
-                r = dr["rect"]
-                if r.x0 < margin or r.y0 < margin or r.x1 > W - margin or r.y1 > H - margin:
-                    continue
-                x0, y0 = min(x0, r.x0), min(y0, r.y0)
-                x1, y1 = max(x1, r.x1), max(y1, r.y1)
-            if x1 <= x0 or y1 <= y0:
-                x0, y0, x1, y1 = margin, margin, W - margin, H - margin
-            pad = 6 / 25.4 * 72
-            clip = fitz.Rect(max(0, x0 - pad), max(0, y0 - pad),
-                             min(W, x1 + pad), min(H, y1 + pad))
-            pix = page.get_pixmap(dpi=150, clip=clip)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            doc.close()
-            # 缓存高清位图：窗口尺寸变化时只重缩放，不再重渲染
-            self._preview_img = img
-            self._preview_label = ""
-            # 新图重置视图：清空画布条目引用并回到 fit
-            self._preview_item = None
-            self._preview_photo = None
-            self._preview_zoom = None
-            self._draw_preview_img()
-        except Exception:
-            c.create_text(cw // 2, ch // 2, text="预览失败", fill="white")
+                          self._draw_scene()))
 
     # ==================== 轴测图渲染 ====================
 

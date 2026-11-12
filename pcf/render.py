@@ -54,6 +54,7 @@ text. See _plan_dim_geometry().
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date as _date
 from itertools import permutations
@@ -756,6 +757,286 @@ def _cap_height_mm(font_pts: float) -> float:
 
 # ---------------------------------------------------------------------------
 # Renderer
+#
+# 双后端：_Canvas 与各 _draw_* 只面对统一绘图接口（fpdf2 同名方法 +
+# local_context/rotation/transform 上下文），由具体后端决定落向——
+# _FpdfBackend 原样转发 fpdf2 真正写出 PDF；_SceneBackend 收集自包含的
+# SceneItem（颜色/线宽/字号/变换全部随项快照），供 GUI 主线程用 tk.Canvas
+# 回放矢量预览，不再经 PyMuPDF 栅格化。
+
+
+class _FpdfBackend:
+    """fpdf2 直通后端：全部调用原样转发给 FPDF 实例。"""
+
+    def __init__(self, pdf):
+        self._pdf = pdf
+
+    def __getattr__(self, name):        # set_line_width/line/text/...
+        return getattr(self._pdf, name)
+
+    @contextmanager
+    def tags(self, *tags_):
+        """语义标签只属于矢量场景；PDF 出图时原样忽略。"""
+        yield
+
+
+# 字宽度量单例：布局决策（尺寸文字放线内/外、标签盒宽、_fit_text）依赖
+# get_string_width，预览回放必须与 PDF 用同一套 Helvetica 度量才能保证
+# 同版式。fpdf2 导入推迟到首次使用。
+_metrics_fpdf = None
+
+
+def _metrics():
+    global _metrics_fpdf
+    if _metrics_fpdf is None:
+        from fpdf import FPDF
+        _metrics_fpdf = FPDF(unit="mm")
+        _metrics_fpdf.add_page()
+    return _metrics_fpdf
+
+
+def _metric_safe_text(text: str) -> str:
+    """与 _Pdf.normalize_text 同款降级：cp1252 写不出的字符替换掉。"""
+    try:
+        text.encode("cp1252")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("cp1252", "replace").decode("cp1252")
+
+
+def _mat_mul(a, b):
+    """6 元组 PDF 矩阵复合 a·b（先作用 b 再作用 a）。"""
+    a0, a1, a2, a3, a4, a5 = a
+    b0, b1, b2, b3, b4, b5 = b
+    return (a0 * b0 + a2 * b1,
+            a1 * b0 + a3 * b1,
+            a0 * b2 + a2 * b3,
+            a1 * b2 + a3 * b3,
+            a0 * b4 + a2 * b5 + a4,
+            a1 * b4 + a3 * b5 + a5)
+
+
+def _mat_apply(m, p):
+    """矩阵 [a b c d e f] 作用于点：x' = a.x + c.y + e, y' = b.x + d.y + f."""
+    x, y = p
+    return (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+
+
+@dataclass
+class SceneItem:
+    """矢量场景图元：坐标为页 mm（左上原点），绘制状态全部随项自带。
+
+    ``matrix`` 是收集时的完整 CTM（已含 transform(...about x,y) 的平移
+    合成）；回放端把图元局部坐标经它映射即可，无需理解状态机。
+    """
+
+    kind: str                                  # line|rect|ellipse|polygon|text
+    pts: tuple[Vec2, ...] = ()                 # line(2 点)/polygon/text 锚点
+    box: tuple[float, float, float, float] | None = None  # rect/ellipse: x,y,w,h
+    text: str = ""                             # 文字内容
+    size: float = 0.0                          # 字号 pt
+    matrix: tuple[float, float, float, float, float, float] | None = None
+    color: tuple[int, int, int] = (0, 0, 0)    # 描边/文字颜色
+    fill: tuple[int, int, int] | None = None   # 填充色；None=不填充
+    stroke: bool = True                        # fpdf style 含 D 才描边；纯 F 填充无边
+    width: float = 0.4                         # 线宽 mm
+    dash: float | None = None                  # 虚线周期 mm；None=实线
+    bold: bool = False                         # 文字加粗（回放端字体权重）
+    widths: tuple[float, ...] = ()             # 逐字符字宽 mm（斜切文字排布用）
+    tags: tuple = ()                           # 语义标签 ("weld", 3) 等
+
+
+@dataclass
+class SceneModel:
+    """一页图纸的矢量场景：渲染后台线程产出，GUI 主线程回放。"""
+
+    page_w_mm: float
+    page_h_mm: float
+    items: list[SceneItem] = field(default_factory=list)
+    ink_bbox_mm: tuple[float, float, float, float] | None = None  # 墨迹范围
+
+    def _grow_ink(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        if self.ink_bbox_mm is None:
+            self.ink_bbox_mm = (x0, y0, x1, y1)
+        else:
+            bx0, by0, bx1, by1 = self.ink_bbox_mm
+            self.ink_bbox_mm = (min(bx0, x0), min(by0, y0),
+                                max(bx1, x1), max(by1, y1))
+
+
+class _SceneBackend:
+    """矢量场景后端：与 fpdf2 调用面同形的收集器。
+
+    当前变换矩阵（CTM）统一处理 rotation/transform 上下文：线/多边形按
+    点映射，矩形升格为映射后的多边形，文字则把 CTM 原样记进 SceneItem
+    交给回放端（tk 对斜切文字用逐字符映射近似）。
+    """
+
+    def __init__(self, scene: SceneModel):
+        self.scene = scene
+        self._stroke = (0, 0, 0)
+        self._fill = (0, 0, 0)
+        self._text = (0, 0, 0)
+        self._width = 0.4
+        self._size = 8.0
+        self._bold = False
+        self._dash: float | None = None
+        self._ctm = None
+        self._tags: tuple = ()
+
+    # ---- 状态设置（fpdf2 同名接口）-------------------------------------
+    def set_draw_color(self, r, g, b):
+        self._stroke = (r, g, b)
+
+    def set_text_color(self, r, g, b):
+        self._text = (r, g, b)
+
+    def set_fill_color(self, r, g, b):
+        self._fill = (r, g, b)
+
+    def set_line_width(self, w):
+        self._width = w
+
+    def set_dash_pattern(self, dash=0, gap=0, **_):
+        self._dash = None if not dash else float(dash)
+
+    def set_font(self, family, style="", size=8.0):
+        self._size = size
+        self._bold = "B" in (style or "")
+        _metrics().set_font(family, style=style, size=size)
+
+    def get_string_width(self, s):
+        return _metrics().get_string_width(_metric_safe_text(s))
+
+    # ---- 上下文（fpdf2 同名接口）----------------------------------------
+    @contextmanager
+    def local_context(self):
+        snap = (self._stroke, self._fill, self._text, self._width,
+                self._size, self._bold, self._dash, self._ctm, self._tags)
+        try:
+            yield self
+        finally:
+            (self._stroke, self._fill, self._text, self._width,
+             self._size, self._bold, self._dash, self._ctm, self._tags) = snap
+
+    @contextmanager
+    def tags(self, *tags_):
+        """上下文内收集的图元携带语义标签（焊点/管线/元件/标注）。"""
+        prev = self._tags
+        self._tags = tuple(tags_)
+        try:
+            yield
+        finally:
+            self._tags = prev
+
+    @contextmanager
+    def rotation(self, angle, x=None, y=None):
+        with self.transform(_rot_matrix(angle, x or 0.0, y or 0.0)):
+            yield self
+
+    @contextmanager
+    def transform(self, matrix):
+        """matrix 为 fpdf Transform；about(x, y) 已由调用方合成进矩阵。"""
+        m = (matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f) \
+            if hasattr(matrix, "a") else tuple(matrix)
+        prev = self._ctm
+        self._ctm = m if prev is None else _mat_mul(m, prev)
+        try:
+            yield self
+        finally:
+            self._ctm = prev
+
+    # ---- 图元 ------------------------------------------------------------
+    def line(self, x1, y1, x2, y2):
+        p, q = (x1, y1), (x2, y2)
+        if self._ctm is not None:
+            p, q = _mat_apply(self._ctm, p), _mat_apply(self._ctm, q)
+        self.scene.items.append(SceneItem(
+            "line", pts=(p, q), color=self._stroke,
+            width=self._width, dash=self._dash, tags=self._tags))
+        self.scene._grow_ink(min(p[0], q[0]), min(p[1], q[1]),
+                             max(p[0], q[0]), max(p[1], q[1]))
+
+    def ellipse(self, x, y, w, h, style="D", **_):
+        fill = self._fill if "F" in style else None
+        stroke = "D" in style
+        if self._ctm is not None:
+            # 变换下的椭圆按外接框四角映射后的包围盒近似（当前调用面
+            # 没有这种情形，仅作保险）。
+            corners = [_mat_apply(self._ctm, c)
+                       for c in ((x, y), (x + w, y), (x, y + h), (x + w, y + h))]
+            xs = [c[0] for c in corners]
+            ys = [c[1] for c in corners]
+            x, y = min(xs), min(ys)
+            w, h = max(xs) - x, max(ys) - y
+        self.scene.items.append(SceneItem(
+            "ellipse", box=(x, y, w, h), color=self._stroke,
+            fill=fill, stroke=stroke, width=self._width, tags=self._tags))
+        self.scene._grow_ink(x, y, x + w, y + h)
+
+    def rect(self, x, y, w, h, style="D", **_):
+        fill = self._fill if "F" in style else None
+        stroke = "D" in style
+        if self._ctm is not None:
+            # 斜切上下文中的矩形（iso_text 白底擦除）升格为映射后的多边形
+            pts = tuple(_mat_apply(self._ctm, c)
+                        for c in ((x, y), (x + w, y), (x + w, y + h), (x, y + h)))
+            self.scene.items.append(SceneItem(
+                "polygon", pts=pts, color=self._stroke,
+                fill=fill, stroke=stroke, width=self._width, tags=self._tags))
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            self.scene._grow_ink(min(xs), min(ys), max(xs), max(ys))
+            return
+        self.scene.items.append(SceneItem(
+            "rect", box=(x, y, w, h), color=self._stroke,
+            fill=fill, stroke=stroke, width=self._width, tags=self._tags))
+        self.scene._grow_ink(x, y, x + w, y + h)
+
+    def polygon(self, points, style="D", **_):
+        pts = tuple((p[0], p[1]) for p in points)
+        if self._ctm is not None:
+            pts = tuple(_mat_apply(self._ctm, p) for p in pts)
+        fill = self._fill if "F" in style else None
+        stroke = "D" in style
+        self.scene.items.append(SceneItem(
+            "polygon", pts=pts, color=self._stroke, fill=fill,
+            stroke=stroke, width=self._width, tags=self._tags))
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        self.scene._grow_ink(min(xs), min(ys), max(xs), max(ys))
+
+    def image(self, name, x=None, y=None, w=0.0, h=0.0, **_):
+        # 预览场景不渲染位图（logo 等图纸家具）；只登记范围供 fit 使用。
+        if x is not None and y is not None and w and h:
+            self.scene._grow_ink(x, y, x + w, y + h)
+
+    def text(self, x, y, txt):
+        txt = _metric_safe_text(txt)
+        met = _metrics()
+        w = met.get_string_width(txt)
+        widths = tuple(met.get_string_width(ch) for ch in txt)
+        cap = _cap_height_mm(self._size)
+        self.scene.items.append(SceneItem(
+            "text", pts=((x, y),), text=txt, size=self._size,
+            color=self._text, bold=self._bold, matrix=self._ctm,
+            widths=widths, tags=self._tags))
+        corners = [(x, y - cap), (x + w, y - cap), (x, y), (x + w, y)]
+        if self._ctm is not None:
+            corners = [_mat_apply(self._ctm, c) for c in corners]
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        self.scene._grow_ink(min(xs), min(ys), max(xs), max(ys))
+
+
+def _rot_matrix(angle_deg: float, cx: float, cy: float):
+    """绕 (cx, cy) 旋转 angle_deg 度（逆时针为正，同 fpdf.rotation）。"""
+    rad = math.radians(angle_deg)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    rot = (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0)
+    t1 = (1.0, 0.0, 0.0, 1.0, cx, cy)
+    t2 = (1.0, 0.0, 0.0, 1.0, -cx, -cy)
+    return _mat_mul(t1, _mat_mul(rot, t2))
 
 
 class _Canvas:
@@ -773,6 +1054,12 @@ class _Canvas:
         # longer leaders, <1 packs them tighter and tolerates near-touching.
         self.spread = spread
         self.pad = 0.6 * spread
+
+    @contextmanager
+    def tagged(self, *tags):
+        """本上下文内画出的图元在场景后端携带语义标签；fpdf 后端忽略。"""
+        with self.pdf.tags(*tags):
+            yield
 
     def line(self, a: Vec2, b: Vec2, width: float = 0.4, record: bool = True) -> None:
         self.pdf.set_line_width(width)
@@ -1051,8 +1338,6 @@ def render_pdf(
 
     options = options or RenderOptions()
     output_path = Path(output_path)
-    warnings: list[str] = []
-
     page_w, page_h = _PAPERS.get(options.paper.lower(), _PAPERS["tabloid"])
     pdf = _Pdf(orientation="landscape" if page_w >= page_h else "portrait",
                unit="mm", format=(page_h, page_w) if page_w >= page_h else (page_w, page_h))
@@ -1060,6 +1345,38 @@ def render_pdf(
     pdf.add_page()
     pdf.set_text_color(0, 0, 0)
     pdf.set_draw_color(0, 0, 0)
+    result = _render_document(doc, options, _FpdfBackend(pdf),
+                              page_w, page_h, pdf_path=output_path)
+    pdf.output(str(output_path))
+    return result
+
+
+def render_scene(
+    doc: PcfDocument,
+    options: RenderOptions | None = None,
+) -> tuple[SceneModel, RenderResult]:
+    """矢量场景渲染：与 render_pdf 共用同一套布局/绘制管线，仅后端不同。
+
+    返回 (SceneModel, RenderResult)：场景交给 GUI 主线程回放（不落盘、
+    不经 PyMuPDF 栅格化），RenderResult 照常携带焊点页坐标等元数据
+    （pdf_path 为 None）。
+    """
+    options = options or RenderOptions()
+    page_w, page_h = _PAPERS.get(options.paper.lower(), _PAPERS["tabloid"])
+    scene = SceneModel(page_w_mm=page_w, page_h_mm=page_h)
+    result = _render_document(doc, options, _SceneBackend(scene), page_w, page_h)
+    return scene, result
+
+
+def _render_document(
+    doc: PcfDocument,
+    options: RenderOptions,
+    backend,
+    page_w: float,
+    page_h: float,
+    pdf_path: Path | None = None,
+) -> RenderResult:
+    warnings: list[str] = []
 
     # ---- layout regions -------------------------------------------------
     border = 6.0
@@ -1071,7 +1388,7 @@ def render_pdf(
         page_h - 2 * border - title_h - 4,
     )
     spread = max(0.4, min(3.0, options.balloon_spread))
-    canvas = _Canvas(pdf, bounds=draw_region, spread=spread)
+    canvas = _Canvas(backend, bounds=draw_region, spread=spread)
 
     comps: list[tuple[Component, str]] = []
     for pipeline in doc.pipelines:
@@ -1155,12 +1472,17 @@ def render_pdf(
     olet_branch_conn = _olet_branch_connected(doc)
     flange_bar_mm = max(1.0, options.flange_bar_mm)
     anchors: dict[int, Vec2] = {}
-    for idx, (comp, _ref) in enumerate(comps):
+    for idx, (comp, ref) in enumerate(comps):
+        # 语义标签：直管段按管线号（拆图/分图按 run 定位），其余元件按
+        # UCI（缺省退回序号）。PDF 出图后端原样忽略。
+        tag = (("pipe", ref) if classify(comp.type) == "PIPE"
+               else ("component", comp.uci or str(idx)))
         try:
-            anchor = _draw_component(canvas, projector, comp, doc,
-                                     flange_face_pts, flange_bar_mm,
-                                     olet_header_pts, olet_branch_conn,
-                                     reducer_runs)
+            with canvas.tagged(*tag):
+                anchor = _draw_component(canvas, projector, comp, doc,
+                                         flange_face_pts, flange_bar_mm,
+                                         olet_header_pts, olet_branch_conn,
+                                         reducer_runs)
         except Exception as exc:  # defensive: a bad record must not kill the sheet
             warnings.append(f"component {idx} ({comp.type}): not drawn ({exc})")
             anchor = None
@@ -1198,7 +1520,8 @@ def render_pdf(
                     dot = w
                     break
         weld_dots.append(dot)
-        _draw_weld_symbol(canvas, projector, weld, dot)
+        with canvas.tagged("weld", weld.number):
+            _draw_weld_symbol(canvas, projector, weld, dot)
         nps = format_bore(weld.bore, doc.units_bore) if weld.bore else "?"
         weld_positions.append(WeldPosition(
             number=weld.number, label=weld.label, joint=weld.joint, nps=nps,
@@ -1228,7 +1551,8 @@ def render_pdf(
     for cont in options.continuations:
         if not cont.label:
             continue
-        _draw_continuation(canvas, projector, cont, doc, options, draw_centre)
+        with canvas.tagged("cont", cont.reference):
+            _draw_continuation(canvas, projector, cont, doc, options, draw_centre)
         drawn_continuations.append(cont)
         if not cont.resolved:
             names = " / ".join(reference_names(cont.reference)) or cont.reference
@@ -1289,8 +1613,6 @@ def render_pdf(
         _draw_title_block(canvas, doc, options, x=border, y=page_h - border - title_h,
                           w=page_w - 2 * border, h=title_h)
 
-    pdf.output(str(output_path))
-
     bom_lines = [
         BomLine(item=str(r["item"]), description=r["description"], nps=r["nps"],
                 cls=r["class"], qty=r["qty"], length_in=round(r["length_in"], 3),
@@ -1300,7 +1622,7 @@ def render_pdf(
     ]
 
     return RenderResult(
-        pdf_path=output_path,
+        pdf_path=pdf_path,
         page_width_mm=page_w,
         page_height_mm=page_h,
         welds=weld_positions,
@@ -3989,10 +4311,11 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
         # and every weld dot. The pipe's own anchor is excluded -- it is one
         # of the candidates, and a run must not be crowded out by itself.
         occupied = [p for i, p in anchors.items() if i != idx] + dots
-        anchor, pos = _draw_callout_box(
-            canvas, anchor, label, draw_centre,
-            options=_pipe_anchor_options(comp, proj) or [anchor],
-            occupied=occupied)
+        with canvas.tagged("callout", label):
+            anchor, pos = _draw_callout_box(
+                canvas, anchor, label, draw_centre,
+                options=_pipe_anchor_options(comp, proj) or [anchor],
+                occupied=occupied)
         callouts.append(Callout(
             item=label, kind="pipe", x_mm=round(pos[0], 2), y_mm=round(pos[1], 2),
             anchor_x_mm=round(anchor[0], 2), anchor_y_mm=round(anchor[1], 2),
@@ -4051,7 +4374,8 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
         label = "/".join([label] + [children[k] for k in ("BOLT", "GASKET")
                                     if k in children])
         anchor = anchors[idx]
-        _anchor, pos = _draw_callout_box(canvas, anchor, label, draw_centre)
+        with canvas.tagged("callout", label):
+            _anchor, pos = _draw_callout_box(canvas, anchor, label, draw_centre)
         callouts.append(Callout(
             item=label, kind="material",
             x_mm=round(pos[0], 2), y_mm=round(pos[1], 2),
@@ -4063,7 +4387,8 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
         if anchor is None:
             continue
         label = "/".join(children[k] for k in ("BOLT", "GASKET") if k in children)
-        _anchor, pos = _draw_callout_box(canvas, anchor, label, draw_centre)
+        with canvas.tagged("callout", label):
+            _anchor, pos = _draw_callout_box(canvas, anchor, label, draw_centre)
         callouts.append(Callout(
             item=label, kind="material",
             x_mm=round(pos[0], 2), y_mm=round(pos[1], 2),

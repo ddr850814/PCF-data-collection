@@ -225,6 +225,36 @@ def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
             pass
 
 
+def render_preview_scene(pcf_path, north_axis=None, quadrant=None, paper=None,
+                         to_scale=False, nts_min_mm=None, nts_max_mm=None,
+                         skew_deg=None, encoding="auto"):
+    """实时预览（全矢量）：渲染单条管线的纯图面，返回 (SceneModel, RenderResult)。
+
+    与 render_preview_bytes 同参数体系，但走矢量场景后端——不经临时
+    PDF/PyMuPDF 栅格化，GUI 主线程直接回放 SceneModel；RenderResult
+    携带焊点页坐标等元数据。
+    """
+    from pcf import RenderOptions, load, render_scene
+
+    options = RenderOptions(preview=True)
+    if north_axis:
+        options.north_axis = north_axis
+    if quadrant:
+        options.quadrant = quadrant
+    if paper:
+        options.paper = paper
+    options.not_to_scale = not to_scale
+    if nts_min_mm is not None:
+        options.nts_min_mm = float(nts_min_mm)
+    if nts_max_mm is not None:
+        options.nts_max_mm = float(nts_max_mm)
+    if skew_deg is not None:
+        options.skew_deg = float(skew_deg)
+
+    doc = load(pcf_path, encoding=encoding)
+    return render_scene(doc, options)
+
+
 def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      paper=None, project="", job="", revision=None,
                      notes=None, properties=None, to_scale=False,

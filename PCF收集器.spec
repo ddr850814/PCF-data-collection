@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['openpyxl', 'ttkbootstrap', 'PIL',
+hiddenimports = ['openpyxl', 'ttkbootstrap', 'PIL.ImageTk',
                  'pcf_renderer',   # 轴测图渲染适配层（pcf_app 内为惰性导入）
                  'pcf', 'fpdf']    # pcf2iso 渲染引擎 + fpdf2
 tmp_ret = collect_all('ttkbootstrap')
@@ -20,7 +20,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pymupdf', 'fitz'],   # 栅格化预览已弃用；PIL 仅用于预览抗锯齿超采样
     noarchive=False,
     optimize=0,
 )

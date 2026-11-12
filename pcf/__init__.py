@@ -79,8 +79,11 @@ from .render import (
     Callout,
     RenderOptions,
     RenderResult,
+    SceneItem,
+    SceneModel,
     WeldPosition,
     render_pdf,
+    render_scene,
 )
 from .skeys import classify, connection_from_skey, joint_from_skey, valve_subtype
 from .tracking import (
@@ -135,7 +138,8 @@ __all__ = [
     "Dimension", "EndInfo", "KeySurvey", "MapItem", "MergeError", "MergeResult",
     "PcfDocument", "Pipeline", "Point", "ProjectConfig", "RecordMatch",
     "RecordResult", "ReconcileResult", "RemovedWeld", "RenderOptions",
-    "RenderResult", "SplitError", "SplitResult", "Weld", "WeldPosition",
+    "RenderResult", "SceneItem", "SceneModel", "SplitError", "SplitResult",
+    "Weld", "WeldPosition",
     "aggregate_candidates", "archive_file", "best_split_key",
     "bore_to_inch", "bore_to_nps", "bounding_box",
     "build_continuation_map",
@@ -154,7 +158,8 @@ __all__ = [
     "match_map_items", "merge_documents", "merge_with_sidecar",
     "model_tolerance", "open_ends", "options_are_trivial",
     "parse_document", "parse_point",
-    "recommend_option", "reconcile_welds", "render_pdf", "resolve_src_dir",
+    "recommend_option", "reconcile_welds", "render_pdf", "render_scene",
+    "resolve_src_dir",
     "sanitize_sheet_value", "save",
     "save_config", "sheet_parent_stem", "sidecar_path",
     "split_by_distance", "split_by_key", "split_document",
