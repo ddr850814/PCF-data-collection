@@ -2387,6 +2387,29 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
         return eps[0] if eps else (cos[0] if cos else None)
 
     else:
+        if len(eps) >= 3 and _v2_len(_v2_sub(eps[1], eps[0])) > 1e-6:
+            # 未知多口件（≥3 端点）：画 NC 式箱体（Isogen NC 符号——矩形
+            # 箱体，两端接点 + 上下 tap）。箱体沿前两个端点，其余端点
+            # （第 3 个起，不限个数）从箱体中心各拉一条 tap 线到真实坐标。
+            a, b = eps[0], eps[1]
+            u = _v2_norm(_v2_sub(b, a))
+            ep3 = comp.end_points
+            run3 = (tuple(ep3[1].xyz[i] - ep3[0].xyz[i] for i in range(3))
+                    if len(ep3) >= 2 else None)
+            v = (_across_v(proj, run3, ep3[0].xyz, u) or _v2_perp(u))
+            ln = max(_v2_len(_v2_sub(b, a)), 4.0)
+            mid = _v2_mid(a, b)
+            h = 4.5
+            corners = [
+                _v2_add(mid, _v2_add(_v2_scale(u, ln / 2), _v2_scale(v, h / 2))),
+                _v2_add(mid, _v2_add(_v2_scale(u, ln / 2), _v2_scale(v, -h / 2))),
+                _v2_add(mid, _v2_add(_v2_scale(u, -ln / 2), _v2_scale(v, -h / 2))),
+                _v2_add(mid, _v2_add(_v2_scale(u, -ln / 2), _v2_scale(v, h / 2))),
+            ]
+            canvas.polyline([*corners, corners[0]], width=0.45)
+            for tap in eps[2:]:
+                canvas.line(mid, tap, width=0.45)
+            return mid
         if len(eps) >= 2:
             canvas.line(eps[0], eps[1], width=0.45)
             return _v2_mid(eps[0], eps[1])

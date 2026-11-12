@@ -390,6 +390,20 @@ def _welded_end_index(eps, comps: list[Component],
     claimed, the answer must not depend on adjacency order.
     """
     best: tuple[int, int] | None = None
+    # 垫片只存在于法兰（螺栓）连接侧：一端贴着垫片时另一端必为焊端。
+    # 这条结构证据优先于 rank 表——否则隔着垫片 1.5mm 的邻件（如 TEE，
+    # rank-0）会抢先认领垫片侧端点，把焊端判反（法兰面杠画向管道）。
+    gasket_ends: set[int] = set()
+    for other_idx in graph.neighbours(idx):
+        other = comps[other_idx]
+        if classify(other.type) != "GASKET":
+            continue
+        for pt in other.connection_points():
+            for n, ep in enumerate(eps[:2]):
+                if ep.distance_to(pt) <= tol:
+                    gasket_ends.add(n)
+    if len(gasket_ends) == 1:
+        return 1 - next(iter(gasket_ends))
     for other_idx in graph.neighbours(idx):
         other = comps[other_idx]
         if looks_like_flange(other.type, other.description, other.skey):
