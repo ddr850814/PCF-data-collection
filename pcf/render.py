@@ -1697,6 +1697,15 @@ def _eccentric_small_side_offsets(
             u = (-u[0], -u[1])
         run3 = tuple(last.xyz[i] - first.xyz[i] for i in range(3))
         v = _across_v(proj, run3, first.xyz, u) or _v2_perp(u)
+        # 与符号分支相同的定向镜像：小端偏侧由模型实测偏心方向决定，
+        # 否则管线平移与符号出口各偏一侧（30001 曾因此顶平/底平画反）
+        flat3 = _reducer_flat_offset(comp, first, last, runs[id(comp)])
+        ea = proj.page(first.xyz, apply_offset=False)
+        eb = proj.page(tuple(first.xyz[i] + flat3[i] for i in range(3)),
+                       apply_offset=False)
+        e2 = _v2_sub(eb, ea)
+        if _v2_len(e2) > 1e-9 and (e2[0] * v[0] + e2[1] * v[1]) * centre < 0:
+            v = (-v[0], -v[1])
         d = (diff[0] * u[0] + diff[1] * u[1]) or _v2_len(diff)
         sx = (1.0 if stop[0] > 0 else -1.0) * d / abs(stop[0])
         sy = 4.5 / (2.0 * big_half)
@@ -2077,10 +2086,20 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                         ax = (-ax[0], -ax[1])
                     axis_override = ax
         bore_ratio = None
+        ecc_dir = None
         if cls == "REDUCER" and "ECCENTRIC" in comp.type.upper():
             bore0, bore1 = ep3[0].bore, ep3[1].bore
             if bore0 and bore1 and bore0 > bore1:
                 bore_ratio = bore1 / bore0
+                # 模型偏心方向（顶平/底平）投影到图面，供符号定向镜像
+                run0 = (reducer_runs or {}).get(id(comp))
+                flat3 = _reducer_flat_offset(comp, ep3[0], ep3[-1], run0)
+                c3 = ep3[0].xyz
+                d3 = tuple(c3[i] + flat3[i] for i in range(3))
+                pa = proj.page(c3, apply_offset=False)
+                pb = proj.page(d3, apply_offset=False)
+                if _v2_len(_v2_sub(pb, pa)) > 1e-9:
+                    ecc_dir = _v2_sub(pb, pa)
         du = _v2_sub(sp1, sp0)
         dln = _v2_len(du)
         kw_rooms = {}
@@ -2095,7 +2114,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                             drop_isolated=(cls == "REDUCER"
                                            and not (b1s or b2s)),
                             bore_ratio=bore_ratio,
-                            no_grow=(cls == "FLANGE"), **kw_rooms):
+                            no_grow=(cls == "FLANGE"),
+                            ecc_dir=ecc_dir, **kw_rooms):
             return cps[0] if cps else _v2_mid(eps[0], eps[1])
 
     face_pt = (flange_face_pts or {}).get(id(comp))
@@ -2611,7 +2631,8 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      bore_ratio: float | None = None,
                      room0: float | None = None,
                      room1: float | None = None,
-                     no_grow: bool = False) -> bool:
+                     no_grow: bool = False,
+                     ecc_dir: Vec2 | None = None) -> bool:
     """SKEY 符号库双接点对齐绘制（ASC 优先 → skeys.json 官方库）。
 
     符号 START(首点) → p0，EXIT(收笔点) → p1。符号 X 轴直接映射管轴 u
@@ -2679,6 +2700,11 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     # "垂直于管轴的世界轴"的图面投影（等轴测 30° 斜向族）；无投影信息时
     # 回退图面垂直
     v = across or (_across_v(proj, run3, wp, u) or _v2_perp(u))
+    if ecc_dir is not None and abs(stop[1]) > 1e-9:
+        # 偏心方向按模型实测定向：符号小端偏在 sign(stop[1])·v 侧，
+        # 模型偏心投影（ecc_dir）与之相反时镜像符号——顶平/底平不画反
+        if (ecc_dir[0] * v[0] + ecc_dir[1] * v[1]) * stop[1] < 0:
+            v = (-v[0], -v[1])
     sx = sgn * d / span
     ys = [c for seg in sym for c in (seg[1], seg[3])]
     perp = (max(ys) - min(ys)) if ys else 1.0
