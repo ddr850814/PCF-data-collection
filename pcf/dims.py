@@ -444,6 +444,17 @@ def _flange_face_index(comp: Component, comps: list[Component],
     flagged = [n for n, t in enumerate(types) if t in _WELDABLE_ENDS]
     if len(flagged) == 1:
         return 1 - flagged[0]
+    if comp.type.upper().replace("_", "-") in ("FLANGE-BLIND", "BLIND-FLANGE"):
+        # 盲法兰没有焊端：配合面是与垫片/阀门相接的一端，另一端为自由外侧。
+        # 不能沿用普通法兰的默认末端，否则符号会朝阀门内部偏移。
+        neighbours = graph.adjacency.get(idx, ())
+        nearest = []
+        for ep in eps[:2]:
+            distances = [ep.distance_to(p) for j in neighbours
+                         for p in comps[j].all_points()]
+            nearest.append(min(distances) if distances else float("inf"))
+        if nearest[0] != nearest[1]:
+            return 0 if nearest[0] < nearest[1] else 1
     welded = _welded_end_index(eps, comps, graph, idx, tol)
     if welded is not None:
         return 1 - welded

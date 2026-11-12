@@ -256,6 +256,8 @@ class Projector:
         # Page transform, set by fit():
         self.scale = 1.0
         self.offset = (0.0, 0.0)
+        # 偏心变径正算出口带动小端侧管线的图面平移（世界坐标键）。
+        self.point_offsets: dict[Vec3, Vec2] = {}
 
     def set_skew(self, degrees: float) -> None:
         """Tilt the plan diagonal that projects vertical by ``degrees``.
@@ -298,9 +300,13 @@ class Projector:
         cy = (max(ys) + min(ys)) / 2 if ys else 0.0
         self.offset = (rx + rw / 2 - cx * self.scale, ry + rh / 2 - cy * self.scale)
 
-    def page(self, p: Vec3) -> Vec2:
+    def page(self, p: Vec3, *, apply_offset: bool = True) -> Vec2:
         sx, sy = self.raw(p)
-        return (sx * self.scale + self.offset[0], sy * self.scale + self.offset[1])
+        page = (sx * self.scale + self.offset[0], sy * self.scale + self.offset[1])
+        if apply_offset:
+            dx, dy = self.point_offsets.get(p, (0.0, 0.0))
+            page = (page[0] + dx, page[1] + dy)
+        return page
 
     def north_arrow_angle(self) -> float:
         """Screen angle (degrees, CCW from +x) of the north direction."""
@@ -331,7 +337,8 @@ _NTS_TINY_INCHES = 0.30
 def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
                     max_mm: float, tiny_world: float,
                     keep: list[set[tuple[float, float]]] | None = None,
-                    rigid: list[list[tuple[float, float, float]]] | None = None):
+                    rigid: list[list[tuple[float, float, float]]] | None = None,
+                    targets: list[list[tuple[float, float, float]]] | None = None):
     """Monotonic per-axis remap; distances are clamped via the current page
     scale (mm targets / scale = world-unit targets).
 
@@ -349,6 +356,16 @@ def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
     pipe. Inside a rigid interval every axis uses the same ``s``, so a skewed
     run maps as ``p -> s*p + c``: direction exactly preserved, collinear stays
     collinear, parallel stays parallel. See ``_skew_rigid_spans``.
+
+    ``targets`` is a per-axis list of ``(lo, hi, target_mm)`` intervals to map
+    to a FIXED page length: inline fittings (valves, flanges, concentric
+    reducers...) whose coordinate span is forced to their symbol's natural
+    page size. The schematic principle: parts print at symbol size whatever
+    the scale, and only straight pipe absorbs the non-to-scale stretching --
+    gaps inside a target interval are scaled proportionally so the whole
+    interval lands on ``target_mm``; the space that true-proportion fittings
+    would have eaten (or the [min,max] clamp would have inflated them to)
+    stays with the pipe runs.
 
     ``rigid`` wins over ``keep`` where they overlap: a gap being scaled by a
     shared slope is not being ballooned to ``min_mm``, which is the only thing
@@ -379,14 +396,16 @@ def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
     for ax in range(3):
         protected = sorted(keep[ax]) if keep else []
         locked = sorted(rigid[ax]) if rigid else []
+        forced = sorted(targets[ax]) if targets else []
         vals = sorted({round(p[ax], 6) for p in points})
         src = [vals[0]]
         dst = [vals[0]]
-        # ``locked`` is sorted and non-overlapping, so the only interval that
-        # can contain a gap is the last one starting at or before it. Binary
-        # search rather than scan, to keep this linear in the number of
-        # coordinates on sheets that carry thousands of both.
+        # ``locked``/``forced`` are sorted and non-overlapping, so the only
+        # interval that can contain a gap is the last one starting at or
+        # before it. Binary search rather than scan, to keep this linear in
+        # the number of coordinates on sheets that carry thousands of both.
         lows = [lo for lo, _hi, _s in locked]
+        flows = [lo for lo, _hi, _t in forced]
         for v in vals[1:]:
             gap = v - src[-1]
             shared = None
@@ -394,10 +413,22 @@ def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
                 j = bisect_right(lows, src[-1]) - 1
                 if j >= 0 and v <= locked[j][1]:
                     shared = locked[j][2]
+            hit = None
+            if shared is None and forced:
+                # 零件示意尺寸目标：仅作用于不在 rigid 斜线段区间内的
+                # 间隙（rigid 区间必须整段共享斜率，否则斜管被剪弯）
+                j = bisect_right(flows, src[-1]) - 1
+                if j >= 0 and v <= forced[j][1]:
+                    lo, hi, tgt = forced[j]
+                    # 区间整体映射到 target_mm：内部多段按世界长度等比分配
+                    hit = (tgt / scale) * (gap / (hi - lo)) if hi > lo else None
             if shared is not None:
                 gap *= shared
+            elif hit is not None:
+                gap = hit
             else:
-                inside = any(lo <= src[-1] and v <= hi for lo, hi in protected)
+                inside = any(lo <= src[-1] and v <= hi
+                             for lo, hi in protected)
                 if gap > tiny_world and not inside:
                     gap = min(max(gap, min_world), max_world)
             src.append(v)
@@ -1051,8 +1082,15 @@ def render_pdf(
         # and the scale depends on the warped extents, so refit a few times.
         # Deterministic -- same model and options always converge identically.
         tiny_world = _NTS_TINY_INCHES / coord_to_inch_factor(doc.units_coords)
+        # 零件示意尺寸：直管件区间固定映射为符号自然图面长度，伸缩只由
+        # 直管吸收（见 _fitting_symbol_targets）。偏心变径的偏心量区间
+        # 仍按真实比例保护。
         keep = _eccentric_offset_pairs(doc, reducer_runs)
-        centrelines = _straight_runs(comps)
+        sym_targets = _fitting_symbol_targets(comps, min_mm=options.nts_min_mm)
+        # 只有直管/短管参与非比例伸缩；弯头腿和其他零件保持刚性。
+        centrelines = [(comp.end_points[0].xyz, comp.end_points[1].xyz)
+                       for comp, _ref in comps
+                       if classify(comp.type) == "PIPE" and len(comp.end_points) >= 2]
         skew_segments = _skew_segments(
             centrelines, all_points, geometry.model_tolerance(doc),
             coord_to_inch_factor(doc.units_coords))
@@ -1061,7 +1099,8 @@ def render_pdf(
                                       options.nts_min_mm, options.nts_max_mm)
             projector.warp = _build_nts_warp(
                 all_points, projector.scale,
-                options.nts_min_mm, options.nts_max_mm, tiny_world, keep, rigid)
+                options.nts_min_mm, options.nts_max_mm, tiny_world, keep,
+                rigid, sym_targets)
             projector.fit(all_points, draw_region)
 
     # Flat 45-degree runs project vertical, exactly like a riser; tilt them
@@ -1076,9 +1115,25 @@ def render_pdf(
     draw_centre = (draw_region[0] + draw_region[2] / 2,
                    draw_region[1] + draw_region[3] / 2)
 
+    # 正算偏心变径后，小端连通侧整体接到符号 EXIT；变径自身不偏移。
+    projector.point_offsets = _eccentric_small_side_offsets(
+        projector, doc, comps, reducer_runs)
+
     # ---- symbol pass -----------------------------------------------------
     flange_face_pts = _flange_faces(doc)
     _FLANGE_BANDS.clear()      # 每张图重置接带注册表（焊点吸附用）
+    _FLANGE_WELDS.clear()
+    # 符号生长避让：先登记所有非管件的页坐标占位点（含尚未绘制的），
+    # 供 _growth_room 判断每个零件两端还有多少可生长空间。
+    _NONPIPE_PAGE_PTS.clear()
+    for comp, _ref in comps:
+        if classify(comp.type) in ("PIPE", "WELD", "BOLT", "GASKET"):
+            continue
+        ecc = (classify(comp.type) == "REDUCER"
+               and "ECCENTRIC" in comp.type.upper())
+        for p in comp.all_points():
+            _NONPIPE_PAGE_PTS.append(
+                (projector.page(p.xyz, apply_offset=not ecc), id(comp)))
     olet_header_pts = _olet_header_points(doc)
     olet_branch_conn = _olet_branch_connected(doc)
     flange_bar_mm = max(1.0, options.flange_bar_mm)
@@ -1096,7 +1151,8 @@ def render_pdf(
             anchors[idx] = anchor
 
     if equip_recs:
-        _draw_equipment_connections(canvas, projector, equip_recs, comps)
+        _draw_equipment_connections(canvas, projector, equip_recs, comps,
+                                    draw_centre)
 
     # ---- welds (dots only) ------------------------------------------------
     # The numbered balloons are drawn as an overlay layer by the weld-tracking
@@ -1114,9 +1170,16 @@ def render_pdf(
             d = _v2_sub(dot, top)
             s = d[0] * uu[0] + d[1] * uu[1]
             lat = abs(d[0] * -uu[1] + d[1] * uu[0])
-            if -1.5 <= s <= 4.0 and lat < 2.0:
+            band_len = _v2_len(_v2_sub(exitp, top))
+            if -1.5 <= s <= band_len + 1.0 and lat < 2.0:
                 dot = exitp
                 break
+        else:
+            # 非重合法兰：焊点吸附到焊端锚点（与管端吸附同一焊接点）
+            for w in _FLANGE_WELDS:
+                if _v2_len(_v2_sub(dot, w)) < 1.5:
+                    dot = w
+                    break
         weld_dots.append(dot)
         _draw_weld_symbol(canvas, projector, weld, dot)
         nps = format_bore(weld.bore, doc.units_bore) if weld.bore else "?"
@@ -1588,6 +1651,77 @@ def _reducer_runs(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     return out
 
 
+def _eccentric_small_side_offsets(
+        proj: Projector, doc: PcfDocument,
+        comps: list[tuple[Component, str | None]],
+        runs: dict[int, tuple[Vec3, Vec3]]) -> dict[Vec3, Vec2]:
+    """正算偏心变径出口带动小端连通侧的图面平移。
+
+    符号保持 4.5 mm 大端和口径比小端；小端侧后续管线整体平移到正算
+    EXIT，不画折线连接。变径自身不偏移，尺寸/BOM 仍取真实模型值。
+    """
+    from .asc_symbols import find_symbol_full
+
+    real = [comp for comp, _ref in comps]
+    tol = geometry.model_tolerance(doc)
+    graph = geometry.ConnectivityGraph(real, tol)
+    offsets: dict[Vec3, Vec2] = {}
+    for idx, comp in enumerate(real):
+        if ("ECCENTRIC" not in comp.type.upper()
+                or len(comp.end_points) < 2 or id(comp) not in runs):
+            continue
+        first, last = comp.end_points[0], comp.end_points[1]
+        if not first.bore or not last.bore or first.bore <= last.bore:
+            continue
+        found = find_symbol_full(comp.skey or "")
+        if not found:
+            continue
+        sym, _orient, stop = found
+        if not stop or abs(stop[1]) <= 1e-9:
+            continue
+        ys = [c for seg in sym for c in (seg[1], seg[3])]
+        big_half = (max(ys) - min(ys)) / 2.0
+        small_half = big_half * last.bore / first.bore
+        centre = math.copysign(big_half - small_half, stop[1])
+        p0 = proj.page(first.xyz, apply_offset=False)
+        p1 = proj.page(last.xyz, apply_offset=False)
+        a = proj.page(runs[id(comp)][0], apply_offset=False)
+        b = proj.page(runs[id(comp)][1], apply_offset=False)
+        run = _v2_sub(b, a)
+        ln = _v2_len(run)
+        if ln <= 1e-9:
+            continue
+        u = (run[0] / ln, run[1] / ln)
+        diff = _v2_sub(p1, p0)
+        if u[0] * diff[0] + u[1] * diff[1] < 0:
+            u = (-u[0], -u[1])
+        run3 = tuple(last.xyz[i] - first.xyz[i] for i in range(3))
+        v = _across_v(proj, run3, first.xyz, u) or _v2_perp(u)
+        d = (diff[0] * u[0] + diff[1] * u[1]) or _v2_len(diff)
+        sx = (1.0 if stop[0] > 0 else -1.0) * d / abs(stop[0])
+        sy = 4.5 / (2.0 * big_half)
+        exit_pt = (p0[0] + stop[0] * sx * u[0] + centre * sy * v[0],
+                   p0[1] + stop[0] * sx * u[1] + centre * sy * v[1])
+        delta = _v2_sub(exit_pt, p1)
+        if _v2_len(delta) <= 0.001:
+            continue
+        starts = [j for j in graph.adjacency.get(idx, ())
+                  if any(geometry.dist(pt.xyz, last.xyz) <= tol * 4
+                         for pt in real[j].connection_points())]
+        seen = set(starts)
+        stack = list(starts)
+        while stack:
+            current = stack.pop()
+            for nxt in graph.adjacency.get(current, ()):
+                if nxt != idx and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        for j in seen:
+            for pt in real[j].all_points():
+                offsets[pt.xyz] = delta
+    return offsets
+
+
 def _eccentric_offset_pairs(doc: PcfDocument,
                             runs: dict[int, tuple[Vec3, Vec3]],
                             ) -> list[set[tuple[float, float]]]:
@@ -1633,6 +1767,65 @@ def _eccentric_offset_pairs(doc: PcfDocument,
             if lo != hi:
                 keep[ax].add((lo, hi))
     return keep
+
+
+def _fitting_symbol_targets(comps: list[tuple[Component, str]],
+                            min_mm: float = 8.0,
+                            height_mm: float = 4.5
+                            ) -> list[list[tuple[float, float, float]]]:
+    """直管件（阀门/法兰/同心变径/短接等单轴双端件）的示意尺寸目标。
+
+    每个件的坐标区间在 warp 中固定映射为 max(符号自然图面长度,
+    min_mm)——与旧版"每个间隙 ≥nts_min"给零件的 8mm 跨度一致，但上限
+    封顶在示意尺寸：不再被拉长（FLWN 曾被组斜率拉到 19mm）。非比例
+    伸缩只由直管吸收。跨轴件（弯头/三通）不走此机制：它们的腿即管段
+    空间，由间隙 clamp 与腿外延处理；偏心变径由 keep 保护真实偏心量。
+    返回 [axis] -> [(lo, hi, target_mm)]。
+    """
+    out: list[list[tuple[float, float, float]]] = [[], [], []]
+    try:
+        from .asc_symbols import find_symbol_full
+    except Exception:
+        return out
+    for comp, _ref in comps:
+        c = classify(comp.type)
+        if c in ("PIPE", "WELD", "BOLT", "ELBOW", "TEE", "SUPPORT"):
+            continue
+        if "ECCENTRIC" in comp.type.upper():
+            continue
+        eps = comp.end_points
+        if len(eps) < 2:
+            continue
+        a, b = eps[0].xyz, eps[-1].xyz
+        axes = [ax for ax in range(3)
+                if abs(round(b[ax], 6) - round(a[ax], 6)) > 1e-9]
+        if len(axes) != 1:
+            continue
+        ax = axes[0]
+        lo, hi = sorted((round(a[ax], 6), round(b[ax], 6)))
+        if c == "GASKET":
+            # 垫片模型厚度（~1.5mm）在示意比例下不可见：warp 固定为
+            # 0.6mm 图面间隙——法兰面与配合件之间露出垫片位，法兰
+            # EXIT 仍精确落焊端，无需平移符号
+            out[ax].append((lo, hi, _GASKET_GAP_MM))
+            continue
+        found = find_symbol_full(comp.skey or "")
+        if not found:
+            continue
+        sym = found[0]
+        xs = [c for seg in sym for c in (seg[0], seg[2])]
+        ys = [c for seg in sym for c in (seg[1], seg[3])]
+        if not xs or not ys:
+            continue
+        perp = max(ys) - min(ys)
+        if perp <= 1e-9:
+            continue
+        # 原始比例：区间 = 符号等比锚距（START→EXIT × 高度/横向跨度），
+        # sx=sy 恒成立，符号不拉伸不压缩
+        anchor = abs(found[2][0]) if found[2] and found[2][0] else 1.0
+        natural = anchor * height_mm / perp
+        out[ax].append((lo, hi, natural))
+    return out
 
 
 def _olet_branch_connected(doc: PcfDocument) -> set[int]:
@@ -1689,8 +1882,45 @@ def _flange_faces(doc: PcfDocument) -> dict[int, Vec3]:
     return faces
 
 
+def _draw_nozzle_tag(canvas: _Canvas, anchor: Vec2, ref: str,
+                     draw_centre: Vec2) -> None:
+    """设备管口信息块：CONNECTION-REFERENCE 拆成"管口号/连接信息"两行。
+
+    PCF 的 CONNECTION-REFERENCE 形如 ``P39004/Suction$80 mm RFFE 150``：
+    ``$`` 前是 设备号/管口号，后是 尺寸 连接型式 压力等级。画成带边框的
+    两行块并引线指向管口，先于尺寸/球标放置并注册进避让集合。
+    """
+    tag, _, info = ref.partition("$")
+    lines = [tag.strip()]
+    if info.strip():
+        lines.append(info.strip())
+    if not lines[0]:
+        return
+    size = 4.5
+    canvas.pdf.set_font("Helvetica", size=size)
+    cap = _cap_height_mm(size)
+    pad = 0.6
+    line_h = cap * 1.45
+    box_w = max(canvas.pdf.get_string_width(t) for t in lines) + 2 * pad
+    box_h = len(lines) * line_h + 2 * pad
+    pos = canvas.place_label(anchor, box_w, box_h, draw_centre,
+                             min_leader=4.0, avoid_geometry=True,
+                             clearance=0.6)
+    edge = _box_edge_toward(pos, anchor, box_w, box_h)
+    canvas.line(anchor, edge, width=0.15)
+    with canvas.pdf.local_context():
+        canvas.pdf.set_fill_color(255, 255, 255)
+        canvas.pdf.set_line_width(0.25)
+        canvas.pdf.rect(pos[0] - box_w / 2, pos[1] - box_h / 2,
+                        box_w, box_h, style="DF")
+    top = pos[1] - box_h / 2 + pad + cap
+    for i, text in enumerate(lines):
+        canvas.text((pos[0], top + i * line_h), text, size=size)
+
+
 def _draw_equipment_connections(canvas: _Canvas, proj: Projector,
-                                equip_recs: list, comps: list) -> None:
+                                equip_recs: list, comps: list,
+                                draw_centre: Vec2) -> None:
     """设备管口：官方 NZ 符号以虚线画在设备侧，法兰面落在连接点。"""
     ends: list[tuple[Vec2, Vec2, Vec3, Vec3]] = []   # (端点, 来向, 3D 端, 3D 来向)
     for comp, _ref in comps:
@@ -1755,6 +1985,9 @@ def _draw_equipment_connections(canvas: _Canvas, proj: Projector,
         _draw_symbol_2pt(canvas, skey, p0, nz, proj=proj,
                          run3=run3, wp=we, across=across, height_mm=h,
                          width=0.3, dashed=True)
+        # 管口信息块：锚在设备侧颈端，引线指向管口本体
+        if ref:
+            _draw_nozzle_tag(canvas, p0, ref, draw_centre)
 
 
 def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
@@ -1766,7 +1999,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     reducer_runs: dict[int, tuple[Vec3, Vec3]] | None = None,
                     ) -> Vec2 | None:
     cls = classify(comp.type)
-    eps = [proj.page(p.xyz) for p in comp.end_points]
+    eccentric = cls == "REDUCER" and "ECCENTRIC" in comp.type.upper()
+    eps = [proj.page(p.xyz, apply_offset=not eccentric) for p in comp.end_points]
     cps = [proj.page(p.xyz) for p in comp.centre_points]
     b1s = [proj.page(p.xyz) for p in comp.branch1_points]
     b2s = [proj.page(p.xyz) for p in comp.branch2_points]
@@ -1822,10 +2056,10 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                 face = proj.page(fpt)
                 if _v2_len(_v2_sub(face, eps[1])) < _v2_len(_v2_sub(face, eps[0])):
                     sp0, sp1 = eps[1], eps[0]      # 配合面在 eps[1]：翻转使 START 对准面
-                u_ax = _v2_norm(_v2_sub(sp1, sp0))
-                off = _v2_scale(u_ax, _GASKET_GAP_MM)
-                sp0 = _v2_add(sp0, off)
-                sp1 = _v2_add(sp1, off)
+                # 登记焊端：管端与焊点都吸到 EXIT 锚定的这一点。
+                # 不做垫片间隙平移——平移会把 EXIT 推过焊端 0.6mm，
+                # 符号与管端/焊点错开（实测偏差就是它）
+                _FLANGE_WELDS.append(sp1)
         axis_override = None
         if cls == "REDUCER":
             # 偏心大小头：管轴取主管走向（原项目 reducer_runs，两端同轴
@@ -1842,11 +2076,26 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     if ax[0] * diff0[0] + ax[1] * diff0[1] < 0:
                         ax = (-ax[0], -ax[1])
                     axis_override = ax
+        bore_ratio = None
+        if cls == "REDUCER" and "ECCENTRIC" in comp.type.upper():
+            bore0, bore1 = ep3[0].bore, ep3[1].bore
+            if bore0 and bore1 and bore0 > bore1:
+                bore_ratio = bore1 / bore0
+        du = _v2_sub(sp1, sp0)
+        dln = _v2_len(du)
+        kw_rooms = {}
+        if dln > 1e-9:
+            ax_u = (du[0] / dln, du[1] / dln)
+            kw_rooms = {"room0": _growth_room(sp0, (-ax_u[0], -ax_u[1]),
+                                              id(comp)),
+                        "room1": _growth_room(sp1, ax_u, id(comp))}
         if _draw_symbol_2pt(canvas, comp.skey, sp0, sp1,
                             proj=proj, run3=run3, axis=axis_override,
                             wp=ep3[0].xyz if ep3 else None,
                             drop_isolated=(cls == "REDUCER"
-                                           and not (b1s or b2s))):
+                                           and not (b1s or b2s)),
+                            bore_ratio=bore_ratio,
+                            no_grow=(cls == "FLANGE"), **kw_rooms):
             return cps[0] if cps else _v2_mid(eps[0], eps[1])
 
     face_pt = (flange_face_pts or {}).get(id(comp))
@@ -1875,9 +2124,9 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     wp = comp.co_ords[0].xyz
                     axis = max(range(3), key=lambda i: abs(dw[i]))
                     across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
-                    a2 = proj.page(wp)
+                    a2 = proj.page(wp, apply_offset=False)
                     b2 = proj.page((wp[0] + across[0], wp[1] + across[1],
-                                    wp[2] + across[2]))
+                                    wp[2] + across[2]), apply_offset=False)
                     vn = (b2[0] - a2[0]) ** 2 + (b2[1] - a2[1]) ** 2
                     if vn > 1e-12:
                         vn = vn ** 0.5
@@ -1921,41 +2170,64 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                 if classify(fl.type) != "FLANGE":
                     continue
                 bd = _flange_band(proj, doc, fl, flange_face_pts)
-                if bd is None:
-                    continue
-                top, exitp, uu = bd
-                for pt_name in ("a", "b"):
-                    p = a if pt_name == "a" else b
-                    d = _v2_sub(p, top)
-                    s = d[0] * uu[0] + d[1] * uu[1]
-                    lat = abs(d[0] * -uu[1] + d[1] * uu[0])
-                    if -1.5 <= s <= 4.0 and lat < 2.0:
-                        if pt_name == "a":
-                            a = exitp
-                        else:
-                            b = exitp
+                if bd is not None:
+                    top, exitp, uu = bd
+                    band_len = _v2_len(_v2_sub(exitp, top))
+                    for pt_name in ("a", "b"):
+                        p = a if pt_name == "a" else b
+                        d = _v2_sub(p, top)
+                        s = d[0] * uu[0] + d[1] * uu[1]
+                        lat = abs(d[0] * -uu[1] + d[1] * uu[0])
+                        if -1.5 <= s <= band_len + 1.0 and lat < 2.0:
+                            # 直管止于接带焊端（越过焊点 0.6mm）
+                            if pt_name == "a":
+                                a = exitp
+                            else:
+                                b = exitp
+                else:
+                    # 非重合法兰：管端吸附到匹配的法兰端点（焊接点）
+                    fpt = (flange_face_pts or {}).get(id(fl))
+                    if fpt is None or len(fl.end_points) < 2:
+                        continue
+                    fl_eps = [proj.page(e.xyz) for e in fl.end_points[:2]]
+                    for pt_name, pend in (("a", a), ("b", b)):
+                        w = min(fl_eps, key=lambda q: _v2_len(_v2_sub(pend, q)))
+                        if _v2_len(_v2_sub(pend, w)) < 1.5:
+                            if pt_name == "a":
+                                a = w
+                            else:
+                                b = w
             canvas.line(a, b, width=0.55)
             return _v2_mid(eps[0], eps[1])
 
     elif cls == "ELBOW":
         if len(eps) >= 2:
             corners = cps if cps else [_v2_mid(eps[0], eps[1])]
-            chain = [eps[0], *corners, eps[1]]
+            chain = [_grown_leg_end(eps[0], corners[0], own_id=id(comp)),
+                     *corners,
+                     _grown_leg_end(eps[1], corners[-1], own_id=id(comp))]
             canvas.polyline(chain, width=0.55)
             branch = b1s[0] if b1s else None
             if branch is not None and corners:
-                canvas.line(corners[0], branch, width=0.55)
+                canvas.line(corners[0], _grown_leg_end(branch, corners[0],
+                                                       own_id=id(comp)),
+                            width=0.55)
             return corners[0]
 
     elif cls == "TEE":
         anchor = None
+        centre = cps[0] if cps else None
         if len(eps) >= 2:
-            canvas.line(eps[0], eps[1], width=0.55)
-            anchor = _v2_mid(eps[0], eps[1])
-        centre = cps[0] if cps else anchor
+            c0 = centre if centre is not None else _v2_mid(eps[0], eps[1])
+            canvas.line(_grown_leg_end(eps[0], c0, own_id=id(comp)),
+                        _grown_leg_end(eps[1], c0, own_id=id(comp)),
+                        width=0.55)
+            anchor = c0
         if centre is not None:
             for branch in (*b1s, *b2s):
-                canvas.line(centre, branch, width=0.55)
+                canvas.line(centre, _grown_leg_end(branch, centre,
+                                                   own_id=id(comp)),
+                            width=0.55)
             anchor = centre
         return anchor
 
@@ -2213,6 +2485,50 @@ _GASKET_GAP_MM = 0.6    # 法兰符号与配合面之间的垫片间隙（图面
 # 供焊点吸附（焊点应落在法兰带上而不是模型投影的空隙里）
 _FLANGE_BANDS: list = []
 
+# 非重合法兰的焊端锚点（页坐标）：焊点圆点吸附用，每张图重置
+_FLANGE_WELDS: list[Vec2] = []
+
+# 非管件占位点（页坐标, 组件 id）：符号生长避让用，每张图重置。
+# PIPE/WELD/BOLT/GASKET 不登记——它们与零件同轴相邻，会把生长空间全锁死。
+_NONPIPE_PAGE_PTS: list[tuple[Vec2, int]] = []
+
+_SCHEMATIC_LEG_MM = 4.5   # 弯头/三通腿外延目标（page mm）
+
+
+def _growth_room(p: Vec2, direction: Vec2, own_id: int | None = None) -> float:
+    """符号端点 p 沿 direction 可生长的图面距离（mm）。
+
+    直接焊接的邻件（占位点贴着 p）锁死返回 0；隔管邻件留 1.5mm 净距；
+    无遮挡返回 1e9。组件自身端点按 own_id 排除。
+    """
+    best = 1e9
+    for (qx, qy), cid in _NONPIPE_PAGE_PTS:
+        if own_id is not None and cid == own_id:
+            continue
+        dx, dy = qx - p[0], qy - p[1]
+        proj = dx * direction[0] + dy * direction[1]
+        if proj <= -0.3 or proj >= best + 0.8:   # 只看前方（含贴身焊接点）
+            continue
+        lat = abs(dx * direction[1] - dy * direction[0])
+        if lat > 2.5:
+            continue
+        if proj < 0.8:            # 贴身：焊接邻件，锁死
+            return 0.0
+        best = proj - 1.5
+    return max(best, 0.0)
+
+
+def _grown_leg_end(end: Vec2, corner: Vec2, natural: float = _SCHEMATIC_LEG_MM,
+                   own_id: int | None = None) -> Vec2:
+    """弯头/三通腿从 corner 向 end 外延到示意腿长，受邻件空间限制。"""
+    d = _v2_sub(end, corner)
+    ln = _v2_len(d)
+    if ln <= 1e-9 or ln >= natural:
+        return end
+    u = (d[0] / ln, d[1] / ln)
+    grow = min(natural - ln, _growth_room(end, u, own_id))
+    return _v2_add(end, _v2_scale(u, grow)) if grow > 0 else end
+
 
 def _flange_band(proj, doc, comp, flange_face_pts):
     """端点重合法兰（平焊等）的接带布局：(top, exit, uu) 或 None。
@@ -2268,8 +2584,11 @@ def _across_v(proj: "Projector | None", run3: tuple | None,
         return None
     axis = max(range(3), key=lambda i: abs(run3[i]))
     across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
-    a2 = proj.page(wp)
-    b2 = proj.page((wp[0] + across[0], wp[1] + across[1], wp[2] + across[2]))
+    # 点偏移只平移最终图面位置；方向两点必须同时取原始投影，
+    # 否则单侧偏移会被误算成旋转（法兰端面因此竖直）。
+    a2 = proj.page(wp, apply_offset=False)
+    b2 = proj.page((wp[0] + across[0], wp[1] + across[1], wp[2] + across[2]),
+                   apply_offset=False)
     dx, dy = b2[0] - a2[0], b2[1] - a2[1]
     ln = (dx * dx + dy * dy) ** 0.5
     if ln <= 1e-12:
@@ -2288,7 +2607,11 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      width: float = 0.4,
                      height_mm: float = 4.5,
                      across: Vec2 | None = None,
-                     dashed: bool = False) -> bool:
+                     dashed: bool = False,
+                     bore_ratio: float | None = None,
+                     room0: float | None = None,
+                     room1: float | None = None,
+                     no_grow: bool = False) -> bool:
     """SKEY 符号库双接点对齐绘制（ASC 优先 → skeys.json 官方库）。
 
     符号 START(首点) → p0，EXIT(收笔点) → p1。符号 X 轴直接映射管轴 u
@@ -2296,11 +2619,9 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     u=p0→p1。横向 v 默认取"垂直于管轴的世界轴"的图面投影（等轴测 30°
     斜向族，与支撑符号同规则）；调用方可用 across 直接指定横向方向
     （设备管口符号与管线法兰杠同用 _iso_cross_dir，保证法兰面对齐同一
-    斜向族）。符号整体高度（Y 跨度）固定 height_mm；axis 分支（大小头）
-    在此基础上加 X 方向线性
-    渐变剪切 s=(R-stop_y·sy·v)/span，R=页面残差=模型偏心投影——端面线
-    仍沿轴测斜向族，小端整体向偏心方向平移，EXIT 恒等落在 p1，出口管道
-    从小端接出，偏心方向由端点自带。
+    斜向族）。符号整体高度（Y 跨度）固定 height_mm；偏心大小头按口径比
+    正算小端高度和偏心量，X 基始终沿主管轴，平齐底边保持平行。小端侧
+    管线由 Projector.point_offsets 整体接到正算出口，不画折线连接。
     未查到符号或几何退化时返回 False，调用方走手写回退分支。
     drop_isolated：剔除与任何其他腿不共端点的孤立腿——大小头的 tap 标记
     线（支管接入位置指示，RE** 中部短竖线），PCF 无 BRANCH-POINT 时不画
@@ -2314,6 +2635,29 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     if not found:
         return False
     sym, orient, stop = found
+    if (axis is not None and bore_ratio is not None and stop
+            and 0.0 < bore_ratio < 1.0 and abs(stop[1]) > 1e-9):
+        # 偏心变径正算：大端全高固定 height_mm，小端全高=大端×口径比，
+        # 小端中心偏移=(大端高-小端高)/2。保留 RE** 轮廓与平齐边，
+        # 不用页面端点残差反推高度。
+        ys0 = [c for seg in sym for c in (seg[1], seg[3])]
+        big_half = (max(ys0) - min(ys0)) / 2.0
+        small_half = big_half * bore_ratio
+        centre = math.copysign(big_half - small_half, stop[1])
+        if centre < 0:
+            small_bottom, small_top = -big_half, centre + small_half
+        else:
+            small_bottom, small_top = centre - small_half, big_half
+        x1 = stop[0]
+        x2 = max(c for seg in sym for c in (seg[0], seg[2]))
+        sym = [
+            (0.0, -big_half, 0.0, big_half),
+            (0.0, big_half, x1, small_top),
+            (x1, small_top, x2, small_bottom),
+            (x2, small_bottom, 0.0, -big_half),
+            *sym[4:],
+        ]
+        stop = (x1, centre)
     diff = _v2_sub(p1, p0)
     d = (diff[0] * diff[0] + diff[1] * diff[1]) ** 0.5
     # 轴向跨度取收笔点的 X 分量：偏心大小头（RE** EXIT=(548,-136)）的
@@ -2340,32 +2684,37 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     perp = (max(ys) - min(ys)) if ys else 1.0
     sy = height_mm / max(perp, 1e-6)
     if axis is None:
-        # 双向保底：端距过小（平焊法兰两端点重合）不压扁；端距过大（盲板
-        # 细长条符号遇长端距）不拉成宽扁形——拉伸比限制在等比的 2 倍以内
+        # 短端距向两端生长到自然长度（sx=sy 等比，即旧版尺寸下限的效果），
+        # 生长量受邻件空间约束（room0/room1）：长不出来就保持原样——不像
+        # 旧版一刀切下限那样越过端点压住相邻法兰/垫片。
+        xs_ = [c for seg in sym for c in (seg[0], seg[2])]
+        natural = (max(xs_) - min(xs_)) * sy if xs_ else span * sy
+        if not no_grow and d < natural:
+            extra = natural - d
+            r0 = 1e9 if room0 is None else room0
+            r1 = 1e9 if room1 is None else room1
+            total = min(extra, r0 + r1)
+            g0 = min(r0, total / 2.0)
+            g1 = min(r1, total - g0)
+            g0 += min(r0 - g0, total - g0 - g1)
+            if g0 > 0:
+                p0 = _v2_sub(p0, _v2_scale(u, g0))
+            if g1 > 0:
+                p1 = _v2_add(p1, _v2_scale(u, g1))
+            d += g0 + g1
+            sx = sgn * d / span
         ax_ = abs(sx)
-        if ax_ < sy:
-            sx = math.copysign(sy, sx)
-        elif ax_ > sy * 2.0:
+        if ax_ > sy * 2.0:
             sx = math.copysign(sy * 2.0, sx)
     # 符号基向量：P = p0 + x·bx + y·by（普通符号 bx=sx·u, by=sy·v）
     bx = (sx * u[0], sx * u[1])
     by = (sy * v[0], sy * v[1])
-    if axis is not None:
-        # 偏心大小头剪切画法：模型偏心可以在任意世界方向（X/Y/Z），若把
-        # 符号横向扭到偏心方向，端面线就脱离轴测斜向族（图面竖直端面很
-        # 突兀）。改为保持端面线沿跨管世界轴投影，偏心由 X 方向的线性
-        # 渐变剪切表达——腰线不对称、小端整体向偏心方向平移，正是模型
-        # 投影的仿射像（直线仍映成直线）：
-        #   P = p0 + x·(sx·u + s) + y·sy·v，s = (R - stop_y·sy·v)/span
-        # 其中 R = diff - d·u 是页面残差 = 模型偏心的真实投影。EXIT 恒等：
-        #   p0 + span·(sx·u + s) + stop_y·sy·v = p0 + d·u + R = p1
-        # 出口管道正好从小端接出，端面方向不受偏心方向影响。
-        stop_y = stop[1] if stop else 0.0
+    if axis is not None and abs(stop[1]) <= 1e-9:
+        # 同心符号仅校正轴向数值残差；偏心符号不做任何 X 剪切，
+        # bx=sx·u、by=sy·v，平齐边自然与主管平行。
         rx = diff[0] - d * u[0]
         ry = diff[1] - d * u[1]
-        shx = (rx - stop_y * sy * v[0]) / span
-        shy = (ry - stop_y * sy * v[1]) / span
-        bx = (bx[0] + shx, bx[1] + shy)
+        bx = (bx[0] + rx / span, bx[1] + ry / span)
     x0, y0 = p0
     if drop_isolated and len(sym) > 1:
         # 孤立腿 = 与其他任何腿都不共端点的腿：轮廓腿围成闭环共端点，
@@ -2388,12 +2737,14 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
             sym = kept
     draw = canvas.dashed if dashed else canvas.line
     for x1, y1, x2, y2 in sym:
+        # 虚线符号（设备管口）是实体几何：记入 segments，尺寸放置与
+        # 球标布线才会避让——否则 goalpost 直接压在管口符号上。
         draw(
             (x0 + x1 * bx[0] + y1 * by[0],
              y0 + x1 * bx[1] + y1 * by[1]),
             (x0 + x2 * bx[0] + y2 * by[0],
              y0 + x2 * bx[1] + y2 * by[1]),
-            width=width)
+            width=width, record=True)
     return True
 
 
@@ -2674,6 +3025,31 @@ def _segs_cross(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool:
     return False
 
 
+def _segs_close(a: Vec2, b: Vec2, c: Vec2, d: Vec2, tol: float = 0.35) -> bool:
+    """True when the segments pass within ``tol`` mm of each other.
+
+    ``_segs_cross`` misses the skew-past-an-endpoint case -- a goalpost
+    whose tip grazes a nozzle stroke at 0.05mm without either segment
+    crossing the other's line. This tests true minimum distance with a
+    bounding-box prefilter, so the per-candidate cost stays bounded.
+    """
+    if (max(a[0], b[0]) + tol < min(c[0], d[0])
+            or max(c[0], d[0]) + tol < min(a[0], b[0])
+            or max(a[1], b[1]) + tol < min(c[1], d[1])
+            or max(c[1], d[1]) + tol < min(a[1], b[1])):
+        return False
+
+    def pt_seg(p: Vec2, s: Vec2, e: Vec2) -> float:
+        se = _v2_sub(e, s)
+        length = _v2_len(se) or 1e-9
+        v = _v2_sub(p, s)
+        t = max(0.0, min(1.0, (v[0] * se[0] + v[1] * se[1]) / (length * length)))
+        return _v2_len(_v2_sub(p, _v2_add(s, _v2_scale(se, t))))
+
+    return (pt_seg(c, a, b) <= tol or pt_seg(d, a, b) <= tol
+            or pt_seg(a, c, d) <= tol or pt_seg(b, c, d) <= tol)
+
+
 def _seg_hits_box(p: Vec2, q: Vec2,
                   box: tuple[float, float, float, float]) -> bool:
     bx, by, bw, bh = box
@@ -2828,7 +3204,8 @@ def _score_dim_geometry(canvas: _Canvas, geom: dict, away: Vec2) -> float:
         if _seg_hits_box(seg[0], seg[1], geom["text_box"]):
             score += 2.0
         for e in geom["ext"]:
-            if _segs_cross(e[0], e[1], seg[0], seg[1]):
+            if (_segs_cross(e[0], e[1], seg[0], seg[1])
+                    or _segs_close(e[0], e[1], seg[0], seg[1])):
                 score += 1.0
         if edge is not None and _segs_cross(edge, geom["leader"], seg[0], seg[1]):
             score += 1.0
@@ -2878,9 +3255,58 @@ def _plan_best_dim(canvas: _Canvas, proj: Projector, p3a: Vec3, p3b: Vec3,
     return best, best_score
 
 
+def _goalpost_pieces(a: Vec2, b: Vec2,
+                     segments: list[tuple[Vec2, Vec2]]) -> list[tuple[Vec2, Vec2]]:
+    """Trim a goalpost against near-parallel strokes it would duplicate.
+
+    An equipment nozzle's face bar is centred on the gasket face -- exactly
+    where a "to equipment face" dimension's endpoint sits -- and often runs
+    the same direction as that end's goalpost. Drawing both puts two lines
+    0.05mm apart on the sheet. The bar already serves as the extension
+    line, so the goalpost draws only the part the bar does not cover.
+    Perpendicular structures (pipes, elbow legs) are never parallel enough
+    to trim, so ordinary goalposts pass through untouched.
+    """
+    ab = _v2_sub(b, a)
+    length = _v2_len(ab)
+    if length <= 1e-6:
+        return [(a, b)]
+    u = (ab[0] / length, ab[1] / length)
+    cuts: list[tuple[float, float]] = []
+    for s, e in segments:
+        se = _v2_sub(e, s)
+        sl = _v2_len(se)
+        if sl <= 1e-6:
+            continue
+        v = (se[0] / sl, se[1] / sl)
+        if abs(u[0] * v[0] + u[1] * v[1]) < 0.98:
+            continue                      # not near-parallel
+        if not _segs_close(a, b, s, e, 0.3):
+            continue                      # not alongside it
+        t1 = (s[0] - a[0]) * u[0] + (s[1] - a[1]) * u[1]
+        t2 = (e[0] - a[0]) * u[0] + (e[1] - a[1]) * u[1]
+        lo, hi = min(t1, t2), max(t1, t2)
+        if hi > 0.1 and lo < length - 0.1:
+            cuts.append((max(lo, 0.0), min(hi, length)))
+    if not cuts:
+        return [(a, b)]
+    cuts.sort()
+    pieces: list[tuple[Vec2, Vec2]] = []
+    start = 0.0
+    for lo, hi in cuts:
+        if lo > start + 0.1:
+            pieces.append((_v2_add(a, _v2_scale(u, start)),
+                           _v2_add(a, _v2_scale(u, lo))))
+        start = max(start, hi)
+    if start < length - 0.1:
+        pieces.append((_v2_add(a, _v2_scale(u, start)), b))
+    return pieces
+
+
 def _render_dim(canvas: _Canvas, geom: dict) -> None:
     for e in geom["ext"]:
-        canvas.line(e[0], e[1], width=0.15, record=False)
+        for p, q in _goalpost_pieces(e[0], e[1], canvas.segments):
+            canvas.line(p, q, width=0.15, record=False)
     for p, q in geom["segs"]:
         canvas.line(p, q, width=0.2)  # recorded: later dims avoid it
     for tip, direction in geom["arrows"]:
@@ -3126,9 +3552,9 @@ def _draw_support_symbol(canvas: _Canvas, at: Vec2, comp,
                     across = (0.0, 1.0, 0.0) if axis == 0 else (1.0, 0.0, 0.0)
                 if comp.co_ords:
                     wp = comp.co_ords[0].xyz
-                    a2 = proj.page(wp)
+                    a2 = proj.page(wp, apply_offset=False)
                     b2 = proj.page((wp[0] + across[0], wp[1] + across[1],
-                                    wp[2] + across[2]))
+                                    wp[2] + across[2]), apply_offset=False)
                     vn = math.hypot(b2[0] - a2[0], b2[1] - a2[1])
                     if vn > 1e-9:
                         v = ((b2[0] - a2[0]) / vn, (b2[1] - a2[1]) / vn)
