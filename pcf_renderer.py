@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import threading
 from pathlib import Path
 
 from pcf import (
@@ -186,6 +187,55 @@ def collect_pcf_files(paths) -> list[Path]:
     return out
 
 
+# ========== 预览用整套图纸缓存（续接标注/幻影件需要邻图数据） ==========
+
+_SET_CACHE: dict = {}
+_SET_LOCK = threading.Lock()
+_SET_CACHE_MAX = 4   # 最多同时保留几个目录的整套数据
+
+
+def _folder_stamp(folder: str) -> tuple:
+    """目录内全部 .pcf 的（文件名, mtime）指纹，任一变动即缓存失效。"""
+    try:
+        return tuple(sorted(
+            (e.name, e.stat().st_mtime_ns)
+            for e in os.scandir(folder)
+            if e.name.lower().endswith(".pcf") and e.is_file()))
+    except OSError:
+        return ()
+
+
+def render_set(pcf_path, encoding="auto"):
+    """返回 (neighbour_docs, cont_map)：整套图纸的文档表与续接表。
+
+    预览只画单条管线，但 SEE ISO/SHT/坐标续接标注与分图幻影件必须
+    拿到邻图文档才能解析绘制（同 render_pcf_files 的批量路径）。按
+    目录把整套文档与续接表缓存起来，首次点击加载全套、之后即时复
+    用；目录内任一 .pcf 变动自动重建。预览在 GUI 后台线程触发，用
+    锁保证只建一份。
+    """
+    folder = os.path.dirname(os.path.abspath(str(pcf_path)))
+    stamp = _folder_stamp(folder)
+    key = (folder, encoding)
+    with _SET_LOCK:
+        hit = _SET_CACHE.get(key)
+        if hit is not None and hit[0] == stamp:
+            return hit[1], hit[2]
+    loaded = [(p, load(p, encoding=encoding))
+              for p in collect_pcf_files([folder])]
+    try:
+        cont_map = build_continuation_map([(p.stem, d) for p, d in loaded])
+    except Exception:
+        cont_map = {}   # 续接解析失败不阻塞预览
+    docs = {p.stem: d for p, d in loaded}
+    stamp = _folder_stamp(folder)
+    with _SET_LOCK:
+        _SET_CACHE[key] = (stamp, docs, cont_map)
+        while len(_SET_CACHE) > _SET_CACHE_MAX:
+            _SET_CACHE.pop(next(iter(_SET_CACHE)))
+    return docs, cont_map
+
+
 def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
                          to_scale=False, nts_min_mm=None, nts_max_mm=None,
                          skew_deg=None, encoding="auto"):
@@ -210,7 +260,11 @@ def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
     if skew_deg is not None:
         options.skew_deg = float(skew_deg)
 
-    doc = load(pcf_path, encoding=encoding)
+    docs, cont_map = render_set(pcf_path, encoding=encoding)
+    stem = Path(pcf_path).stem
+    doc = docs.get(stem) or load(pcf_path, encoding=encoding)
+    options.continuations = cont_map.get(stem, [])
+    options.neighbour_docs = docs
     import tempfile
     fd, tmp = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
@@ -251,7 +305,11 @@ def render_preview_scene(pcf_path, north_axis=None, quadrant=None, paper=None,
     if skew_deg is not None:
         options.skew_deg = float(skew_deg)
 
-    doc = load(pcf_path, encoding=encoding)
+    docs, cont_map = render_set(pcf_path, encoding=encoding)
+    stem = Path(pcf_path).stem
+    doc = docs.get(stem) or load(pcf_path, encoding=encoding)
+    options.continuations = cont_map.get(stem, [])
+    options.neighbour_docs = docs
     return render_scene(doc, options)
 
 
@@ -327,6 +385,10 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     except Exception:
         cont_map = {}  # 续接解析失败不阻塞出图
 
+    # 整套文档表：分图幻影件需要邻图数据才能把断点对侧的紧邻零件
+    # 画成虚线幻影（见 render.RenderOptions.neighbour_docs）
+    neighbour_docs = {p.stem: d for p, d in loaded}
+
     summaries = []
     for i, (path, doc) in enumerate(loaded):
         report(f"渲染 {path.name}", i + 1)
@@ -359,6 +421,7 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
             options.detect_ffw = True
         options.drawing_no = path.stem
         options.continuations = cont_map.get(path.stem, [])
+        options.neighbour_docs = neighbour_docs
 
         pdf_path = out / (path.stem + ".pdf")
         dims_file = sidecar_path(pdf_path)

@@ -54,6 +54,7 @@ text. See _plan_dim_geometry().
 from __future__ import annotations
 
 import math
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date as _date
@@ -162,6 +163,10 @@ class RenderOptions:
     # means the sheet was rendered without knowledge of its neighbours, and
     # only the file's own END-CONNECTION references (if any) are available.
     continuations: list[Continuation] = field(default_factory=list)
+    # 整套图纸的文档表（图名 → PcfDocument），由 render_pcf_files 在批量
+    # 渲染时传入。分图幻影件需要邻图文档才能把断点对侧的紧邻零件画成
+    # 虚线幻影；单图渲染（预览）为空时幻影件退化为只画接续标记。
+    neighbour_docs: dict[str, PcfDocument] | None = None
 
 
 @dataclass
@@ -1406,6 +1411,12 @@ def _render_document(
                   if rec.type == "END-CONNECTION-EQUIPMENT"]
     all_points += [p.xyz for rec in equip_recs for p in rec.co_ords]
 
+    # 分图幻影件：邻图断点紧邻零件的关键点纳入投影/NTS 变形范围，
+    # 保证幻影几何与本图共用同一投影（含非比例伸缩）。只影响画面，
+    # 不进 BOM/切割清单/避让集合（那些只吃 doc 本身）。
+    for pxyz in _phantom_points(doc, options):
+        all_points.append(pxyz)
+
     projector = Projector(options)
     projector.fit(all_points, draw_region)
 
@@ -1547,12 +1558,20 @@ def _render_document(
         _draw_nts_stamp(canvas, draw_region)
 
     # ---- continuations (before dims/callouts: they are the bigger blocks) ---
+    # 分图（同管线断开）→ 邻图紧邻零件画虚线幻影 + SEE ISO/SHT/坐标标注；
+    # 跨管线接点（不同线号）→ 虚线示意短管 + SEE ISO 对方线号/坐标标注。
     drawn_continuations: list[Continuation] = []
     for cont in options.continuations:
         if not cont.label:
             continue
         with canvas.tagged("cont", cont.reference):
-            _draw_continuation(canvas, projector, cont, doc, options, draw_centre)
+            if _junction_kind(doc, cont, options) == "line":
+                _draw_line_tie_in(canvas, projector, cont, doc, options,
+                                  draw_centre)
+            else:
+                _draw_continuation(canvas, projector, cont, doc, options,
+                                   draw_centre)
+                _draw_phantom_mate(canvas, projector, doc, cont, options)
         drawn_continuations.append(cont)
         if not cont.resolved:
             names = " / ".join(reference_names(cont.reference)) or cont.reference
@@ -1820,7 +1839,7 @@ def _coordinate_text(point: Vec3, doc: PcfDocument,
 def _draw_continuation(canvas: _Canvas, proj: Projector, cont: Continuation,
                        doc: PcfDocument, options: RenderOptions,
                        draw_centre: Vec2) -> None:
-    """One continuation mark: arrow along the run + the drawing/coords block."""
+    """分图接续标记：沿线箭头 + SEE ISO 管线号/SHT/坐标文字块（仅分图型）。"""
     at = proj.page(cont.point)
     out: Vec2 | None = None
     if cont.inboard is not None:
@@ -1832,16 +1851,280 @@ def _draw_continuation(canvas: _Canvas, proj: Projector, cont: Continuation,
     canvas.line(at, tip, width=0.35)
     _draw_arrowhead(canvas, tip, _v2_scale(out, -1.0))
 
+    lines = _cont_callout_lines(doc, cont, options)
+    canvas.pdf.set_font("Helvetica", size=_CONT_FONT)
+    text_w = max(canvas.pdf.get_string_width(line) for line in lines)
+    w = text_w + 2 * _CONT_PAD_MM
+    h = len(lines) * _CONT_LINE_MM + 2 * _CONT_PAD_MM - (_CONT_LINE_MM - _CONT_CAP)
+    pos = canvas.place_label(tip, w, h, draw_centre, min_leader=7.0,
+                             avoid_geometry=True, clearance=_CONT_CLEARANCE_MM)
+
+    with canvas.pdf.local_context():
+        canvas.pdf.set_fill_color(255, 255, 255)
+        canvas.pdf.set_line_width(0.3)
+        canvas.pdf.rect(pos[0] - w / 2, pos[1] - h / 2, w, h, style="DF")
+    top = pos[1] - h / 2 + _CONT_PAD_MM + _CONT_CAP
+    for n, line in enumerate(lines):
+        canvas.text((pos[0], top + n * _CONT_LINE_MM), line, size=_CONT_FONT)
+
+    edge = _box_edge_toward(pos, tip, w, h)
+    if _v2_len(_v2_sub(tip, edge)) > 0.8:
+        canvas.line(edge, tip, width=0.15)
+
+
+# ---------------------------------------------------------------------------
+# 分图幻影件 / 跨管线虚线延续
+
+
+_PHANTOM_STUB_MM = 10.0   # 幻影直管虚线延伸段的图面长度上限
+_LINE_TIE_STUB_MM = 6.0   # 跨管线虚线示意短管的图面长度
+
+
+def _sheet_line_refs(doc: PcfDocument) -> set[str]:
+    """本图所有管线号（PIPELINE-REFERENCE 属性）。"""
+    return {p.reference.strip() for p in doc.pipelines
+            if p.reference and p.reference.strip()}
+
+
+def _junction_kind(doc: PcfDocument, cont: Continuation,
+                   options: RenderOptions) -> str:
+    """接点类型："split"=同管线分图断点（画幻影件），"line"=跨管线接点。
+
+    两侧图纸共享任一管线号 → 分图幻影；否则是两条独立管线的对接 →
+    画虚线短管 + SEE ISO 对方线号文字。未解析（对侧图不在渲染集）时
+    用 PCF 自己声明的引用判断：引用里的线号不等于本图管线号 → 跨管线。
+    """
+    own = _sheet_line_refs(doc)
     if cont.resolved:
-        lines = [f"CONT ON {cont.label}",
-                 *_coordinate_lines(cont.point, doc, options)]
+        for name in cont.sheets:
+            ndoc = (options.neighbour_docs or {}).get(name)
+            if ndoc is None:
+                continue
+            if own & _sheet_line_refs(ndoc):
+                return "split"
+        return "line"
+    nos = _cont_ref_nos(cont.reference)
+    if nos and not (own & set(nos)):
+        return "line"
+    if not nos:
+        return "line"    # 什么都不接 → 标注退化为只有坐标
+    return "split"
+
+
+def _sheet_tag(name: str) -> str:
+    """邻图图名里的页号（SHT n）；取不到就退回图名本身。
+
+    本工具的分图文件命名是 <母图>_SHT_<n> / <母图>_SPL_<值>
+    （见 project.SHEET_RE / KEY_SHEET_RE），页号直接从图名提取。
+    """
+    m = re.search(r"[_\s-]SHT[_\s-]?(\d+)$", name, re.IGNORECASE)
+    if m:
+        return f"SHT {int(m.group(1))}"
+    m = re.search(r"_SPL_(.+)$", name, re.IGNORECASE)
+    if m:
+        return f"SHT {m.group(1)}"
+    return name
+
+
+def _cont_callout_lines(doc: PcfDocument, cont: Continuation,
+                        options: RenderOptions) -> list[str]:
+    """接点标注文字（图面规范）：
+
+    分图 → "SEE ISO 管线号" / "SHT n" / 坐标；
+    跨管线 → "SEE ISO 对方管线号" / 坐标；
+    不接任何东西 → 只有坐标。
+    """
+    coords = _coordinate_lines(cont.point, doc, options)
+    own = _sheet_line_refs(doc)
+    if _junction_kind(doc, cont, options) == "split":
+        others: set[str] = set()
+        for name in cont.sheets:
+            ndoc = (options.neighbour_docs or {}).get(name)
+            if ndoc is not None:
+                others |= _sheet_line_refs(ndoc)
+        nos = sorted((own & others) or own)
+        lines = [f"SEE ISO {' / '.join(nos)}"]
+        tags = [_sheet_tag(n) for n in cont.sheets]
+        if tags:
+            lines.append(" / ".join(tags))
+        return [*lines, *coords]
+    nos: set[str] = set()
+    if cont.resolved:
+        for name in cont.sheets:
+            ndoc = (options.neighbour_docs or {}).get(name)
+            if ndoc is not None:
+                nos |= _sheet_line_refs(ndoc) - own
     else:
-        # ISOGEN 的 $ 是字段内的分行显示符：未解析的 fallback 引用按原意
-        # 拆成多行，还原它在 ISOGEN 图面上的两行显示（图纸/区域引用 + 管线号）。
-        parts = [p.strip() for p in cont.label.split("$") if p.strip()]
-        lines = [f"CONT ON {parts[0]}",
-                 *parts[1:],
-                 *_coordinate_lines(cont.point, doc, options)]
+        nos.update(_cont_ref_nos(cont.reference))
+    nos -= own
+    if not nos:
+        return list(coords)    # 不接任何东西 → 只写坐标
+    return [f"SEE ISO {' / '.join(sorted(nos))}", *coords]
+
+
+def _neighbour_mates(doc: PcfDocument, cont: Continuation,
+                     options: RenderOptions) -> list[Component]:
+    """邻图在接点上的紧邻零件（分图幻影件的素材，每图至多一两件）。"""
+    tol = geometry.model_tolerance(doc) * 4
+    out: list[Component] = []
+    seen: set[int] = set()
+    for name in cont.sheets:
+        ndoc = (options.neighbour_docs or {}).get(name)
+        if ndoc is None:
+            continue
+        ncomps = ndoc.real_components()
+        for idx in geometry.components_at_point(ncomps, cont.point, tol):
+            if id(ncomps[idx]) not in seen:
+                seen.add(id(ncomps[idx]))
+                out.append(ncomps[idx])
+    return out
+
+
+def _phantom_points(doc: PcfDocument, options: RenderOptions) -> list[Vec3]:
+    """需要纳入本图投影范围的幻影件关键点（只统计分图型接点）。
+
+    跨管线接点的对方几何一律不画，其坐标也不进投影范围。"""
+    pts: list[Vec3] = []
+    for cont in options.continuations:
+        if not cont.label or not cont.resolved:
+            continue
+        if _junction_kind(doc, cont, options) != "split":
+            continue
+        for comp in _neighbour_mates(doc, cont, options):
+            pts.extend(p.xyz for p in comp.all_points())
+    return pts
+
+
+def _draw_phantom_mate(canvas: _Canvas, proj: Projector, doc: PcfDocument,
+                       cont: Continuation, options: RenderOptions) -> None:
+    """分图幻影件：把邻图断点对侧的紧邻零件按虚线画进本图。
+
+    直管 → 虚线延伸段；管件 → SKEY 符号虚线（幻影）；焊点 → 虚线小圆。
+    纯画面元素：不进 BOM/切割清单、不注册避让集合、不产生气球/焊号。
+    """
+    at3 = cont.point
+    at = proj.page(at3)
+    for comp in _neighbour_mates(doc, cont, options):
+        cls = classify(comp.type)
+        if cls in ("BOLT", "GASKET", "SUPPORT", "MESSAGE"):
+            continue
+        eps = comp.end_points
+        if cls == "PIPE" and len(eps) >= 2:
+            # 直管虚线延伸段：沿对方直管走向画示意（图面长度封顶），
+            # 与本图断点处的实线端头相接
+            near = 0 if (geometry.dist(eps[0].xyz, at3)
+                         <= geometry.dist(eps[-1].xyz, at3)) else -1
+            far = eps[1] if near == 0 else eps[-2]
+            pa = proj.page(eps[near].xyz)
+            pb = proj.page(far.xyz)
+            d = _v2_sub(pb, pa)
+            ln = _v2_len(d)
+            if ln > 1e-6:
+                end = _v2_add(at, _v2_scale(d, min(ln, _PHANTOM_STUB_MM) / ln))
+                canvas.dashed(at, end, width=0.35)
+            continue
+        if cls == "WELD" or comp.type.upper().startswith("WELD"):
+            # 幻影焊点：虚线小圆（ISOGEN 幻影焊缝画法）
+            canvas.pdf.set_line_width(0.25)
+            with canvas.pdf.local_context():
+                canvas.pdf.set_dash_pattern(dash=0.9, gap=0.7)
+                canvas.pdf.ellipse(at[0] - 0.7, at[1] - 0.7, 1.4, 1.4, style="D")
+            continue
+        if len(eps) >= 2:
+            # 幻影管件：SKEY 符号虚线，符号首点对齐断点（与设备管口
+            # 虚线画法同模式，法兰等符号按真实朝向落在幻影位置）
+            e0 = proj.page(eps[0].xyz)
+            e1 = proj.page(eps[-1].xyz)
+            u = _v2_norm(_v2_sub(e1, e0))
+            if u == (0.0, 0.0):
+                continue
+            across = _iso_cross_dir(proj, u)
+            run3 = tuple(eps[-1].xyz[i] - eps[0].xyz[i] for i in range(3))
+            if _draw_symbol_2pt(canvas, comp.skey, e0, e1, proj=proj,
+                                run3=run3, wp=at3, across=across,
+                                width=0.3, dashed=True):
+                continue
+            # ASC 库缺符号时的手写虚线回退：弯头画两腿折线，三通/支管台
+            # 画主管加支管腿，其余退化为两端虚线
+            if cls == "ELBOW" and comp.centre_points:
+                corner = proj.page(comp.centre_points[0].xyz)
+                canvas.dashed(e0, corner, width=0.3)
+                canvas.dashed(corner, e1, width=0.3)
+            elif cls in ("TEE", "OLET") and comp.centre_points:
+                centre = proj.page(comp.centre_points[0].xyz)
+                canvas.dashed(e0, centre, width=0.3)
+                canvas.dashed(centre, e1, width=0.3)
+                for bp in (*comp.branch1_points, *comp.branch2_points):
+                    canvas.dashed(centre, proj.page(bp.xyz), width=0.3)
+            else:
+                canvas.dashed(e0, e1, width=0.3)
+
+
+def _junction_out_dir(doc: PcfDocument, cont: Continuation,
+                      proj: Projector, draw_centre: Vec2) -> Vec2:
+    """跨管线虚线短管的延伸方向（图面向量，从接点指向外侧）。
+
+    优先 inboard→接点；两者重合时（接点常落在场焊的两重合端点上）
+    改用本图紧邻零件的本体点→接点方向（OLET 取支管腿、直管/弯头取
+    远端→接点）；再退化才退回图心方向。
+    """
+    at = proj.page(cont.point)
+    if cont.inboard is not None and geometry.dist(cont.inboard,
+                                                  cont.point) > 1e-9:
+        v = _v2_norm(_v2_sub(at, proj.page(cont.inboard)))
+        if v != (0.0, 0.0):
+            return v
+    tol = geometry.model_tolerance(doc) * 4
+    lcomps = doc.real_components()
+    best: tuple[float, Vec3] | None = None
+    for idx in geometry.components_at_point(lcomps, cont.point, tol):
+        comp = lcomps[idx]
+        body: Vec3 | None = None
+        if comp.centre_points:
+            body = comp.centre_points[0].xyz
+        elif comp.branch1_points:
+            body = comp.branch1_points[0].xyz
+        elif len(comp.end_points) >= 2:
+            near = min(comp.end_points,
+                       key=lambda p: geometry.dist(p.xyz, cont.point))
+            if geometry.dist(near.xyz, cont.point) > tol:
+                body = near.xyz
+        if body is None or geometry.dist(body, cont.point) <= tol:
+            continue
+        d = geometry.dist(body, cont.point)
+        if best is None or d < best[0]:
+            best = (d, body)
+    if best is not None:
+        v = _v2_norm(_v2_sub(at, proj.page(best[1])))
+        if v != (0.0, 0.0):
+            return v
+    return _v2_norm(_v2_sub(at, draw_centre)) or (0.7071, -0.7071)
+
+
+def _cont_ref_nos(ref: str) -> list[str]:
+    """接点声明引用里的对方线号（引用串可能以 ' / ' 连接多条）。"""
+    out: list[str] = []
+    for part in ref.split(" / "):
+        names = reference_names(part)
+        if names:
+            out.append(names[-1])
+    return out
+
+
+def _draw_line_tie_in(canvas: _Canvas, proj: Projector, cont: Continuation,
+                      doc: PcfDocument, options: RenderOptions,
+                      draw_centre: Vec2) -> None:
+    """跨管线延续：接点画虚线示意短管 + SEE ISO 对方线号文字。
+
+    两条管线数据独立，对方管件一律不画——虚线沿本图管线在接点的
+    逼近方向（inboard→接点，重合时用紧邻零件本体方向）延长，
+    示意"线在那边继续"。"""
+    at = proj.page(cont.point)
+    out = _junction_out_dir(doc, cont, proj, draw_centre)
+    tip = _v2_add(at, _v2_scale(out, _LINE_TIE_STUB_MM))
+    canvas.dashed(at, tip, width=0.35)
+
+    lines = _cont_callout_lines(doc, cont, options)
     canvas.pdf.set_font("Helvetica", size=_CONT_FONT)
     text_w = max(canvas.pdf.get_string_width(line) for line in lines)
     w = text_w + 2 * _CONT_PAD_MM
