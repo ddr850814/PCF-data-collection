@@ -8,6 +8,11 @@ with no usable SKEY inherits the previous component's SKEY.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+from pathlib import Path
+
 # End-connection suffix -> joint type.
 _SUFFIX_JOINTS = {
     "BW": "BW",   # butt weld
@@ -44,8 +49,74 @@ def connection_from_skey(skey: str | None) -> str | None:
     return None
 
 
+# -- SKEY -> PCF 类型反查（skeys.json "skey_to_types" 段） -------------------
+# 官方映射表：skey（含 ** 通配，** 占两个字符的端接代码）-> PCF 组件类型
+# 列表。仅当 COMPONENT-TYPE 分类落到 OTHER 时作为兜底——出口器把管件写成
+# 非标类型但保留标准 SKEY 时（如 TYPE=FITTING + SKEY=RCBW 的同心变径），
+# 绘制、尺寸、报表仍按真实类别处理；标准数据零影响。
+
+_SKEY_TYPES_EXACT: dict[str, str] = {}
+_SKEY_TYPES_WILD: list[tuple[re.Pattern[str], str]] = []
+_SKEY_TYPES_LOADED = False
+
+
+def _load_skey_types() -> None:
+    global _SKEY_TYPES_LOADED
+    dirs = []
+    env = os.environ.get("PCF_SYMBOL_DIR")
+    if env:
+        dirs.append(Path(env))
+    dirs.append(Path(__file__).resolve().parent.parent / "symbols")
+    for d in dirs:
+        path = d / "skeys.json"
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for pattern, types in (data.get("skey_to_types") or {}).items():
+            resolved = next((t for t in types if t != "END-PREP"), None)
+            if not resolved:
+                continue
+            if "**" in pattern:
+                rx = re.compile("^" + pattern.upper().replace("**", "..") + "$")
+                _SKEY_TYPES_WILD.append((rx, resolved))
+            else:
+                _SKEY_TYPES_EXACT.setdefault(pattern.upper(), resolved)
+        _SKEY_TYPES_LOADED = True
+        return
+
+
+def type_from_skey(skey: str | None) -> str | None:
+    """SKEY -> PCF 组件类型（先精确后 ** 通配，如 RCBW -> REDUCER-CONCENTRIC）。"""
+    if not skey:
+        return None
+    if not _SKEY_TYPES_LOADED:
+        _load_skey_types()
+    s = skey.upper()
+    resolved = _SKEY_TYPES_EXACT.get(s)
+    if resolved:
+        return resolved
+    for rx, t in _SKEY_TYPES_WILD:
+        if rx.match(s):
+            return t
+    return None
+
+
+def reducer_is_eccentric(component_type: str, skey: str | None = None) -> bool:
+    """偏心变径判定：类型串明示优先，类型不明时按 SKEY 反查的类型判断。"""
+    t = component_type.upper().replace("_", "-")
+    if "ECCENTRIC" in t:
+        return True
+    if "CONCENTRIC" in t:
+        return False
+    resolved = type_from_skey(skey) if skey else None
+    return bool(resolved and "ECCENTRIC" in resolved.upper())
+
+
 # Component type -> short display class used by the renderer and reports.
-def classify(component_type: str) -> str:
+def _classify_type(component_type: str) -> str:
     t = component_type.upper().replace("_", "-")
     if t.startswith("PIPE") or t == "NIPPLE":
         return "PIPE"
@@ -95,6 +166,16 @@ def classify(component_type: str) -> str:
     if t.startswith("MESSAGE"):
         return "MESSAGE"
     return "OTHER"
+
+
+def classify(component_type: str, skey: str | None = None) -> str:
+    """按 COMPONENT-TYPE 分类；类型不认识（OTHER）时用 SKEY 反查兜底。"""
+    cls = _classify_type(component_type)
+    if cls == "OTHER" and skey:
+        resolved = type_from_skey(skey)
+        if resolved:
+            return _classify_type(resolved)
+    return cls
 
 
 _VALVE_SUBTYPE_KEYWORDS = (

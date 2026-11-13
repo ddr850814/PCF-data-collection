@@ -1,0 +1,5 @@
+{
+ "_comment": "阀体 SKEY -> 阀柄 SKEY 映射。阀体与阀柄是两个独立符号（柄按 SPINDLE-DIRECTION 单独适配朝向）。by_skey 键支持 'VV**' 前缀通配（** = 两个端接字符），default 兜底所有未列出的阀门。渲染：阀体符号按管线两端对齐后，柄叠加在阀体包围盒顶边中点、朝 spindle 方向伸出。",
+ "default": "01SP",
+ "by_skey": {}
+}

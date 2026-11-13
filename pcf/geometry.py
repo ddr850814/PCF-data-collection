@@ -153,7 +153,7 @@ class ConnectivityGraph:
         from .skeys import classify
 
         pipe_idxs = [i for i, c in enumerate(self.components)
-                     if classify(c.type) == "PIPE"]
+                     if classify(c.type, c.skey) == "PIPE"]
         for idx, comp in enumerate(self.components):
             if not comp.centre_points and not comp.co_ords:
                 continue
@@ -176,7 +176,7 @@ class ConnectivityGraph:
     def _on_axis(self, host: Component, rider: Component) -> bool:
         from .skeys import classify
 
-        if classify(host.type) != "PIPE":
+        if classify(host.type, host.skey) != "PIPE":
             return False
         eps = host.end_points
         if len(eps) < 2:

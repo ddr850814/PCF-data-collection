@@ -173,7 +173,7 @@ def _collect_landmarks(doc: PcfDocument) -> list[_Landmark]:
     # middle of a run is joined to nothing, so the graph calls both of its
     # ends open and hands back a landmark that cuts the run in half.
     for comp, pt in geometry.open_ends(doc, tol):
-        if classify(comp.type) in _NEVER_OPEN_END:
+        if classify(comp.type, comp.skey) in _NEVER_OPEN_END:
             continue
         if id(comp) in speaks_for_itself:
             continue  # its own centre/face already speaks for it
@@ -210,7 +210,7 @@ def _continuity(doc: PcfDocument, comps: list[Component]) -> _Continuity:
         if is_annotation_symbol(comp.type, desc, comp.skey):
             arrows.extend(p.xyz for p in comp.all_points())
             continue
-        if classify(comp.type) in _NO_STRAIGHT_BODY:
+        if classify(comp.type, comp.skey) in _NO_STRAIGHT_BODY:
             continue
         eps = comp.end_points
         if len(eps) >= 2:
@@ -279,7 +279,7 @@ def _own_landmarks(comp: Component, comps: list[Component],
     leg past a reducer went out undimensioned. The pair is tagged with a
     shared owner so the chain walk never dimensions the reducer's own body.
     """
-    cls = classify(comp.type)
+    cls = classify(comp.type, comp.skey)
     if cls == "ELBOW":
         corner = _elbow_corner(comp)
         return [(corner, "ELL CENTER", RANK_CENTRE)] if corner is not None else []
@@ -396,7 +396,7 @@ def _welded_end_index(eps, comps: list[Component],
     gasket_ends: set[int] = set()
     for other_idx in graph.neighbours(idx):
         other = comps[other_idx]
-        if classify(other.type) != "GASKET":
+        if classify(other.type, other.skey) != "GASKET":
             continue
         for pt in other.connection_points():
             for n, ep in enumerate(eps[:2]):
@@ -408,7 +408,7 @@ def _welded_end_index(eps, comps: list[Component],
         other = comps[other_idx]
         if looks_like_flange(other.type, other.description, other.skey):
             continue
-        cls = classify(other.type)
+        cls = classify(other.type, other.skey)
         rank = next((r for r, names in enumerate(_WELDED_BY_RANK)
                      if cls in names), None)
         if rank is None or (best is not None and rank >= best[0]):
@@ -530,12 +530,12 @@ def _leg_segments(comp: Component) -> list[tuple[Vec3, Vec3]]:
     eps = comp.end_points
     if len(eps) < 2:
         return []
-    if classify(comp.type) in ("ELBOW", "BEND"):
+    if classify(comp.type, comp.skey) in ("ELBOW", "BEND"):
         if not comp.centre_points:
             return []
         corner = comp.centre_points[0].xyz
         return [(eps[0].xyz, corner), (eps[-1].xyz, corner)]
-    if classify(comp.type) in _LEG_CLASSES or looks_like_flange(
+    if classify(comp.type, comp.skey) in _LEG_CLASSES or looks_like_flange(
             comp.type, comp.description, comp.skey):
         return [(eps[0].xyz, eps[1].xyz)]
     return []
@@ -700,7 +700,7 @@ def _reducer_body_dimensions(comps: list[Component], legs: list[_Leg],
     out: list[Dimension] = []
     seen = {d.id for d in dims}
     for comp in comps:
-        if classify(comp.type) != "REDUCER":
+        if classify(comp.type, comp.skey) != "REDUCER":
             continue
         ends = _reducer_ends(comp)
         if len(ends) < 2:

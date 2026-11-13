@@ -550,7 +550,7 @@ def _joint_axis(comps: list[Component], at_cut: list[int], cut: Vec3) -> Vec3:
         direction = geometry.normalize(geometry.sub(eps[1].xyz, eps[0].xyz))
         if direction == (0.0, 0.0, 0.0):
             continue
-        if classify(comp.type) in ("WELD", "COUPLING"):
+        if classify(comp.type, comp.skey) in ("WELD", "COUPLING"):
             return direction
         if best is None:
             best = direction

@@ -210,7 +210,7 @@ def _open_exits(doc: PcfDocument, tol: float) -> list[Vec3]:
     """Open ends that could hand off to another drawing."""
     out: list[Vec3] = []
     for comp, pt in geometry.open_ends(doc, tol):
-        if classify(comp.type) in _TERMINATES:
+        if classify(comp.type, comp.skey) in _TERMINATES:
             continue
         out.append(pt.xyz)
     return out

@@ -90,7 +90,7 @@ def _end_info(
         touching = any(end.distance_to(op) <= tolerance for op in other.connection_points())
         if not touching:
             continue
-        if classify(other.type) == "WELD":
+        if classify(other.type, other.skey) == "WELD":
             eps = other.end_points
             if len(eps) >= 2:
                 gap = eps[0].distance_to(eps[1])
@@ -128,7 +128,7 @@ def _branches_on(
 
     out: list[BranchInfo] = []
     for comp in comps:
-        if classify(comp.type) != "OLET" or not comp.centre_points:
+        if classify(comp.type, comp.skey) != "OLET" or not comp.centre_points:
             continue
         centre = comp.centre_points[0].xyz
         t = geometry.dot(geometry.sub(centre, a), unit)
@@ -175,7 +175,7 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
 
     pieces: list[CutPiece] = []
     for idx, comp in enumerate(comps):
-        if classify(comp.type) != "PIPE":
+        if classify(comp.type, comp.skey) != "PIPE":
             continue
         eps = comp.end_points
         if len(eps) < 2:

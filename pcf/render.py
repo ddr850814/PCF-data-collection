@@ -53,6 +53,7 @@ text. See _plan_dim_geometry().
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from contextlib import contextmanager
@@ -68,7 +69,8 @@ from .dims import (DEFAULT_OFFSET_MM, Dimension, flange_face,
                    infer_dimensions, load_sidecar, merge_with_sidecar)
 from .model import Component, PcfDocument, Point
 from .skeys import (classify, is_annotation_symbol, is_slip_on_flange,
-                    is_weld_coupling, looks_like_flange, valve_subtype)
+                    is_weld_coupling, looks_like_flange,
+                    reducer_is_eccentric, type_from_skey, valve_subtype)
 from .units import (coord_to_inch_factor, format_bore, format_feet_inches,
                     format_length, format_mm, is_metric_units)
 from .welds import (GAP_COUPLING_MAX_INCHES, Weld, component_spools,
@@ -687,7 +689,7 @@ def _straight_runs(comps: list[tuple[Component, str]]) -> list[tuple[Vec3, Vec3]
     """
     runs: list[tuple[Vec3, Vec3]] = []
     for comp, _ref in comps:
-        cls = classify(comp.type)
+        cls = classify(comp.type, comp.skey)
         eps = [p.xyz for p in comp.end_points]
         if len(eps) < 2:
             continue
@@ -1435,7 +1437,7 @@ def _render_document(
         # 只有直管/短管参与非比例伸缩；弯头腿和其他零件保持刚性。
         centrelines = [(comp.end_points[0].xyz, comp.end_points[1].xyz)
                        for comp, _ref in comps
-                       if classify(comp.type) == "PIPE" and len(comp.end_points) >= 2]
+                       if classify(comp.type, comp.skey) == "PIPE" and len(comp.end_points) >= 2]
         skew_segments = _skew_segments(
             centrelines, all_points, geometry.model_tolerance(doc),
             coord_to_inch_factor(doc.units_coords))
@@ -1472,10 +1474,10 @@ def _render_document(
     # 供 _growth_room 判断每个零件两端还有多少可生长空间。
     _NONPIPE_PAGE_PTS.clear()
     for comp, _ref in comps:
-        if classify(comp.type) in ("PIPE", "WELD", "BOLT", "GASKET"):
+        if classify(comp.type, comp.skey) in ("PIPE", "WELD", "BOLT", "GASKET"):
             continue
-        ecc = (classify(comp.type) == "REDUCER"
-               and "ECCENTRIC" in comp.type.upper())
+        ecc = (classify(comp.type, comp.skey) == "REDUCER"
+               and reducer_is_eccentric(comp.type, comp.skey))
         for p in comp.all_points():
             _NONPIPE_PAGE_PTS.append(
                 (projector.page(p.xyz, apply_offset=not ecc), id(comp)))
@@ -1486,7 +1488,7 @@ def _render_document(
     for idx, (comp, ref) in enumerate(comps):
         # 语义标签：直管段按管线号（拆图/分图按 run 定位），其余元件按
         # UCI（缺省退回序号）。PDF 出图后端原样忽略。
-        tag = (("pipe", ref) if classify(comp.type) == "PIPE"
+        tag = (("pipe", ref) if classify(comp.type, comp.skey) == "PIPE"
                else ("component", comp.uci or str(idx)))
         try:
             with canvas.tagged(*tag):
@@ -2005,7 +2007,7 @@ def _draw_phantom_mate(canvas: _Canvas, proj: Projector, doc: PcfDocument,
     at3 = cont.point
     at = proj.page(at3)
     for comp in _neighbour_mates(doc, cont, options):
-        cls = classify(comp.type)
+        cls = classify(comp.type, comp.skey)
         if cls in ("BOLT", "GASKET", "SUPPORT", "MESSAGE"):
             continue
         eps = comp.end_points
@@ -2168,7 +2170,7 @@ def _olet_header_points(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     tol = geometry.model_tolerance(doc)
     out: dict[int, tuple[Vec3, Vec3]] = {}
     for comp in comps:
-        if classify(comp.type) != "OLET" or not comp.centre_points:
+        if classify(comp.type, comp.skey) != "OLET" or not comp.centre_points:
             continue
         centre = comp.centre_points[0].xyz
         for other in comps:
@@ -2206,7 +2208,7 @@ def _run_axis_at(comp: Component, at: Vec3, tol: float
     never goes. Returns None when ``at`` is not on this component, or when
     the leg through it is too short to give a direction.
     """
-    cls = classify(comp.type)
+    cls = classify(comp.type, comp.skey)
     eps = comp.end_points
     ends = (eps[0].xyz, eps[-1].xyz) if len(eps) >= 2 else None
 
@@ -2271,7 +2273,7 @@ def _reducer_runs(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     tol = geometry.model_tolerance(doc)
     out: dict[int, tuple[Vec3, Vec3]] = {}
     for comp in comps:
-        if classify(comp.type) != "REDUCER" or len(comp.end_points) < 2:
+        if classify(comp.type, comp.skey) != "REDUCER" or len(comp.end_points) < 2:
             continue
         first, last = comp.end_points[0], comp.end_points[-1]
         large_first = (first.bore or 0.0) >= (last.bore or 0.0)
@@ -2302,7 +2304,7 @@ def _eccentric_small_side_offsets(
     graph = geometry.ConnectivityGraph(real, tol)
     offsets: dict[Vec3, Vec2] = {}
     for idx, comp in enumerate(real):
-        if ("ECCENTRIC" not in comp.type.upper()
+        if (not reducer_is_eccentric(comp.type, comp.skey)
                 or len(comp.end_points) < 2 or id(comp) not in runs):
             continue
         first, last = comp.end_points[0], comp.end_points[1]
@@ -2392,9 +2394,9 @@ def _eccentric_offset_pairs(doc: PcfDocument,
     """
     keep: list[set[tuple[float, float]]] = [set(), set(), set()]
     for comp in doc.real_components():
-        if classify(comp.type) != "REDUCER" or len(comp.end_points) < 2:
+        if classify(comp.type, comp.skey) != "REDUCER" or len(comp.end_points) < 2:
             continue
-        if "ECCENTRIC" not in comp.type.upper():
+        if not reducer_is_eccentric(comp.type, comp.skey):
             continue
         run = runs.get(id(comp))
         if run is None:
@@ -2432,10 +2434,10 @@ def _fitting_symbol_targets(comps: list[tuple[Component, str]],
     except Exception:
         return out
     for comp, _ref in comps:
-        c = classify(comp.type)
+        c = classify(comp.type, comp.skey)
         if c in ("PIPE", "WELD", "BOLT", "ELBOW", "TEE", "SUPPORT"):
             continue
-        if "ECCENTRIC" in comp.type.upper():
+        if reducer_is_eccentric(comp.type, comp.skey):
             continue
         eps = comp.end_points
         if len(eps) < 2:
@@ -2490,7 +2492,7 @@ def _olet_branch_connected(doc: PcfDocument) -> set[int]:
     """
     comps = doc.real_components()
     olets = [c for c in comps
-             if classify(c.type) == "OLET" and c.branch1_points]
+             if classify(c.type, c.skey) == "OLET" and c.branch1_points]
     if not olets:
         return set()
     tol = geometry.model_tolerance(doc)
@@ -2642,8 +2644,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     olet_branch_connected: set[int] | None = None,
                     reducer_runs: dict[int, tuple[Vec3, Vec3]] | None = None,
                     ) -> Vec2 | None:
-    cls = classify(comp.type)
-    eccentric = cls == "REDUCER" and "ECCENTRIC" in comp.type.upper()
+    cls = classify(comp.type, comp.skey)
+    eccentric = cls == "REDUCER" and reducer_is_eccentric(comp.type, comp.skey)
     eps = [proj.page(p.xyz, apply_offset=not eccentric) for p in comp.end_points]
     cps = [proj.page(p.xyz) for p in comp.centre_points]
     b1s = [proj.page(p.xyz) for p in comp.branch1_points]
@@ -2659,8 +2661,23 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     # START(首点)→eps[0]、EXIT(收笔点)→eps[1] 双点仿射对齐。
     # 手写分支仅作无符号时的回退；支撑(SUPPORT)走自己的方向模式分支。
     # 注意：必须先于下方 flange_face 特殊分支，法兰符号才优先生效。
-    if cls in ("VALVE", "FLANGE", "ELBOW", "REDUCER", "COUPLING", "FILTER",
-               "INSTRUMENT", "MULTIPORT") and len(eps) >= 2:
+    # 爆破片（SAFETY-DISC，SKEY=RD）在 classify 里归 GASKET，但官方
+    # 符号必须画——只让普通垫片走"不画、项号并父标"分支。
+    sym_first = cls == "GASKET" and (
+        (comp.type or "").upper().replace("_", "-").startswith("SAFETY-DISC")
+        or type_from_skey(comp.skey) == "SAFETY-DISC")
+    # 焊接联管节（gap 小）不画符号——焊点语义由焊点呈现，中心线保持
+    # 连续（与下方 COUPLING 原生分支同一判定）；gap 大的仍走符号。
+    skip_sym = False
+    if cls == "COUPLING" and len(eps) >= 2:
+        gap_in = (comp.end_points[0].distance_to(comp.end_points[1])
+                  * coord_to_inch_factor(doc.units_coords))
+        skip_sym = (gap_in <= GAP_COUPLING_MAX_INCHES
+                    and is_weld_coupling(comp.type, comp.description,
+                                         comp.skey))
+    if (cls in ("VALVE", "FLANGE", "ELBOW", "REDUCER", "COUPLING", "FILTER",
+                "INSTRUMENT", "MULTIPORT", "OLET") or sym_first) \
+            and not skip_sym and len(eps) >= 2:
         ep3 = comp.end_points
         run3 = (tuple(ep3[1].xyz[i] - ep3[0].xyz[i] for i in range(3))
                 if len(ep3) >= 2 else None)
@@ -2672,7 +2689,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             # 方向向量的正负是随机的，会把符号翻进阀门里。
             try:
                 for c in doc.real_components():
-                    if classify(c.type) != "PIPE" or len(c.end_points) < 2:
+                    if classify(c.type, c.skey) != "PIPE" or len(c.end_points) < 2:
                         continue
                     e0 = proj.page(c.end_points[0].xyz)
                     e1 = proj.page(c.end_points[1].xyz)
@@ -2722,7 +2739,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     axis_override = ax
         bore_ratio = None
         ecc_dir = None
-        if cls == "REDUCER" and "ECCENTRIC" in comp.type.upper():
+        if cls == "REDUCER" and reducer_is_eccentric(comp.type, comp.skey):
             bore0, bore1 = ep3[0].bore, ep3[1].bore
             if bore0 and bore1 and bore0 > bore1:
                 bore_ratio = bore1 / bore0
@@ -2737,6 +2754,22 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     ecc_dir = _v2_sub(pb, pa)
         du = _v2_sub(sp1, sp0)
         dln = _v2_len(du)
+        op_kw = {}
+        if cls == "VALVE":
+            # 阀柄：映射表查柄 skey，SPINDLE-DIRECTION 投影成页面方向
+            op_skey = _valve_operator_skey(comp.skey)
+            sd3 = _FLAT_DIRECTIONS.get(
+                (comp.get("SPINDLE-DIRECTION") or "").strip().upper())
+            if op_skey and sd3 and proj is not None and ep3:
+                c3 = ep3[0].xyz
+                pa = proj.page(c3, apply_offset=False)
+                pb = proj.page(tuple(c3[i] + sd3[i] for i in range(3)),
+                               apply_offset=False)
+                dv = _v2_sub(pb, pa)
+                ln3 = _v2_len(dv)
+                if ln3 > 1e-9:
+                    op_kw["operator"] = (op_skey,
+                                         (dv[0] / ln3, dv[1] / ln3))
         kw_rooms = {}
         if dln > 1e-9:
             ax_u = (du[0] / dln, du[1] / dln)
@@ -2750,7 +2783,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                                            and not (b1s or b2s)),
                             bore_ratio=bore_ratio,
                             no_grow=(cls == "FLANGE"),
-                            ecc_dir=ecc_dir, **kw_rooms):
+                            ecc_dir=ecc_dir, **op_kw, **kw_rooms):
             return cps[0] if cps else _v2_mid(eps[0], eps[1])
 
     face_pt = (flange_face_pts or {}).get(id(comp))
@@ -2822,7 +2855,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             # 端点落在"端点重合法兰"接带簇里的：修剪到法兰焊端——
             # 主管接焊端，不穿越垫片空隙直抵阀面
             for fl in doc.real_components():
-                if classify(fl.type) != "FLANGE":
+                if classify(fl.type, fl.skey) != "FLANGE":
                     continue
                 bd = _flange_band(proj, doc, fl, flange_face_pts)
                 if bd is not None:
@@ -3225,7 +3258,7 @@ def _flange_band(proj, doc, comp, flange_face_pts):
     best = None
     try:
         for c in doc.real_components():
-            if classify(c.type) != "PIPE" or len(c.end_points) < 2:
+            if classify(c.type, c.skey) != "PIPE" or len(c.end_points) < 2:
                 continue
             p0 = proj.page(c.end_points[0].xyz)
             p1 = proj.page(c.end_points[1].xyz)
@@ -3277,6 +3310,50 @@ def _across_v(proj: "Projector | None", run3: tuple | None,
     return vv
 
 
+_VALVE_OPS: dict[str, str] | None = None
+
+
+def _valve_operators() -> dict[str, str]:
+    """阀体 SKEY -> 阀柄 SKEY 映射（symbols/operators.json）。
+
+    阀体与阀柄在符号库里是两个独立符号（柄需要按 SPINDLE-DIRECTION
+    单独适配朝向，不能并进阀体几何）。by_skey 键支持 "VV**" 形式
+    （** = 两个端接字符），"default" 兜底所有未列出的阀门。
+    """
+    global _VALVE_OPS
+    if _VALVE_OPS is None:
+        ops: dict[str, str] = {}
+        try:
+            from .asc_symbols import _candidate_dirs
+            for d in _candidate_dirs():
+                p = d / "operators.json"
+                if p.is_file():
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    ops.update(data.get("by_skey") or {})
+                    if data.get("default"):
+                        ops.setdefault("**", data["default"])
+                    break
+        except (OSError, ValueError):
+            pass
+        _VALVE_OPS = ops
+    return _VALVE_OPS
+
+
+def _valve_operator_skey(skey: str | None) -> str | None:
+    """阀柄 SKEY：先按映射键匹配（带 ** 前缀通配），最后落 default。"""
+    if not skey:
+        return None
+    ops = _valve_operators()
+    s = skey.upper()
+    for pat, op in ops.items():
+        p = pat.upper()
+        if p == "**":
+            continue
+        if (p.endswith("**") and s.startswith(p[:-2])) or p == s:
+            return op
+    return ops.get("**")
+
+
 def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      proj: "Projector | None" = None,
                      run3: tuple | None = None, wp: tuple | None = None,
@@ -3290,7 +3367,8 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
                      room0: float | None = None,
                      room1: float | None = None,
                      no_grow: bool = False,
-                     ecc_dir: Vec2 | None = None) -> bool:
+                     ecc_dir: Vec2 | None = None,
+                     operator: tuple[str, Vec2] | None = None) -> bool:
     """SKEY 符号库双接点对齐绘制（ASC 优先 → skeys.json 官方库）。
 
     符号 START(首点) → p0，EXIT(收笔点) → p1。符号 X 轴直接映射管轴 u
@@ -3420,15 +3498,37 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
         if kept:
             sym = kept
     draw = canvas.dashed if dashed else canvas.line
+    pts: list[Vec2] = []
     for x1, y1, x2, y2 in sym:
         # 虚线符号（设备管口）是实体几何：记入 segments，尺寸放置与
         # 球标布线才会避让——否则 goalpost 直接压在管口符号上。
-        draw(
-            (x0 + x1 * bx[0] + y1 * by[0],
-             y0 + x1 * bx[1] + y1 * by[1]),
-            (x0 + x2 * bx[0] + y2 * by[0],
-             y0 + x2 * bx[1] + y2 * by[1]),
-            width=width, record=True)
+        a = (x0 + x1 * bx[0] + y1 * by[0],
+             y0 + x1 * bx[1] + y1 * by[1])
+        b = (x0 + x2 * bx[0] + y2 * by[0],
+             y0 + x2 * bx[1] + y2 * by[1])
+        pts.append(a)
+        pts.append(b)
+        draw(a, b, width=width, record=True)
+    if operator and pts:
+        # 阀柄叠加：阀体与阀柄是两个独立符号，柄按 SPINDLE-DIRECTION
+        # 单独定朝向（用户约定）。柄符号 START 已归一到原点（阀杆底），
+        # 锚点取阀体包围盒顶边中点，Y 正方向 = 柄伸出方向（符号库朝
+        # 上画柄），等比缩放到与阀体同标尺（height_mm）。
+        op_skey, sp2 = operator
+        from .asc_symbols import find_symbol_full
+        op_sym = find_symbol_full(op_skey)[0] if op_skey else None
+        if op_sym:
+            ys = [c for s in op_sym for c in (s[1], s[3])]
+            s_op = height_mm / max(max(ys) - min(ys), 1e-6)
+            anchor = ((min(p[0] for p in pts) + max(p[0] for p in pts)) / 2.0,
+                      min(p[1] for p in pts))          # 页面 y 向下，顶=miny
+            dx, dy = sp2
+            for x1, y1, x2, y2 in op_sym:
+                draw((anchor[0] + s_op * (x1 * dy + y1 * dx),
+                      anchor[1] + s_op * (-x1 * dx + y1 * dy)),
+                     (anchor[0] + s_op * (x2 * dy + y2 * dx),
+                      anchor[1] + s_op * (-x2 * dx + y2 * dy)),
+                     width=width, record=True)
     return True
 
 
@@ -3555,7 +3655,7 @@ def _draw_reducer(canvas: _Canvas, proj: Projector, comp: Component,
     if axis == (0.0, 0.0):
         return
 
-    if "ECCENTRIC" in comp.type.upper():
+    if reducer_is_eccentric(comp.type, comp.skey):
         offset = _reducer_flat_offset(comp, big_pt, small_pt, run)
         across = _v2_norm(_v2_sub(proj.raw(offset), proj.raw((0, 0, 0))))
         step = _step_across(_v2_sub(small, big), axis, across)
@@ -4149,7 +4249,7 @@ def _nearest_pipe_run_dir(proj: "Projector", doc, at: Vec2):
     if runs is None:
         runs = []
         for comp in doc.real_components():
-            if classify(comp.type) == "PIPE" and len(comp.end_points) >= 2:
+            if classify(comp.type, comp.skey) == "PIPE" and len(comp.end_points) >= 2:
                 w0 = comp.end_points[0].xyz
                 w1 = comp.end_points[1].xyz
                 a = proj.page(w0)
@@ -4399,7 +4499,7 @@ def _bom_class(comp: Component) -> str:
     shipped as a COUPLING/OTHER record is counted as the flange it is."""
     if looks_like_flange(comp.type, comp.description, comp.skey):
         return "FLANGE"
-    return classify(comp.type)
+    return classify(comp.type, comp.skey)
 
 
 def _bom_key(comp: Component) -> tuple:
@@ -4583,7 +4683,7 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
 
     # -- pass 1: pipe item-number callouts（Isogen 惯例：直管也标 BOM 项号） --
     for idx, (comp, _ref) in enumerate(comps):
-        if idx not in anchors or classify(comp.type) != "PIPE":
+        if idx not in anchors or classify(comp.type, comp.skey) != "PIPE":
             continue
         row = bom_rows.get(_bom_key(comp))
         label = str(row["item"]) if row else pipe_labels.get(idx)
@@ -4640,7 +4740,7 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
 
     done: set[tuple] = set()
     for idx, (comp, _ref) in enumerate(comps):
-        if idx not in anchors or classify(comp.type) == "PIPE":
+        if idx not in anchors or classify(comp.type, comp.skey) == "PIPE":
             continue
         if comp.type.upper() in ("GASKET", "BOLT"):
             continue

@@ -120,7 +120,7 @@ def _parse_asc(text: str) -> dict[str, tuple]:
 
 def _flush(symbols, skeys, segs, first_pt, orient, stop_pt=None) -> None:
     """把当前累积的符号按 SKEY 存入（先到先得），归一到连接点（首条 502 首点）"""
-    if not skeys or segs is None:
+    if not skeys or not segs:      # 空段符号（如 vendor FLRC）不入库，留给原生兜底
         return
     ox, oy = first_pt if first_pt else (0.0, 0.0)
     norm = [(x1-ox, y1-oy, x2-ox, y2-oy) for x1, y1, x2, y2 in segs]

@@ -78,7 +78,7 @@ def _weld_label(description: str | None) -> str:
 
 
 def _is_gap_coupling(comp: Component, inch_factor: float) -> bool:
-    if classify(comp.type) != "COUPLING":
+    if classify(comp.type, comp.skey) != "COUPLING":
         return False
     desc = (comp.description or "").lower()
     if "weld" not in desc:
@@ -97,7 +97,7 @@ def _neighbor_names(
     names = []
     for other_idx in sorted(graph.neighbours(idx)):
         other = doc_components[other_idx]
-        if classify(other.type) in ("COUPLING", "CONNECTION", "MESSAGE"):
+        if classify(other.type, other.skey) in ("COUPLING", "CONNECTION", "MESSAGE"):
             continue
         label = other.description or other.type
         if label not in names:
@@ -125,7 +125,7 @@ def _insert_toward(
     pipe_pts: list[tuple[float, float, float]] = []
     for other_idx in graph.neighbours(idx):
         other = doc_components[other_idx]
-        if classify(other.type) != "PIPE":
+        if classify(other.type, other.skey) != "PIPE":
             continue
         pipe_pts.extend(p.xyz for p in other.connection_points())
     if not pipe_pts:
@@ -188,7 +188,7 @@ def derive_welds(
 
     last_skey: str | None = None
     for idx, comp in enumerate(comps):
-        ctype = classify(comp.type)
+        ctype = classify(comp.type, comp.skey)
         skey = comp.skey
         if skey and ctype != "WELD" and not _is_gap_coupling(comp, inch_factor):
             last_skey = skey
@@ -254,7 +254,7 @@ def derive_welds(
     if detect_ffw:
         prox_tol = max(PROXIMITY_INCHES / inch_factor, tolerance)
         for idx, comp in enumerate(comps):
-            if classify(comp.type) not in _WELDABLE_CLASSES:
+            if classify(comp.type, comp.skey) not in _WELDABLE_CLASSES:
                 continue
             for pt in comp.end_points:
                 if pt.connection_type in _NON_WELD_CONNECTIONS:
@@ -263,7 +263,7 @@ def derive_welds(
                     if other_idx <= idx:
                         continue
                     other = comps[other_idx]
-                    if classify(other.type) not in _WELDABLE_CLASSES:
+                    if classify(other.type, other.skey) not in _WELDABLE_CLASSES:
                         continue
                     for opt in other.end_points:
                         if opt.connection_type in _NON_WELD_CONNECTIONS:
