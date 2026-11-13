@@ -194,6 +194,8 @@ def derive_welds(
             last_skey = skey
 
         if ctype == "WELD":
+            if comp.material_excluded():
+                continue  # 边界焊（EXCLUDE+DOTTED-UNDIMENSIONED）：对侧所有，不编号不进焊表
             eps = comp.end_points
             if eps:
                 pos = geometry.midpoint(eps[0].xyz, eps[-1].xyz) if len(eps) > 1 else eps[0].xyz
@@ -240,6 +242,10 @@ def derive_welds(
             continue
 
         if ctype == "OLET" and comp.centre_points:
+            if comp.material_excluded():
+                # 对侧支管台副本（CONTINUATION/EXCLUDE）：其 set-on 焊属于
+                # 归属图（那边有显式 WELD 记录），本图不编号不画点
+                continue
             centre = comp.centre_points[0]
             branch_bore = comp.branch1_points[0].bore if comp.branch1_points else comp.bore
             raw.append(((idx, 0), dict(

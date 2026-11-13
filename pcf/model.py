@@ -205,6 +205,19 @@ class Component:
     def has(self, key: str) -> bool:
         return self.get(key) is not None
 
+    def material_excluded(self) -> bool:
+        """MATERIAL-LIST EXCLUDE：本图只画不计料。
+
+        距离拆分导出把边界段（支管台/三通/直管及其法兰副料、焊缝）双写
+        进两侧文件，客侧副本带此标记——ISOGEN 惯例是画示意但不进本图
+        BOM/切割表/焊表，归属侧无标记、正常计量。
+        """
+        return (self.get("MATERIAL-LIST") or "").strip().upper() == "EXCLUDE"
+
+    def is_continuation_copy(self) -> bool:
+        """CONTINUATION：对侧图纸边界件在本图的副本（画虚线示意）。"""
+        return self.has("CONTINUATION")
+
     def set(self, key: str, value: str) -> None:
         """Set (or add) a scalar attribute, preserving other lines verbatim."""
         key_u = key.upper()

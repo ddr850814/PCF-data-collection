@@ -53,7 +53,8 @@ from pathlib import Path
 
 from . import geometry
 from .model import Component, PcfDocument
-from .skeys import classify, is_annotation_symbol, looks_like_flange
+from .skeys import (classify, is_annotation_symbol, looks_like_flange,
+                    reducer_is_eccentric)
 from .units import format_length
 
 Vec3 = tuple[float, float, float]
@@ -96,6 +97,8 @@ class Dimension:
     text: str | None = None      # explicit override; None = computed
     offset_mm: float = DEFAULT_OFFSET_MM   # offset of the dimension line
     suppressed: bool = False
+    # 偏心变径等同轴尺寸：图面端点只保留轴向位移，剔除符号偏心横移。
+    coaxial: bool = False
 
     def computed_text(self, units_coords: str) -> str:
         if self.text:
@@ -537,6 +540,13 @@ def _leg_segments(comp: Component) -> list[tuple[Vec3, Vec3]]:
         return [(eps[0].xyz, corner), (eps[-1].xyz, corner)]
     if classify(comp.type, comp.skey) in _LEG_CLASSES or looks_like_flange(
             comp.type, comp.description, comp.skey):
+        # 偏心变径不建弦 leg：两端在平行中心线上，弦是斜线而非管线
+        # 走的线（与弯头不建弦同理）。建了它，偏心端点与邻近 landmark
+        # 会挂上斜弦配出倾斜尺寸。两端各自落在相邻管段的 leg 上，本体
+        # 长度由 _reducer_body_dimensions 沿主管轴标注。
+        if (classify(comp.type, comp.skey) == "REDUCER"
+                and reducer_is_eccentric(comp.type, comp.skey)):
+            return []
         return [(eps[0].xyz, eps[1].xyz)]
     return []
 
@@ -658,13 +668,19 @@ def infer_dimensions(doc: PcfDocument) -> list[Dimension]:
             for (_t1, lm1), (_t2, lm2) in zip(chain, chain[1:]):
                 if lm1.owner is not None and lm1.owner == lm2.owner:
                     continue  # a component's own body length is a catalogue number
-                dim_id = _dim_id(lm1.point, lm2.point)
+                # 同轴化：端点取 leg 轴线上的垂足。偏心变径的端点带横向
+                # 偏心（小端中心线平移了半圈壁厚差），直接用原始点配对会
+                # 让尺寸线倾斜、渲染端多出 offset 盒——链式尺寸量的是
+                # 沿线距离，端点理应落在线上。
+                p1 = geometry.add(leg.origin, geometry.scale(leg.unit, _t1))
+                p2 = geometry.add(leg.origin, geometry.scale(leg.unit, _t2))
+                dim_id = _dim_id(p1, p2)
                 if dim_id in seen:
                     continue
                 seen.add(dim_id)
                 dims.append(Dimension(
                     id=dim_id, kind="auto",
-                    p_from=lm1.point, p_to=lm2.point,
+                    p_from=p1, p_to=p2,
                     landmark_from=lm1.name, landmark_to=lm2.name,
                 ))
 
@@ -710,9 +726,19 @@ def _reducer_body_dimensions(comps: list[Component], legs: list[_Leg],
         if geometry.length(delta) <= off_tol:
             continue
         chord = geometry.normalize(delta)
-        axis = next((leg.unit for leg in legs
-                     if _off_line(leg, big)[1] <= off_tol
-                     and abs(geometry.dot(leg.unit, chord)) < 0.9999), chord)
+        # 轴向取邻接管段：大端优先，无则取小端（客侧副本变径大端悬空，
+        # 而两侧中心线平行，小端管段同样给出主管轴）。拿不到才回退弦
+        # 线本身——同心变径弦即轴，偏心变径两腿至少一端有管（否则两
+        # 端都悬空，只剩孤件）。绝不沿斜弦标注：那不是同轴尺寸。
+        axis = chord
+        for want in (big, small):
+            hit = next((leg.unit for leg in legs
+                        if _off_line(leg, want)[1] <= off_tol
+                        and abs(geometry.dot(leg.unit, chord)) < 0.9999),
+                       None)
+            if hit is not None:
+                axis = hit
+                break
         axial = geometry.dot(delta, axis)
         if abs(axial) <= off_tol:
             continue
@@ -724,6 +750,7 @@ def _reducer_body_dimensions(comps: list[Component], legs: list[_Leg],
         out.append(Dimension(
             id=dim_id, kind="auto", p_from=big, p_to=far,
             landmark_from="RED LG", landmark_to="RED SM",
+            coaxial=True,
         ))
     return out
 
@@ -776,14 +803,33 @@ def _overall_dimensions(comps: list[Component], landmarks: list[_Landmark],
         )
         if a is None or geometry.dist(a.point, b.point) < min_span:
             continue
-        dim_id = _dim_id(a.point, b.point)
+        p_from, p_to = a.point, b.point
+        # 组内含偏心变径时按同轴处理：最远两点各落在变径一侧的中心线
+        # 上，横向差是偏心量（半圈壁厚差）而非布局尺寸。沿变径主管轴
+        # 投影小概率横向分量，渲染端才不会把总长拆成带偏心腿的 offset
+        # 盒（尺寸线倾斜）。
+        for idx in group:
+            c = comps[idx]
+            if (classify(c.type, c.skey) != "REDUCER"
+                    or not reducer_is_eccentric(c.type, c.skey)
+                    or len(c.end_points) < 2):
+                continue
+            d3 = geometry.sub(c.end_points[1].xyz, c.end_points[0].xyz)
+            k = max(range(3), key=lambda i: abs(d3[i]))
+            if abs(d3[k]) > 1e-9:
+                axis = tuple(1.0 if i == k else 0.0 for i in range(3))
+                axial = geometry.dot(geometry.sub(p_to, p_from), axis)
+                p_to = geometry.add(p_from, geometry.scale(axis, axial))
+            break
+        dim_id = _dim_id(p_from, p_to)
         if dim_id in seen:
             continue
         seen.add(dim_id)
         out.append(Dimension(
             id=dim_id, kind="auto",
-            p_from=a.point, p_to=b.point,
+            p_from=p_from, p_to=p_to,
             landmark_from=a.name, landmark_to=b.name,
+            coaxial=True,
         ))
     return out
 

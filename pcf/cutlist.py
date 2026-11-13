@@ -177,6 +177,8 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
     for idx, comp in enumerate(comps):
         if classify(comp.type, comp.skey) != "PIPE":
             continue
+        if comp.material_excluded():
+            continue  # 对侧边界直管副本（CONTINUATION/EXCLUDE），不进本图切割表
         eps = comp.end_points
         if len(eps) < 2:
             continue
