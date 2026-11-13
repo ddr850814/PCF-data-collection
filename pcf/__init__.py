@@ -2,8 +2,6 @@
 
 Flat public API; scripts and agents should import from here.
 """
-# 本目录（pcf/）引入自 https://github.com/ProcessQualitySolutions/pcf2iso
-# （MIT License，完整许可证文本见上游仓库）。
 # 本地修改：
 # render.py:
 # 1. _build_bom 跳过无 ITEM-CODE 的 WELD 记录（焊缝不是材料，避免占 BOM 行）；

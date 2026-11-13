@@ -117,10 +117,10 @@ class RenderOptions:
     # "MATERIAL": "A106-B"}. Insertion order is print order.
     properties: dict[str, str] = field(default_factory=dict)
     show_dimensions: bool = True
-    # Page length (mm) of the bar drawn across the gasket face of a flange.
-    # Twice the standard dimension offset by default, which is what makes a
-    # flanged connection read at a glance on a full sheet.
-    flange_bar_mm: float = 2 * DEFAULT_OFFSET_MM
+    # Page length (mm) of the bar drawn across the gasket face of a flange
+    # (hand-drawn path). Same width as the valve bow-tie base so the two read
+    # as one symbol family on a true-scale sheet.
+    flange_bar_mm: float = 3.8
     show_bom: bool = True
     show_cut_table: bool = True
     detect_ffw: bool = False
@@ -1520,16 +1520,19 @@ def _render_document(
                    draw_region[1] + draw_region[3] / 2)
 
     flange_face_pts = _flange_faces(doc)
-    if not chain_on:
+    if not chain_on and not projector.proportional:
         # 正算偏心变径后，小端连通侧整体接到符号 EXIT；变径自身不偏移。
+        # 按比例模式不走 SKEY 符号（手绘梯形两端即真实端点），无需平移。
         projector.point_offsets = _eccentric_small_side_offsets(
             projector, doc, comps, reducer_runs,
             proportional=projector.proportional)
-    # 小端后直接出图时没有下游管件可携带平移，接续线也要从符号 EXIT
-    # 接出；只改图面锚点，标注仍打印 PCF 声明坐标。
-    projector.point_offsets.update(_continuation_eccentric_offsets(
-        projector, doc, options.continuations, reducer_runs,
-        proportional=projector.proportional))
+    if not projector.proportional:
+        # 小端后直接出图时没有下游管件可携带平移，接续线也要从符号 EXIT
+        # 接出；只改图面锚点，标注仍打印 PCF 声明坐标。按比例下接续锚点
+        # 即声明坐标的真实投影。
+        projector.point_offsets.update(_continuation_eccentric_offsets(
+            projector, doc, options.continuations, reducer_runs,
+            proportional=projector.proportional))
     if not chain_on and not projector.proportional:
         # 等比符号端面带动连接点（仅示意模式）：管端修剪、焊点吸附、尺寸
         # goalpost 都随符号实际端面走——端点/尺寸计算"考虑 skey"的统一
@@ -3432,9 +3435,14 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
         skip_sym = (gap_in <= GAP_COUPLING_MAX_INCHES
                     and is_weld_coupling(comp.type, comp.description,
                                          comp.skey))
+    # 按比例模式整体走上游手绘路径（轴向=真实端点、横向=固定可读页宽），
+    # 不走 SKEY 符号——符号 X 轴对齐管轴的仿射对齐在偏心件上靠下游平移
+    # 补偿，与"忠实坐标"语义冲突。SAFETY-DISC（sym_first）无手绘等价物，
+    # 仍走符号库。
     if (cls in ("VALVE", "FLANGE", "ELBOW", "REDUCER", "COUPLING", "FILTER",
                 "INSTRUMENT", "MULTIPORT", "OLET") or sym_first) \
-            and not skip_sym and len(eps) >= 2:
+            and not skip_sym and len(eps) >= 2 \
+            and (sym_first or not proj.proportional):
         ep3 = comp.end_points
         run3 = (tuple(ep3[1].xyz[i] - ep3[0].xyz[i] for i in range(3))
                 if len(ep3) >= 2 else None)
@@ -3658,24 +3666,30 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     elif cls == "ELBOW":
         if len(eps) >= 2:
             corners = cps if cps else [_v2_mid(eps[0], eps[1])]
-            chain = [_grown_leg_end(eps[0], corners[0], natural=leg_mm,
-                                    own_id=id(comp)),
-                     *corners,
-                     _grown_leg_end(eps[1], corners[-1], natural=leg_mm,
-                                    own_id=id(comp))]
+            if proj.proportional:
+                # 按比例：腿=真实端点（上游画法），不做示意腿长生长
+                chain = [eps[0], *corners, eps[1]]
+                b_end = b1s[0] if b1s else None
+            else:
+                chain = [_grown_leg_end(eps[0], corners[0], natural=leg_mm,
+                                        own_id=id(comp)),
+                         *corners,
+                         _grown_leg_end(eps[1], corners[-1], natural=leg_mm,
+                                        own_id=id(comp))]
+                b_end = (_grown_leg_end(b1s[0], corners[0], natural=leg_mm,
+                                        own_id=id(comp))
+                         if b1s else None)
             if cont_copy:
                 for p, q in zip(chain, chain[1:]):
                     canvas.dashed(p, q, width=0.3)
             else:
                 canvas.polyline(chain, width=0.55)
-            branch = b1s[0] if b1s else None
+            branch = b_end
             if branch is not None and corners:
-                b_end = _grown_leg_end(branch, corners[0], natural=leg_mm,
-                                       own_id=id(comp))
                 if cont_copy:
-                    canvas.dashed(corners[0], b_end, width=0.3)
+                    canvas.dashed(corners[0], branch, width=0.3)
                 else:
-                    canvas.line(corners[0], b_end, width=0.55)
+                    canvas.line(corners[0], branch, width=0.55)
             return corners[0]
 
     elif cls == "TEE":
@@ -3688,18 +3702,25 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             stroke = canvas.line
         if len(eps) >= 2:
             c0 = centre if centre is not None else _v2_mid(eps[0], eps[1])
-            stroke(_grown_leg_end(eps[0], c0, natural=leg_mm,
-                                  own_id=id(comp)),
-                   _grown_leg_end(eps[1], c0, natural=leg_mm,
-                                  own_id=id(comp)),
-                   width=0.55)
+            if proj.proportional:
+                # 按比例：腿=真实端点（上游画法），不做示意腿长生长
+                stroke(eps[0], eps[1], width=0.55)
+            else:
+                stroke(_grown_leg_end(eps[0], c0, natural=leg_mm,
+                                      own_id=id(comp)),
+                       _grown_leg_end(eps[1], c0, natural=leg_mm,
+                                      own_id=id(comp)),
+                       width=0.55)
             anchor = c0
         if centre is not None:
             for branch in (*b1s, *b2s):
-                stroke(centre, _grown_leg_end(branch, centre,
-                                              natural=leg_mm,
-                                              own_id=id(comp)),
-                       width=0.55)
+                if proj.proportional:
+                    stroke(centre, branch, width=0.55)
+                else:
+                    stroke(centre, _grown_leg_end(branch, centre,
+                                                  natural=leg_mm,
+                                                  own_id=id(comp)),
+                           width=0.55)
             anchor = centre
         return anchor
 
@@ -3713,8 +3734,9 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             connected = (olet_branch_connected is None
                          or id(comp) in olet_branch_connected)
             # SKEY 符号库优先（WT 支管台等）：主管中心→支管端 两接点对齐，
-            # 跨向仍取世界轴投影；支管未连接时保持 _draw_olet 原行为
-            if connected:
+            # 跨向仍取世界轴投影；支管未连接或按比例模式（手绘路径）保持
+            # _draw_olet 原行为
+            if connected and not proj.proportional:
                 c3 = (comp.centre_points[0].xyz if comp.centre_points
                       else comp.end_points[0].xyz)
                 b3 = comp.branch1_points[0].xyz
@@ -3733,7 +3755,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     elif cls == "VALVE":
         if len(eps) >= 2:
             mid = cps[0] if cps else _v2_mid(eps[0], eps[1])
-            _draw_valve(canvas, eps, mid, comp)
+            _draw_valve(canvas, proj, eps, mid, comp)
             return mid
 
     elif cls == "FLANGE":
@@ -3763,7 +3785,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
         if eps:
             end = eps[0]
             axis = _v2_norm(_v2_sub(eps[0], eps[1])) if len(eps) > 1 else (1.0, 0.0)
-            _draw_cap(canvas, end, axis)
+            _draw_cap(canvas, proj, end, axis)
             return end
 
     elif cls == "COUPLING":
@@ -3798,7 +3820,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
 
     elif cls in ("INSTRUMENT", "FILTER", "MULTIPORT"):
         if len(eps) >= 2:
-            _draw_box_on_axis(canvas, eps[0], eps[1])
+            _draw_box_on_axis(canvas, proj, eps[0], eps[1])
             return _v2_mid(eps[0], eps[1])
         if pps and cps:
             for pp in pps:
@@ -4251,31 +4273,11 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
         # 链式布局整图缩放：符号尺寸与位置表同乘，保持搭积木间距
         sy *= proj.schematic_scale
     if proportional:
-        # 按比例模式：符号铺满实际端距（sx=端距/跨度），短端距生长、
-        # 超限钳制——真实比例出图时符号长度跟端点走（旧行为）。
+        # 按比例模式：符号长度严格等于实际端距（sx=端距/跨度）——不生长、
+        # 不钳制，符号两端与真实坐标投影精确对齐；只有高度保持可读
+        # （符号是示意表达，压缩到端距宽的阀/法兰在图上会缩成窄条，
+        # 这是"真实比例"语义下的预期可读性代价）。
         sx = sgn * d / span
-        if axis is None:
-            # 短端距向两端生长到自然长度（sx=sy 等比），生长量受邻件
-            # 空间约束（room0/room1）：长不出来就保持原样。
-            xs_ = [c for seg in sym for c in (seg[0], seg[2])]
-            natural = (max(xs_) - min(xs_)) * sy if xs_ else span * sy
-            if not no_grow and d < natural:
-                extra = natural - d
-                r0 = 1e9 if room0 is None else room0
-                r1 = 1e9 if room1 is None else room1
-                total = min(extra, r0 + r1)
-                g0 = min(r0, total / 2.0)
-                g1 = min(r1, total - g0)
-                g0 += min(r0 - g0, total - g0 - g1)
-                if g0 > 0:
-                    p0 = _v2_sub(p0, _v2_scale(u, g0))
-                if g1 > 0:
-                    p1 = _v2_add(p1, _v2_scale(u, g1))
-                d += g0 + g1
-                sx = sgn * d / span
-            ax_ = abs(sx)
-            if ax_ > sy * 2.0:
-                sx = math.copysign(sy * 2.0, sx)
     else:
         # 不按比例（示意）：符号恒等比，sx 恒等于 sy（镜像号除外）——
         # 轴向不单独拉伸，也不对个别符号加大/缩小。START 锚 p0 沿管轴
@@ -4348,13 +4350,16 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     return True
 
 
-def _draw_valve(canvas: _Canvas, eps: list[Vec2], mid: Vec2, comp: Component) -> None:
+def _draw_valve(canvas: _Canvas, proj: Projector, eps: list[Vec2],
+                mid: Vec2, comp: Component) -> None:
     # 回退：程序化领结 + 子类型装饰（SKEY 符号库命中时不会走到这里，
     # 统一入口见 _draw_component 顶部的 _draw_symbol_2pt）
     half_w = 1.9
     for end in eps[:4]:
         axis = _v2_norm(_v2_sub(mid, end))
-        perp = _v2_perp(axis)
+        # 底边沿轴测平面横轴（与法兰面杠/变径端面同族），不用页面垂直
+        # ——页面垂直不在任何轴测平面上，按比例长阀读起来像贴上去的贴纸
+        perp = _iso_cross_dir(proj, axis) if proj is not None else _v2_perp(axis)
         a = _v2_add(end, _v2_scale(perp, half_w))
         b = _v2_add(end, _v2_scale(perp, -half_w))
         canvas.polyline([a, mid, b, a], width=0.4)
@@ -4511,8 +4516,11 @@ def _step_across(chord: Vec2, axis: Vec2, across: Vec2) -> float | None:
     return (axis[0] * chord[1] - axis[1] * chord[0]) / det
 
 
-def _draw_cap(canvas: _Canvas, end: Vec2, axis_into_pipe: Vec2) -> None:
-    perp = _v2_perp(axis_into_pipe)
+def _draw_cap(canvas: _Canvas, proj: "Projector", end: Vec2,
+              axis_into_pipe: Vec2) -> None:
+    # 弧面沿轴测平面横轴（与阀领结/法兰杠/方块端面同族）
+    perp = _iso_cross_dir(proj, axis_into_pipe) if proj is not None \
+        else _v2_perp(axis_into_pipe)
     r = 1.5
     pts = []
     for step in range(9):
@@ -4524,9 +4532,11 @@ def _draw_cap(canvas: _Canvas, end: Vec2, axis_into_pipe: Vec2) -> None:
     canvas.polyline(pts, width=0.4)
 
 
-def _draw_box_on_axis(canvas: _Canvas, e0: Vec2, e1: Vec2) -> None:
+def _draw_box_on_axis(canvas: _Canvas, proj: "Projector", e0: Vec2,
+                      e1: Vec2) -> None:
     axis = _v2_norm(_v2_sub(e1, e0))
-    perp = _v2_perp(axis)
+    # 端面沿轴测平面横轴（与阀领结/法兰杠同族），不用页面垂直
+    perp = _iso_cross_dir(proj, axis) if proj is not None else _v2_perp(axis)
     half = max(_v2_len(_v2_sub(e1, e0)) * 0.35, 1.2)
     corners = [
         _v2_add(e0, _v2_scale(perp, half)),
