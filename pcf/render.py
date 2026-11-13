@@ -30,12 +30,14 @@ a square box carrying the item number (materials) or the cut-list name
 If the BOM or cut-list table overflows the sheet a loud "SPLIT SHEET"
 warning is drawn and reported.
 
-Continuation callouts mark every point where the piping leaves the sheet:
-an arrow along the run plus a block naming the **next rendered drawing**
-and the hand-off point's plant coordinates. The drawing name is resolved
-across the set of sheets being rendered together (see continuations.py) --
-never taken from the file's own spool/pipeline reference, which names the
-neighbouring piping rather than the neighbouring sheet.
+Continuation callouts mark every point the PCF declares as leaving the
+sheet (END-CONNECTION-PIPELINE): an arrow along the run plus a block
+printing the declared reference -- "SEE ISO <line number>" -- and the
+declared point's plant coordinates. The render set only maps the
+declared neighbour to the sheets actually carrying it (SHT tags,
+split-junction phantoms) and warns when nothing carries it; the hand-off
+points themselves are never re-derived from geometry (see
+continuations.py).
 
 Dimensional callouts have isometric skew: leader bars, dimension lines and
 the *text itself* run along projected world axes, so the whole callout --
@@ -158,12 +160,11 @@ class RenderOptions:
     # 管线清单实时预览：只画图面内容（管线/符号/焊点/尺寸/注释/北向标/
     # NTS 戳），不出图框、标题栏、BOM/切割表等"图纸家具"。
     preview: bool = False
-    # Where the piping leaves this sheet, and for which drawing. Resolved by
-    # continuations.build_continuation_map() over every document about to be
-    # rendered together, because the answer is the name of the NEXT SHEET --
-    # not the neighbouring spool, which is all the PCF itself knows. Empty
-    # means the sheet was rendered without knowledge of its neighbours, and
-    # only the file's own END-CONNECTION references (if any) are available.
+    # Where the piping leaves this sheet: one entry per END-CONNECTION-
+    # PIPELINE declaration (point = its CO-ORDS, name = its reference),
+    # built by continuations.build_continuation_map() over the documents
+    # being rendered together -- the set only resolves which rendered
+    # sheets carry the declared neighbour (SHT tags, phantom mates).
     continuations: list[Continuation] = field(default_factory=list)
     # 整套图纸的文档表（图名 → PcfDocument），由 render_pcf_files 在批量
     # 渲染时传入。分图幻影件需要邻图文档才能把断点对侧的紧邻零件画成
@@ -1928,40 +1929,37 @@ def _sheet_tag(name: str) -> str:
     return name
 
 
+def _declared_ref_lines(ref: str) -> list[str]:
+    """声明的 CONNECTION-REFERENCE 逐字成行：$ = 注释框内换行。
+
+    ISOGEN 里 ``$`` 是打印字段内的换行符，所以 ``2105\\21053000$
+    2105-BR3S-31051`` 在注释框里就是两行（每行按惯例去掉路径前缀）。
+    同点重复声明以 ``" / "`` 合并时逐条展开，各占自己的行。
+    """
+    out: list[str] = []
+    for part in ref.split(" / "):
+        out.extend(reference_names(part))
+    return out
+
+
 def _cont_callout_lines(doc: PcfDocument, cont: Continuation,
                         options: RenderOptions) -> list[str]:
     """接点标注文字（图面规范）：
 
-    分图 → "SEE ISO 管线号" / "SHT n" / 坐标；
-    跨管线 → "SEE ISO 对方管线号" / 坐标；
-    不接任何东西 → 只有坐标。
+    SEE ISO 块逐字来自 PCF 声明（首行冠 SEE ISO，$ 起的段各占一行）；
+    分图型再补 "SHT n" 页号行（页号按渲染实际情况取自图名）；末尾是
+    声明 CO-ORDS 的坐标行。声明为空时退化为只有坐标。
     """
     coords = _coordinate_lines(cont.point, doc, options)
-    own = _sheet_line_refs(doc)
+    names = _declared_ref_lines(cont.reference)
+    lines = [f"SEE ISO {names[0]}", *names[1:]] if names else []
     if _junction_kind(doc, cont, options) == "split":
-        others: set[str] = set()
-        for name in cont.sheets:
-            ndoc = (options.neighbour_docs or {}).get(name)
-            if ndoc is not None:
-                others |= _sheet_line_refs(ndoc)
-        nos = sorted((own & others) or own)
-        lines = [f"SEE ISO {' / '.join(nos)}"]
         tags = [_sheet_tag(n) for n in cont.sheets]
         if tags:
             lines.append(" / ".join(tags))
-        return [*lines, *coords]
-    nos: set[str] = set()
-    if cont.resolved:
-        for name in cont.sheets:
-            ndoc = (options.neighbour_docs or {}).get(name)
-            if ndoc is not None:
-                nos |= _sheet_line_refs(ndoc) - own
-    else:
-        nos.update(_cont_ref_nos(cont.reference))
-    nos -= own
-    if not nos:
+    if not lines:
         return list(coords)    # 不接任何东西 → 只写坐标
-    return [f"SEE ISO {' / '.join(sorted(nos))}", *coords]
+    return [*lines, *coords]
 
 
 def _neighbour_mates(doc: PcfDocument, cont: Continuation,
@@ -3340,7 +3338,9 @@ def _valve_operators() -> dict[str, str]:
 
 
 def _valve_operator_skey(skey: str | None) -> str | None:
-    """阀柄 SKEY：先按映射键匹配（带 ** 前缀通配），最后落 default。"""
+    """阀柄 SKEY：operators.json 显式映射优先（带 ** 前缀通配），其次
+    ASC 符号库厂商配对（501 行第 2 名，如 `501 VB 03SP` → VB** 挂杠杆
+    03SP），最后落 default。"""
     if not skey:
         return None
     ops = _valve_operators()
@@ -3351,6 +3351,10 @@ def _valve_operator_skey(skey: str | None) -> str | None:
             continue
         if (p.endswith("**") and s.startswith(p[:-2])) or p == s:
             return op
+    from .asc_symbols import operator_skey_of
+    paired = operator_skey_of(s)
+    if paired:
+        return paired
     return ops.get("**")
 
 
@@ -3510,24 +3514,26 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
         pts.append(b)
         draw(a, b, width=width, record=True)
     if operator and pts:
-        # 阀柄叠加：阀体与阀柄是两个独立符号，柄按 SPINDLE-DIRECTION
-        # 单独定朝向（用户约定）。柄符号 START 已归一到原点（阀杆底），
-        # 锚点取阀体包围盒顶边中点，Y 正方向 = 柄伸出方向（符号库朝
-        # 上画柄），等比缩放到与阀体同标尺（height_mm）。
+        # 阀柄叠加：柄是独立 skey 的符号，厂商坐标系以阀中心连接点为
+        # START、阀杆沿符号 +X 伸出（01SP=T 形柄、03SP=杠杆、04SP=手轮、
+        # 10SP=疏水器浮子…，独立块见 symbols/ALIAS.asc 的 N**SP）。柄
+        # 符号已归一到 START=(0,0)：锚到阀中心连接点（收笔点中程、两端
+        # 点页面中点），符号 +X 旋到 SPINDLE-DIRECTION 图面投影方向；
+        # 缩放沿用阀体高度标尺 sy——柄与阀体同一符号坐标系，等比不失真。
         op_skey, sp2 = operator
         from .asc_symbols import find_symbol_full
         op_sym = find_symbol_full(op_skey)[0] if op_skey else None
-        if op_sym:
-            ys = [c for s in op_sym for c in (s[1], s[3])]
-            s_op = height_mm / max(max(ys) - min(ys), 1e-6)
-            anchor = ((min(p[0] for p in pts) + max(p[0] for p in pts)) / 2.0,
-                      min(p[1] for p in pts))          # 页面 y 向下，顶=miny
-            dx, dy = sp2
+        dl = (sp2[0] * sp2[0] + sp2[1] * sp2[1]) ** 0.5
+        if op_sym and dl > 1e-9:
+            ex = (sp2[0] / dl, sp2[1] / dl)          # 符号 +X=阀杆伸出方向
+            ey = (ex[1], -ex[0])
+            anchor = (x0 + stop[0] / 2.0 * bx[0],
+                      y0 + stop[0] / 2.0 * bx[1])    # 阀中心连接点
             for x1, y1, x2, y2 in op_sym:
-                draw((anchor[0] + s_op * (x1 * dy + y1 * dx),
-                      anchor[1] + s_op * (-x1 * dx + y1 * dy)),
-                     (anchor[0] + s_op * (x2 * dy + y2 * dx),
-                      anchor[1] + s_op * (-x2 * dx + y2 * dy)),
+                draw((anchor[0] + sy * (x1 * ex[0] + y1 * ey[0]),
+                      anchor[1] + sy * (x1 * ex[1] + y1 * ey[1])),
+                     (anchor[0] + sy * (x2 * ex[0] + y2 * ey[0]),
+                      anchor[1] + sy * (x2 * ex[1] + y2 * ey[1])),
                      width=width, record=True)
     return True
 

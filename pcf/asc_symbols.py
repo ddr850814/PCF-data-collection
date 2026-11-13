@@ -30,6 +30,9 @@ _CACHE: dict | None = None
 _JSON_CACHE: dict | None = None
 
 
+_OP_PAIRS: dict[str, str] = {}   # 阀体→阀柄 skey 配对（501 行第 2 名，如 VB→03SP）
+
+
 def _parse_asc(text: str) -> dict[str, tuple]:
     """解析一个 .asc 文本，返回 {SKEY: (segments, orient)}
 
@@ -127,6 +130,10 @@ def _flush(symbols, skeys, segs, first_pt, orient, stop_pt=None) -> None:
     stop = ((stop_pt[0]-ox, stop_pt[1]-oy) if stop_pt else (0.0, 0.0))
     for k in skeys:
         symbols.setdefault(k, (norm, orient, stop))
+    if len(skeys) > 1 and re.fullmatch(r"\d{1,2}SP", skeys[1]):
+        # 厂商阀体→阀柄配对：501 行第 2 个名字是该阀门的操作件（柄）skey，
+        # 柄几何另有独立 N**SP 块（如 `501 VB 03SP` → VB** 挂杠杆 03SP）
+        _OP_PAIRS.setdefault(skeys[0], skeys[1])
 
 
 def _candidate_dirs() -> list[Path]:
@@ -195,6 +202,7 @@ def load_symbols(force: bool = False) -> dict[str, tuple]:
     global _CACHE
     if _CACHE is not None and not force:
         return _CACHE
+    _OP_PAIRS.clear()
     merged: dict[str, tuple] = {}
     seen = False
     for d in _candidate_dirs():
@@ -238,4 +246,23 @@ def find_symbol_full(skey: str):
     for k in cands:
         if k in js:
             return js[k]
+    return None
+
+
+def operator_skey_of(skey: str | None) -> str | None:
+    """查厂商 501 行配对的阀柄 skey（`501 VB 03SP ...` → VB** 的柄=03SP）。
+
+    与 find_symbol_full 相同的三级候选：精确 SKEY → 前两位+"**" → 前两位；
+    配对信息只在 ASC 符号库（skeys.json 几何源无柄概念）。未命中返回 None。
+    """
+    if not skey:
+        return None
+    key = skey.strip().upper()
+    cands = [key, key[:2] + "**"]
+    if len(key) > 2:
+        cands.append(key[:2])
+    load_symbols()
+    for k in cands:
+        if k in _OP_PAIRS:
+            return _OP_PAIRS[k]
     return None

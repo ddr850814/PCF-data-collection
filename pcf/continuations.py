@@ -1,41 +1,26 @@
 """Continuation callouts: where the piping leaves this drawing.
 
-A fabrication isometric has to say, at every point where the line runs off
-the sheet, **which drawing it runs onto**. That name is a property of the
-*drawing set*, not of the PCF: a sheet may be one spool, or a whole
-multi-spool region of a distance split, so the spool/pipeline reference the
-file carries is the wrong answer -- it names the neighbouring *piping*, not
-the neighbouring *sheet*, and on a merged sheet the two are not the same
-thing. The reference is kept only as the fallback for a continuation that
-resolves to no drawing in the set (piping that continues beyond everything
-being rendered).
+Every callout comes from the PCF's own ``END-CONNECTION-PIPELINE``
+declarations, verbatim: the record's CO-ORDS is the hand-off point, its
+CONNECTION-REFERENCE names the line that carries on, and the callout
+prints "SEE ISO <that name>" with the point's plant coordinates.
+Nothing is inferred from geometry -- where the exporter says the sheet
+hands over is where the drawing says it hands over, so a wrong PCF
+prints a wrong callout. Re-deriving the boundary from coordinates was
+tried and only multiplied marks: distance-split exports carry the same
+boundary run (pipe, weld, reducer) in both files, so every joint of the
+duplicated span matched.
 
-Resolution is therefore done across the whole set of documents about to be
-rendered together, matching each sheet's exit points against every other
-sheet's connection points:
-
-    build_continuation_map([(name, doc), ...]) -> {name: [Continuation, ...]}
-
-**A point is a hand-off when another sheet's piping lands on it.** That,
-rather than whether the end looks open on this sheet, is the definition --
-and it has to be, because a spool cut at a shop weld ends in a coupling
-whose outboard end sits one modelled 1/16" root gap from its own inboard
-end. That is inside the connection tolerance, so the connectivity walk reads
-the boundary as *connected* and it never shows up as an open end at all.
-
-``END-CONNECTION-PIPELINE`` records are a source of **names, not of exit
-points**. Real exports declare them in pairs -- a CO-ORDS at the junction
-plus the reference of the line that carries on -- and both halves survive
-splitting, since ``_build_parts`` copies every connection record into each
-part of its pipeline. Taken as exits they put a "continues on..." callout in
-the middle of an unbroken run whenever both pipelines landed on one sheet.
-They label a genuinely open end whose far side is on no drawing in the set:
-the unresolved case, which the renderer reports as a warning because a line
-reference must not be read as a sheet number.
-
-``END-POSITION-OPEN``/``-CLOSED`` records are the file saying the line
-*stops* there, so a point they mark never gets a continuation, and neither
-does the closed end of a cap.
+The render set is consulted only for what a PCF cannot know: which
+rendered sheet the declared neighbour actually is. The reference names a
+*pipeline*; the sheet bearing it, and its SHT number when one pipeline
+renders as several sheets, belong to this render pass -- that resolution
+feeds the split-junction phantom (drawn from the neighbour document) and
+the sheet tags. A declared neighbour no sheet in the set carries stays
+as a name-only callout from the declaration text, and the renderer warns
+about it. A declaration whose neighbour turns out to live on this very
+sheet is not a continuation at all -- the piping runs straight through
+it -- so it prints nothing.
 """
 
 from __future__ import annotations
@@ -44,16 +29,12 @@ from dataclasses import dataclass, field
 
 from . import geometry
 from .model import PcfDocument
-from .skeys import classify
 
 Vec3 = tuple[float, float, float]
 
-# Component classes whose open end is the end of the line, not a hand-off.
-_TERMINATES = {"CAP", "BOLT", "GASKET", "SUPPORT", "MESSAGE", "CONNECTION"}
-
-# Attributes an END-CONNECTION record names its continuing line in, in order
-# of preference.
-_REFERENCE_KEYS = ("PIPELINE-REFERENCE", "CONNECTION-REFERENCE",
+# Attributes an END-CONNECTION record names its continuing line in, in
+# order of preference.
+_REFERENCE_KEYS = ("CONNECTION-REFERENCE", "PIPELINE-REFERENCE",
                    "CONTINUATION-REFERENCE")
 
 
@@ -61,12 +42,12 @@ _REFERENCE_KEYS = ("PIPELINE-REFERENCE", "CONNECTION-REFERENCE",
 class Continuation:
     """One place where the piping leaves this drawing for another."""
 
-    point: Vec3                     # the hand-off point, native coordinates
+    point: Vec3                     # the declared hand-off point (CO-ORDS)
     drawing: str = ""               # the NEXT RENDERED DRAWING, when resolved
-    reference: str = ""             # the PCF's own line reference (fallback)
+    reference: str = ""             # the declared CONNECTION-REFERENCE text
     inboard: Vec3 | None = None     # a point up the run, to aim the arrow
     bore: float | None = None
-    sheets: list[str] = field(default_factory=list)   # every drawing matched
+    sheets: list[str] = field(default_factory=list)   # rendered sheets carrying the neighbour
 
     @property
     def resolved(self) -> bool:
@@ -77,11 +58,6 @@ class Continuation:
     def label(self) -> str:
         """What the callout prints: the drawing name, else the file's ref."""
         return self.drawing or self.reference
-
-
-def _round(point: Vec3, quantum: float) -> tuple[int, int, int]:
-    return (round(point[0] / quantum), round(point[1] / quantum),
-            round(point[2] / quantum))
 
 
 def reference_names(ref: str) -> list[str]:
@@ -99,47 +75,6 @@ def reference_names(ref: str) -> list[str]:
         if part:
             names.append(part)
     return names
-
-
-class _PointIndex:
-    """Spatial hash of every sheet's connection points, for cross matching.
-
-    A job is routinely thirty sheets of three hundred points; matching each
-    exit point against all of them pairwise is a hundred million distance
-    tests per render pass, so points are bucketed by a tolerance-sized cell
-    and only the 27 cells around a query are examined.
-    """
-
-    def __init__(self, tolerance: float):
-        self.tolerance = tolerance
-        self.cells: dict[tuple[int, int, int], list[tuple[Vec3, str]]] = {}
-
-    def add(self, point: Vec3, sheet: str) -> None:
-        self.cells.setdefault(_round(point, self.tolerance), []).append(
-            (point, sheet))
-
-    def near(self, point: Vec3):
-        """Every (point, sheet) entry within tolerance of ``point``."""
-        key = _round(point, self.tolerance)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    cell = (key[0] + dx, key[1] + dy, key[2] + dz)
-                    for entry in self.cells.get(cell, ()):
-                        if geometry.dist(point, entry[0]) <= self.tolerance:
-                            yield entry
-
-    def holds(self, point: Vec3) -> bool:
-        return any(True for _ in self.near(point))
-
-    def sheets_near(self, point: Vec3, exclude: str) -> list[str]:
-        return sorted({sheet for _pt, sheet in self.near(point)
-                       if sheet != exclude})
-
-    def nearest(self, point: Vec3, exclude: str) -> float:
-        """Distance to the closest entry not belonging to ``exclude``."""
-        return min((geometry.dist(point, pt) for pt, sheet in self.near(point)
-                    if sheet != exclude), default=float("inf"))
 
 
 def _inboard_point(doc: PcfDocument, point: Vec3, tol: float) -> Vec3 | None:
@@ -168,21 +103,19 @@ def _inboard_point(doc: PcfDocument, point: Vec3, tol: float) -> Vec3 | None:
     return best
 
 
-def _declared_references(doc: PcfDocument, tol: float) -> _PointIndex:
-    """Where END-CONNECTION-PIPELINE records say the line carries on.
+def _pipeline_refs(doc: PcfDocument) -> set[str]:
+    """本图全部管线号（PIPELINE-REFERENCE 属性，去空白）。"""
+    return {p.reference.strip() for p in doc.pipelines
+            if p.reference and p.reference.strip()}
 
-    Indexed by point so an open end can look up the name the file gives the
-    line beyond it -- the fallback when no drawing in the set turns out to
-    own the other side. Only ``-PIPELINE`` records qualify: a connection to
-    equipment is where the line *ends*, not where a drawing continues.
 
-    These are a source of *names*, never of exit points. A declared
-    connection between two pipelines that both live on this sheet is not a
-    continuation at all -- the piping runs straight through it -- so exits
-    are found elsewhere (a point another sheet lands on, or an open end) and
-    these only put a name to one.
+def _declared_handoffs(doc: PcfDocument) -> list[tuple[Vec3, str]]:
+    """每条 END-CONNECTION-PIPELINE 声明原样列出：(CO-ORDS, 引用串)。
+
+    只有 ``-PIPELINE`` 记录算接图：接设备（``-EQUIPMENT``）是管线
+    到头，不是交给另一张图。一条记录可以带多个 CO-ORDS，逐点列出。
     """
-    index = _PointIndex(tol * 4)
+    out: list[tuple[Vec3, str]] = []
     for comp in doc.all_components():
         if not comp.type.upper().startswith("END-CONNECTION-PIPELINE"):
             continue
@@ -194,108 +127,68 @@ def _declared_references(doc: PcfDocument, tol: float) -> _PointIndex:
                 break
         if not reference:
             continue
-        for pt in comp.co_ords:
-            index.add(pt.xyz, reference)
-    return index
-
-
-def _stop_points(doc: PcfDocument) -> list[Vec3]:
-    """Where the file declares the line ends (END-POSITION-OPEN/CLOSED)."""
-    return [pt.xyz for comp in doc.all_components()
-            if comp.type.upper().startswith("END-POSITION")
-            for pt in comp.co_ords]
-
-
-def _open_exits(doc: PcfDocument, tol: float) -> list[Vec3]:
-    """Open ends that could hand off to another drawing."""
-    out: list[Vec3] = []
-    for comp, pt in geometry.open_ends(doc, tol):
-        if classify(comp.type, comp.skey) in _TERMINATES:
-            continue
-        out.append(pt.xyz)
+        out.extend((pt.xyz, reference) for pt in comp.co_ords)
     return out
 
 
 def build_continuation_map(
     sheets: list[tuple[str, PcfDocument]],
-    *,
-    tolerance: float | None = None,
 ) -> dict[str, list[Continuation]]:
-    """Resolve every sheet's continuations against the rest of the set.
+    """每张图的接图点，逐字来自各文件的 END-CONNECTION-PIPELINE 声明。
 
-    ``sheets`` is ``[(drawing name, document), ...]`` -- the names that will
-    appear on the finished drawings, which is what a continuation callout
-    has to print. A single-sheet set is legal and still returns the
-    continuations the file declares for itself, unresolved.
+    ``sheets`` 是 ``[(drawing name, document), ...]``——整套渲染集。图
+    名与各图的管线号只用于把声明的对侧线号对到渲染集里实际画着它
+    的图张（分图 SHT 标签、幻影件素材、未解析告警都要它）；接图点
+    本身一个都不来自几何匹配。单图渲染也合法：声明对不上任何图张
+    时按未解析处理，标注照打，渲染端给 warning。
     """
-    tol = tolerance
-    if tol is None:
-        tol = max((geometry.model_tolerance(doc) for _name, doc in sheets),
-                  default=0.11)
-
-    index = _PointIndex(tol * 4)
+    # 渲染集承载表：图名 / 管线号 → 画着它的图名集合
+    carriers: dict[str, set[str]] = {}
     for name, doc in sheets:
-        for comp in doc.real_components():
-            for pt in comp.connection_points():
-                index.add(pt.xyz, name)
+        carriers.setdefault(name, set()).add(name)
+        for ref in _pipeline_refs(doc):
+            carriers.setdefault(ref, set()).add(name)
 
     out: dict[str, list[Continuation]] = {}
     for name, doc in sheets:
-        doc_tol = geometry.model_tolerance(doc)
-        stops = _stop_points(doc)
-        declared = _declared_references(doc, doc_tol)
+        tol = geometry.model_tolerance(doc) * 4
+        # 同一点的重复声明（tol 内）合并为一个标注
+        groups: list[list[tuple[Vec3, str]]] = []
+        for point, reference in _declared_handoffs(doc):
+            for group in groups:
+                if geometry.dist(group[0][0], point) <= tol:
+                    group.append((point, reference))
+                    break
+            else:
+                groups.append([(point, reference)])
+
         found: list[Continuation] = []
-
-        # A hand-off is defined by the *set*, not by one sheet: any point of
-        # this sheet's piping that another sheet's piping also lands on is
-        # where the two drawings meet, whatever the local connectivity walk
-        # makes of it. That matters, because a spool cut at a shop weld ends
-        # in a coupling whose outboard end sits one root gap -- less than the
-        # connection tolerance -- from its own inboard end, so the graph
-        # reads the boundary as connected and it is never an open end at all.
-        #
-        # Genuinely open ends are added on top, but only where the file
-        # declares what carries on: that is the unresolved case, and without
-        # a name there is nothing to print.
-        #
-        # Sorted closest to the neighbouring sheet first, so that when a joint
-        # offers several coincident points the one that survives the
-        # de-duplication below is the one on the boundary itself -- and both
-        # sheets then print the same coordinates for the same joint.
-        candidates: list[Vec3] = sorted(
-            {pt.xyz for comp in doc.real_components()
-             for pt in comp.connection_points()
-             if index.sheets_near(pt.xyz, exclude=name)}
-            | {point for point in _open_exits(doc, doc_tol)
-               if declared.holds(point)},
-            key=lambda p: (round(index.nearest(p, exclude=name), 6), p))
-
-        accepted: list[Vec3] = []
-        for point in candidates:
-            # Matched at the connectivity tolerance, not a loose multiple of
-            # it: an END-POSITION record names one exact end, and a spool can
-            # easily carry another end half an inch from it that continues.
-            if any(geometry.dist(point, stop) <= doc_tol for stop in stops):
-                continue   # the file says the line ends here
-            # One joint can offer several coincident points -- a coupling
-            # end, the weld on it, the pipe beyond -- and they are one mark.
-            if any(geometry.dist(point, seen) <= doc_tol * 4
-                   for seen in accepted):
+        for group in groups:
+            point = group[0][0]
+            refs: list[str] = []
+            for _pt, reference in group:
+                if reference not in refs:
+                    refs.append(reference)
+            # 声明线号 → 渲染集图张
+            known = False
+            matched: set[str] = set()
+            for reference in refs:
+                for nm in reference_names(reference):
+                    if nm in carriers:
+                        known = True
+                        matched |= carriers[nm]
+            matched -= {name}
+            if known and not matched:
+                # 声明的对侧就画在本图上：管线直通，不是接图
                 continue
-            matched = index.sheets_near(point, exclude=name)
-            references = sorted({ref for _pt, ref in declared.near(point)})
-            if not matched and not references:
-                continue   # nothing continues here that anyone can name
-            accepted.append(point)
             found.append(Continuation(
                 point=point,
-                drawing=" / ".join(matched),
-                reference=" / ".join(references),
-                inboard=_inboard_point(doc, point, doc_tol * 4),
-                bore=_bore_at(doc, point, doc_tol * 4),
-                sheets=matched,
+                drawing=" / ".join(sorted(matched)),
+                reference=" / ".join(refs),
+                inboard=_inboard_point(doc, point, tol),
+                bore=_bore_at(doc, point, tol),
+                sheets=sorted(matched),
             ))
-
         out[name] = sorted(found, key=lambda c: c.point)
     return out
 
