@@ -329,15 +329,36 @@ class Projector:
         if apply_offset:
             off = self.point_offsets.get(p)
             if off is None and self.offset_nearest and self.point_offsets:
-                # 链式布局：未映射的派生世界点（尺寸盒角点/设备管口等）
-                # 取世界距离最近已映射点的平移，跟随邻近几何
-                best: tuple[float, Vec2] | None = None
+                # 链式布局：未映射的派生世界点（尺寸盒角点/设备管口/流向
+                # 箭头/管架等）跟随邻近几何。只取最近点的平移，在管线被
+                # 摆位拉伸/压缩后会偏离段中位置（同段两端平移量不同），
+                # 派生符号就从管线上"掉下来"；这里取最近两点沿其连线按
+                # 投影比例插值平移，派生点落在摆位后管段的对应位置上。
+                best: tuple[float, Vec3, Vec2] | None = None
+                second: tuple[float, Vec3, Vec2] | None = None
                 for k, d in self.point_offsets.items():
                     dd = ((k[0] - p[0]) ** 2 + (k[1] - p[1]) ** 2
                           + (k[2] - p[2]) ** 2)
                     if best is None or dd < best[0]:
-                        best = (dd, d)
-                off = best[1] if best else (0.0, 0.0)
+                        second = best
+                        best = (dd, k, d)
+                    elif second is None or dd < second[0]:
+                        second = (dd, k, d)
+                if best is not None and second is not None and \
+                        second[0] <= best[0] * 25.0 + 1e-9:
+                    _d1, k1, t1 = best
+                    _d2, k2, t2 = second
+                    seg = (k2[0] - k1[0], k2[1] - k1[1], k2[2] - k1[2])
+                    denom = seg[0] ** 2 + seg[1] ** 2 + seg[2] ** 2
+                    if denom > 1e-12:
+                        rel = ((p[0] - k1[0]) * seg[0]
+                               + (p[1] - k1[1]) * seg[1]
+                               + (p[2] - k1[2]) * seg[2]) / denom
+                        rel = max(0.0, min(1.0, rel))
+                        off = (t1[0] + (t2[0] - t1[0]) * rel,
+                               t1[1] + (t2[1] - t1[1]) * rel)
+                if off is None:
+                    off = best[2] if best is not None else (0.0, 0.0)
             dx, dy = off if off is not None else (0.0, 0.0)
             page = (page[0] + dx, page[1] + dy)
         return page
@@ -1447,16 +1468,26 @@ def _render_document(
 
     # 搭积木链式布局（示意模式）：位置由拓扑走链决定；失败回退 warp
     chain = None
+    floored = False
     if options.not_to_scale and len(all_points) > 1:
         try:
+            # 超幅：直管/腿档位按缩放比收缩重摆（符号端点对刚性，打包层
+            # 只压管线边），缩放比累计迭代到装得下；档位触底仍超幅（固定
+            # 件+符号自身占满图面）时才整体兜底缩（含符号，rigid off）。
+            pipe_scale = 1.0
             chain = _chain_layout(projector, doc, comps, draw_region)
             for _ in range(4):
-                # 超幅：直管档位按缩放比收缩重摆（管件固定尺寸不动），
-                # 迭代到装得下或封顶（固定件占比越大收敛越慢）
                 if chain is None or chain[2] >= 0.98:
                     break
+                pipe_scale *= chain[2]
+                if pipe_scale < 0.15:
+                    pipe_scale = 0.15
+                    floored = True
                 chain = _chain_layout(projector, doc, comps, draw_region,
-                                      pipe_scale=chain[2])
+                                      pipe_scale=pipe_scale,
+                                      rigid_symbols=not floored)
+                if floored:
+                    break
         except Exception as exc:
             # 失败必须可见：静默回退会让"链式没生效"伪装成布局缺陷
             chain = None
@@ -1464,10 +1495,10 @@ def _render_document(
     chain_on = chain is not None and bool(chain[0])
     if chain_on:
         projector.point_offsets.update(chain[0])
-        # 位置表已按 s 缩放：示意符号尺寸与弯头/三通腿同乘 schematic_scale
-        # （否则 0.6x 位置配 1.0x 符号，管件互相压叠）；未映射派生点走
-        # 最近点平移回退，跟随邻近几何
-        projector.schematic_scale = min(chain[2], 1.0)
+        # 符号恒定：正常收敛（打包层只压管线边）时 schematic_scale=1.0，
+        # 符号端点对不缩、绘制尺寸不变；仅触底兜底时整体同缩保持自洽。
+        # 未映射派生点走最近点平移回退，跟随邻近几何
+        projector.schematic_scale = chain[2] if floored else 1.0
         projector.offset_nearest = True
         if chain[1]:
             warnings.append(chain[1])
@@ -1665,6 +1696,18 @@ def _render_document(
                 f"is labelled from the PCF's own reference ({names}) "
                 "-- no drawing in this render set owns the other side of that "
                 "joint")
+
+    # ---- END-POSITION 终点坐标（纯声明驱动，无几何判断、无接续线）----------
+    # PCF 用 END-POSITION-OPEN/CLOSED 声明管线终点：按声明点直接标坐标块。
+    # 与接图点重合时不再重复（接图块里已带同一份坐标行）。
+    tol_end = geometry.model_tolerance(doc)
+    for point in _declared_end_positions(doc):
+        if any(geometry.dist(point, c.point) <= tol_end
+               for c in drawn_continuations):
+            continue
+        with canvas.tagged("endpos", _coordinate_text(point, doc, options)):
+            _draw_end_position(canvas, projector, point, doc, options,
+                               draw_centre)
 
     # ---- dimensions --------------------------------------------------------
     dimensions: list[Dimension] = []
@@ -1957,8 +2000,41 @@ def _draw_continuation(canvas: _Canvas, proj: Projector, cont: Continuation,
         canvas.line(edge, tip, width=0.15)
 
 
-# ---------------------------------------------------------------------------
-# 分图幻影件 / 跨管线虚线延续
+def _declared_end_positions(doc: PcfDocument) -> list[Vec3]:
+    """END-POSITION-OPEN/CLOSED 声明的管线终点坐标。
+
+    纯声明驱动：PCF 在哪声明终点，图面就在哪标坐标，不做任何几何
+    判断（不查连通、不查是否管段中部）——用户定稿要求。
+    """
+    return [pt.xyz for comp in doc.all_components()
+            if comp.type.upper().startswith("END-POSITION")
+            for pt in comp.co_ords]
+
+
+def _draw_end_position(canvas: _Canvas, proj: Projector, point: Vec3,
+                       doc: PcfDocument, options: RenderOptions,
+                       draw_centre: Vec2) -> None:
+    """终点坐标标注：白底坐标块 + 引线钉在声明点上，不画接续线。"""
+    at = proj.page(point)
+    lines = _coordinate_lines(point, doc, options)
+    canvas.pdf.set_font("Helvetica", size=_CONT_FONT)
+    text_w = max(canvas.pdf.get_string_width(line) for line in lines)
+    w = text_w + 2 * _CONT_PAD_MM
+    h = len(lines) * _CONT_LINE_MM + 2 * _CONT_PAD_MM - (_CONT_LINE_MM - _CONT_CAP)
+    pos = canvas.place_label(at, w, h, draw_centre, min_leader=7.0,
+                             avoid_geometry=True, clearance=_CONT_CLEARANCE_MM)
+
+    with canvas.pdf.local_context():
+        canvas.pdf.set_fill_color(255, 255, 255)
+        canvas.pdf.set_line_width(0.3)
+        canvas.pdf.rect(pos[0] - w / 2, pos[1] - h / 2, w, h, style="DF")
+    top = pos[1] - h / 2 + _CONT_PAD_MM + _CONT_CAP
+    for n, line in enumerate(lines):
+        canvas.text((pos[0], top + n * _CONT_LINE_MM), line, size=_CONT_FONT)
+
+    edge = _box_edge_toward(pos, at, w, h)
+    if _v2_len(_v2_sub(at, edge)) > 0.8:
+        canvas.line(edge, at, width=0.15)
 
 
 _PHANTOM_STUB_MM = 10.0   # 幻影直管虚线延伸段的图面长度上限
@@ -2557,18 +2633,19 @@ def _natural_run_length(skey: str | None) -> float | None:
 def _chain_pipe_len(world_len: float, scale: float = 1.0) -> float:
     """链式布局的直管图面长度档位（真实长度单调分档，保长短关系）。
 
-    scale 是整图自适应因子：首轮 1.0，超幅时按缩放比重摆一轮，
-    管件尺寸不动、只有直管档位收缩，尽量保住固定尺寸语义。
+    基准档位 ×1.5（2026-11-14 定稿）：管线拉长腾出注释空间，全图风格
+    一致（固定倍数，不做自适应填满）。scale 是管线自适应因子：首轮
+    1.0，超幅时按缩放比重摆——只有直管档位与腿收缩，符号尺寸恒定。
     """
     if world_len < 500.0:
-        b = 8.0
+        b = 12.0
     elif world_len < 1500.0:
-        b = 15.0
+        b = 22.5
     elif world_len < 4000.0:
-        b = 24.0
+        b = 36.0
     else:
-        b = 34.0
-    return max(4.0, b * scale)
+        b = 51.0
+    return max(6.0, b * scale)
 
 
 _chain_debug: list[str] = []   # 链式布局调试日志（临时，验证后删）
@@ -2578,6 +2655,7 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
                   comps: list[tuple[Component, str | None]],
                   draw_region: tuple,
                   pipe_scale: float = 1.0,
+                  rigid_symbols: bool = True,
                   ) -> tuple[dict[Vec3, Vec2], str | None, float] | None:
     """搭积木链式布局（示意模式专用）：位置由拓扑走链决定。
 
@@ -3015,8 +3093,9 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         ep = [p.xyz for p in c.connection_points()]
         if len(ep) >= 2 and ep[0] in pos and ep[1] in pos:
             pipe_segs.append((ep[0], ep[1]))
-    to_snap: list[tuple[list[Vec3], Vec3, Vec3, Vec3]] = []  # keys,k,a,b
+    to_snap: list[tuple[list[Vec3], Vec3, Vec3, Vec3, float]] = []
     kept_boxes = []
+    free_drop: set[Vec3] = set()
     for box in group_boxes:
         keys = box[4]
         hit = None
@@ -3027,15 +3106,28 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
                                      geometry.dist(k, b)) <= tol:
                     continue
                 if geometry.point_segment_distance(k, a, b) <= tol:
-                    hit = (k, a, b)
+                    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+                    # 投影分数并钳位：3D 距离/段长只对共线点成立，端外
+                    # 离轴点会算出 >1 的"比例"，插值冲出段外（掉线）
+                    t = ((k[0] - a[0]) * ab[0] + (k[1] - a[1]) * ab[1]
+                         + (k[2] - a[2]) * ab[2]) / (lab * lab)
+                    hit = (k, a, b, min(1.0, max(0.0, t)))
                     break
             if hit:
                 break
         if hit:
-            to_snap.append((keys, hit[0], hit[1], hit[2]))
+            to_snap.append((keys, *hit))
+        elif len(keys) == 1:
+            # 离轴单点松散件（支座/仪表挂在管端外、不在任何管线轴上）：
+            # 不进打包、不写 point_offsets——绘制时 page() 最近段插值把
+            # 它钳到所挂管线的最终图面位置（拉长后不再悬空）
+            free_drop.add(keys[0])
         else:
             kept_boxes.append(box)
     group_boxes = kept_boxes
+    # 贴附组的键集合：bbox 统计排除（贴附单点组的 pos 还停在打包前的
+    # 原点附近，计入会把包围盒撑爆、错误压小适配比例）
+    snap_keys = {k for keys, _k, _a, _b, _t in to_snap for k in keys}
 
     # 组竖排打包（y 向下为正，组间留 14mm），再整体居中；
     # 超幅只缩不放（管件固定尺寸是布局语义，放大失真）
@@ -3045,25 +3137,24 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         for k in keys:
             pos[k] = (pos[k][0] + dx, pos[k][1] + dy)
         cursor_y += (gy1 - gy0) + 14.0
-    # 贴附件吸附（打包后执行）：世界线段上的比例插值到图面线段
-    for keys, k, a, b in to_snap:
-        lab = geometry.dist(a, b)
-        t = geometry.dist(a, k) / lab           # 贴壁点近共线，线性插值
-        tgt = _v2_add(pos[a], _v2_scale(_v2_sub(pos[b], pos[a]), t))
-        d = _v2_sub(tgt, pos[k])
-        for kk in keys:
-            pos[kk] = _v2_add(pos[kk], d)
+    # 贴附件吸附：改在最终 rebuild 之后按 new_pos 线段插值执行（见下方
+    # 二次吸附）——打包后此刻吸附会被随后的弹性拉伸撕掉（管线边逐轮
+    # ×s 累计拉长、贴附点走自由分支刚性缩放，变换不一致=掉线根因）
     # 未覆盖点（孤立接点/中心点）吸附到世界最近的已布点——必须在打包
     # 之后做，否则吸附点留在锚点打包前的旧位置上（飞出件的根因）
     mapped = list(pos)
+    unmap_twin: dict[Vec3, Vec3] = {}
     for comp in real:
         for p in (*comp.connection_points(), *comp.centre_points):
             if p.xyz in pos:
                 continue
             near = min(mapped, key=lambda k: geometry.dist(k, p.xyz))
             pos[p.xyz] = pos[near]
-    xs = [p[0] for p in pos.values()]
-    ys = [p[1] for p in pos.values()]
+            unmap_twin[p.xyz] = near
+    xs = [p[0] for k, p in pos.items()
+          if k not in free_drop and k not in snap_keys]
+    ys = [p[1] for k, p in pos.items()
+          if k not in free_drop and k not in snap_keys]
     bx0, by0, bx1, by1 = min(xs), min(ys), max(xs), max(ys)
     bw = max(bx1 - bx0, 1e-6)
     bh = max(by1 - by0, 1e-6)
@@ -3075,9 +3166,46 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
     warn = None
     if s < 0.999:
         warn = f"chain layout scaled to {s:.2f} to fit the sheet"
+    # 按边弹性缩放（符号恒定的关键）：超幅只压管线边——直管/弯头/三通
+    # 摆放的边 ×s，符号/垫片/点件边刚性跟随（长度不变）。全局绕中心乘 s
+    # 会把符号端点对一起压近，符号库双点仿射随之把符号画小（管线拉长
+    # 白拉）。rigid_symbols=False（档位触底仍超幅的极端兜底）时全体弹性，
+    # 退回整体缩小。沿摆放谱系按写入序重放：parent 必先于 child 入表。
+    flex_cls = ("PIPE", "ELBOW", "TEE") if rigid_symbols else ()
+    new_pos: dict[Vec3, Vec2] = {}
+    for k in pos:
+        if k in free_drop:
+            continue
+        info = parent.get(k)
+        twin = unmap_twin.get(k)
+        if twin is not None and twin in new_pos:
+            new_pos[k] = new_pos[twin]
+        elif info is None or info[0] not in new_pos:
+            p = pos[k]
+            new_pos[k] = ((p[0] - bcx) * s + cx_t, (p[1] - bcy) * s + cy_t)
+        else:
+            idx = info[1]
+            cls = classify(real[idx].type, real[idx].skey)
+            f = s if cls in flex_cls else 1.0
+            base = new_pos[info[0]]
+            src = pos[info[0]]
+            p = pos[k]
+            new_pos[k] = (base[0] + (p[0] - src[0]) * f,
+                          base[1] + (p[1] - src[1]) * f)
+    # 贴附件二次吸附（最终空间）：按世界比例 t 插值到管线段的最终图面
+    # 位置——rebuild 的弹性拉伸只作用在管线边上，贴附点若沿用打包后的
+    # 旧位置会被撕离管线（拉长模式下的掉线根因），此处整组平移归位
+    for keys, k, a, b, t in to_snap:
+        if a not in new_pos or b not in new_pos or k not in new_pos:
+            continue
+        fa, fb = new_pos[a], new_pos[b]
+        tgt = (fa[0] + (fb[0] - fa[0]) * t, fa[1] + (fb[1] - fa[1]) * t)
+        d = (tgt[0] - new_pos[k][0], tgt[1] - new_pos[k][1])
+        for kk in keys:
+            if kk in new_pos:
+                new_pos[kk] = (new_pos[kk][0] + d[0], new_pos[kk][1] + d[1])
     out: dict[Vec3, Vec2] = {}
-    for k, p in pos.items():
-        tgt = ((p[0] - bcx) * s + cx_t, (p[1] - bcy) * s + cy_t)
+    for k, tgt in new_pos.items():
         base = _page(k)
         d = (tgt[0] - base[0], tgt[1] - base[1])
         if _v2_len(d) > 1e-6:
@@ -4086,7 +4214,7 @@ _FLANGE_WELDS: list[Vec2] = []
 # PIPE/WELD/BOLT/GASKET 不登记——它们与零件同轴相邻，会把生长空间全锁死。
 _NONPIPE_PAGE_PTS: list[tuple[Vec2, int]] = []
 
-_SCHEMATIC_LEG_MM = 4.5   # 弯头/三通腿外延目标（page mm）
+_SCHEMATIC_LEG_MM = 6.75  # 弯头/三通腿外延目标（page mm，×1.5 管线放大）
 
 
 def _growth_room(p: Vec2, direction: Vec2, own_id: int | None = None) -> float:
@@ -5234,36 +5362,75 @@ _SUPPORT_WORLD_DIRS = {
 _PIPE_RUNS_CACHE: dict[int, list] = {}
 
 
-def _nearest_pipe_run_dir(proj: "Projector", doc, at: Vec2):
+def _nearest_pipe_run_dir(proj: "Projector", doc, at: Vec2,
+                          world_at: Vec3 | None = None):
     """支架点附近管道走向；返回 (页空间方向, 世界空间方向)，找不到返回 None。
 
     世界方向用于推导跨管的世界轴（等轴测里跨管偏移沿世界轴的 30° 投影，
     而不是页面上管轴的垂线）。
+
+    world_at 给定时（支架自身世界坐标），凡世界距离≈0（支架真立在管线
+    上）的管段优先，其间再按页面距离定夺：支架常立在弯头端口上，页面
+    最近的可能只是邻跨的接续短管（39021 管架被对到接续线上画成斜线
+    的根因）。候选集因此补上弯头/三通的腿（centre→端点），端口上的
+    支架才能命中真正所在的管轴。
     """
     runs = _PIPE_RUNS_CACHE.get(id(proj))
     if runs is None:
         runs = []
         for comp in doc.real_components():
-            if classify(comp.type, comp.skey) == "PIPE" and len(comp.end_points) >= 2:
-                w0 = comp.end_points[0].xyz
-                w1 = comp.end_points[1].xyz
+            cls = classify(comp.type, comp.skey)
+            pairs: list[tuple[Vec3, Vec3, bool]] = []
+            if cls == "PIPE" and len(comp.end_points) >= 2:
+                pairs.append((comp.end_points[0].xyz,
+                              comp.end_points[1].xyz, False))
+            elif (cls in ("ELBOW", "TEE") and comp.centre_points
+                    and comp.end_points):
+                cw = comp.centre_points[0].xyz
+                pairs = [(cw, ep.xyz, True) for ep in comp.end_points]
+            for w0, w1, leg in pairs:
                 a = proj.page(w0)
                 b = proj.page(w1)
                 d = _v2_sub(b, a)
                 if _v2_len(d) > 1e-6:
-                    runs.append((a, d, (w1[0]-w0[0], w1[1]-w0[1], w1[2]-w0[2])))
+                    runs.append((a, d,
+                                 (w1[0]-w0[0], w1[1]-w0[1], w1[2]-w0[2]),
+                                 w0, w1, leg))
         _PIPE_RUNS_CACHE.clear()
         _PIPE_RUNS_CACHE[id(proj)] = runs
-    best, best_dist = None, 1e18
+    best, best_key = None, (1e18, 1e18)
     px, py = at
-    for a, d, dw in runs:
+    for a, d, dw, w0, w1, leg in runs:
+        if world_at is None and leg:
+            continue           # 页面最近回退保持旧候选集（仅 PIPE）
         ax, ay = a
         dx, dy = d
         t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
         t = max(0.0, min(1.0, t))
         dist = math.hypot(px - ax - t * dx, py - ay - t * dy)
-        if dist < best_dist:
-            best_dist, best = dist, (d, dw)
+        if world_at is not None:
+            sd = (w1[0]-w0[0], w1[1]-w0[1], w1[2]-w0[2])
+            denom = sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]
+            if denom > 1e-12:
+                tw = ((world_at[0]-w0[0]) * sd[0]
+                      + (world_at[1]-w0[1]) * sd[1]
+                      + (world_at[2]-w0[2]) * sd[2]) / denom
+                tw = max(0.0, min(1.0, tw))
+                wdist = math.sqrt(
+                    (world_at[0]-w0[0]-tw*sd[0]) ** 2
+                    + (world_at[1]-w0[1]-tw*sd[1]) ** 2
+                    + (world_at[2]-w0[2]-tw*sd[2]) ** 2)
+            else:
+                wdist = 1e18
+            if wdist > 1.0:      # 1mm 内才算"立在管上"，否则维持页面最近
+                continue
+            key = (wdist, dist)
+        else:
+            key = (dist, 0.0)
+        if key < best_key:
+            best_key, best = key, (d, dw)
+    if best is None and world_at is not None:
+        return _nearest_pipe_run_dir(proj, doc, at)
     return best
 
 
@@ -5319,7 +5486,8 @@ def _draw_support_symbol(canvas: _Canvas, at: Vec2, comp,
         if orient == 0 and proj is not None and doc is not None:
             # 顺管道：符号 X 轴对齐管段；跨管方向取"垂直于管轴的世界轴"的投影
             # （等轴测中为 30° 斜向，立管上两条线因此有高度差）
-            run = _nearest_pipe_run_dir(proj, doc, at)
+            world_at = comp.co_ords[0].xyz if comp.co_ords else None
+            run = _nearest_pipe_run_dir(proj, doc, at, world_at)
             if run is not None:
                 d, dw = run
                 ln = _v2_len(d)

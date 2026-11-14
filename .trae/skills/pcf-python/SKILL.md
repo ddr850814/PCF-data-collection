@@ -23,7 +23,7 @@ py -3 -X utf8 pcf_renderer.py "c:\Users\jiazheng\桌面\新建文件夹\HQSH_Iso
 ```
 
 - 366 张，判定通过 = exit 0 且日志无 Traceback/Error
-- 警告基线（全为既有类别，新增类别须解释）：87 continuation（声明指向本交付集外线号）、19 不连通管段组、9 切割表截断、2 尺寸过小
+- 警告基线（全为既有类别，新增类别须解释）：87 continuation（声明指向本交付集外线号）、19 不连通管段组、5 切割表截断、5 尺寸过小（RED SM/RED LG/BRANCH CL 侧车尺寸）、约 80 chain layout scaled（不按比例模式自适应缩放）
 - 测试语料 `c:\Users\jiazheng\桌面\新建文件夹\HQSH_Iso_Pipeline_PTFE` 为**只读**厂商数据，勿改
 
 ## 符号库同步（vendor 更新 BSF.asc 后）
