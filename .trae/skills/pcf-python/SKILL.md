@@ -46,4 +46,45 @@ py -3 -m PyInstaller "PCF收集器.spec" --noconfirm
 
 - 中文一行式 commit message，聚焦"为什么"；只 `git add` 具体文件，禁止 `git add -A`
 - `.gitignore` 已覆盖 preview/、dist/、build/、__pycache__/、*.pdf、.screenshots/——构建产物与回归输出不入库
-- 深层历史规则（符号语义、渲染细节、用户定稿决策）在 Trae 记忆 `project_memory.md`，不在本 skill 重复
+- 深层历史规则（符号语义、渲染细节、用户定稿决策）原在 Trae 记忆 `project_memory.md`；2026-11-14 起代码注释已精简，完整定稿规则改记下方「定稿规则总账」，project_memory 只留当日进展
+
+## 定稿规则总账（2026-11-14 自代码注释迁出）
+
+### 管架与符号库
+- 管架选线：优先世界距离≈0（真立管线上）的管段再按页面距离——39021 管架曾对到邻跨接续短管画成斜线；候选集含弯头/三通腿
+- 管架 SKEY 语义出自 SystemMaterialData.xml Supports 段：01HG/空=承重、ANCH/GUID/SPRG/HANG；.ASC 方向模式（501 尾参）：0=顺管、2=UP/DOWN 翻转、3=三轴六向
+- 符号库优先（START→eps[0]、EXIT→eps[1] 双点仿射），手绘仅回退；SAFETY-DISC 归 GASKET 但必须画官方符号，仅普通垫片不画并父标；WT 支管台=主管中心→支管端对齐
+- 法兰常误导出为 COUPLING，派发兼看 description，BOM 只用 classify()
+- 阀柄独立 skey（01SP/03SP/04SP/10SP）已归一 START=(0,0)，+X 旋到 SPINDLE-DIRECTION 投影、沿用阀体 sy
+
+### 宽度体系
+- 按比例图：孔径正比 2·_bore_half_w，法兰类×B16.5 突面比（1/2"≈1.64→24"≈1.14，C150 全表 21 档最小二乘拟合偏差≤0.05≈0.15mm；锚点 2"→1.53、6"→1.28、12"→1.18）
+- 不按比例图：固定尺寸（法兰杠 3.8/阀 1.9/符号 4.5）；高度 4.5 同时校准轴向自然长度（VB** 800→9.0mm、FLWN 500→4.09mm），改高度连带缩长度、链上留死区，宽度走单独通道
+
+### END-POSITION 与接图点
+- END-POSITION-OPEN/CLOSED 是文件声明的止点，置信高于连通图行走（模型内 field weld 两端容差内重合，否则 spool 边界无 landmark）；非盲信，经 _is_run_terminus()；END-CONNECTION-* 为跨管线接续跳过；接图点由 continuation 阶段画（图上要的是下一张图名）
+
+### 偏心变径
+- 不建弦 leg；轴向取邻接管段（大端优先小端兜底），绝不沿斜弦标注；warp 用区间保护（点对规则在有中间坐标时把偏心撑成折线撕掉小端）
+- 符号体两端落自身焊点（旧法沿邻轴伸出致楔尖悬空），run 只定方正（弦定方出菱形）；跨向用投影世界轴（屏幕垂线不在等轴测面）
+- 平侧示意画（真实 1" 偏心仅 1/3mm 读作同心），平侧朝向取模型；尺寸以大端为锚、小端投影回原管轴；体深≥页空间中心线偏移否则领结交叉
+
+### 尺寸
+- 尺寸线沿投影世界轴；≥4 箭头长才双箭头内置；offset leg 的 spanned 按页空间判定（模型对角线判定使 3" roll 在 40' 线中 offset 盒消失）
+- 兜底尺寸按连通组独立跑（旧版整页无尺寸才触发+多组拒绝）；垫片只存于法兰连接侧，此结构证据优先 rank 表判焊端
+
+### 链式布局
+- 直管按真实长度单调分档（基准×1.5 定稿）；按边弹性缩放只压管线边（全局乘 s 会压符号端点对、符号画小），rigid_symbols=False 极端兜底全体弹性
+- 垫片模型厚度 ~1.5mm 示意不可见，warp 固定 0.6mm 间隙；face-to-face≈0 时轴向取最近管段且方向指"远端"；贴附件吸附必须在打包后（rebuild 弹性拉伸会撕掉）
+
+### welds
+- 联管节 gap 模型空间测量（页空间被 warp 拉大，1/16" 越过 3mm 阈值致本体线压焊点）；焊耦合经焊点派生但中心线须连续
+- socket weld 画方括号朝插入件（旧版统一圆点不可辨）；boss 站开根部 0.9mm 焊点；tie band 用 1e-3 容差（1e-6 时螺栓法兰对两半因投影噪声选不同轴、两面杠 60° 成 X）
+
+### 球标与 GUI
+- callout 单一风格，裸标签靠邻近推断在繁忙图纸/NTS 拉近时失效；leader foot 与邻件锚/焊点留白；切割件标注点中点优先、四分点逃生；垫片/螺栓并入任一端法兰，无法兰单独球标；标题栏标签比值低一级（原有层级），仅值用 _SHEET_FONT 8.0
+- revision join 容差——未动焊点世界坐标相同（distance 0），容差只消化模型微调；pull-back 容差——地图项自放置，未动 marker 与行差 <1px
+
+### __init__ 本地修改
+- BOM 跳无 ITEM-CODE 焊缝；项号/气球固定行序号 1..N（原料号存 code 列）；直管气球标 BOM 项号
+- SUPPORT/FLOW-ARROW 优先 .ASC 符号库（SUPPORT-DIRECTION/FLOW 控向，无库回退内置，箭头不进 BOM）；asc_symbols.py 为本地新增解析器（见 symbols/ASC符号格式规则.md）

@@ -42,14 +42,12 @@ from . import geometry
 # The column added to a _welds.csv row by record/reconcile.
 MAP_ITEM_ID_COLUMN = "map_item_id"
 
-# Default revision join tolerance, in the CSV's native coordinate units. Welds
-# that did not move share identical world coordinates (distance 0); the slack
-# only forgives minor nudges from a model edit.
+# Default revision join tolerance, in the CSV's native coordinate units: unmoved welds
+# share identical world coordinates (distance 0); the slack only forgives minor nudges.
 DEFAULT_RECONCILE_TOLERANCE = 0.1
 
-# Default pull-back position tolerance, in canvas pixels. We placed the map
-# items ourselves, so an untouched marker sits within a pixel of its row; the
-# slack forgives an inspector nudging a marker.
+# Default pull-back position tolerance, in canvas pixels: we placed the map items
+# ourselves, so an untouched marker sits within a pixel of its row; slack forgives nudges.
 DEFAULT_MATCH_TOLERANCE_PX = 30.0
 
 

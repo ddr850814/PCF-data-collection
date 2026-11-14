@@ -1,56 +1,13 @@
 """Rules-based single-line isometric PDF rendering with weld capture.
 
-Projection: true isometric. After the plan is oriented (north axis + view
-quadrant), East contributes (+cos30, +sin30), North (+cos30, -sin30), and
-Up (0, -1) in page space (y grows downward, matching PDF coordinates), so
-elevation always draws straight up and both plan axes draw at 30 degrees.
-A sheet carrying piping that is flat to the ground on a 45/135/225/315
-bearing gets one departure from that: such a run projects dead vertical,
-the way a riser reads, so a plan shear tilts it ~10 degrees off vertical
-(RenderOptions.skew_deg). Risers stay vertical; see set_skew().
-
-Symbols are dispatched per component class using the conventions proven in
-the wmdb renderers: pipes are single lines, elbows turn at their
-centre-point corner, valves are bow-ties with subtype decorations, reducers
-are trapezoids (eccentric ones keep their FLAT-DIRECTION side flat), olets
-branch off the header centreline. Flanges draw one long bar at the gasket
-face -- the flanged end, not the welded one -- skewed onto an isometric
-plane like the dimension callouts and about twice a dimension offset long,
-so a flanged connection is unmistakable on a full sheet.
-
-Welds are drawn as small filled dots only -- their numbered balloons live
-in the weld-tracking system as a separate overlay layer, not on the sheet.
-Every weld's page x/y (mm, top-left origin) is still captured during the
-same layout pass that draws the dot, so the weld-map upload keeps working;
-positions are never re-measured from the PDF.
-
-Component callouts are one style for everything the shop has to identify:
-a square box carrying the item number (materials) or the cut-list name
-(pipe pieces), standing off the centreline with a leader to the component.
-If the BOM or cut-list table overflows the sheet a loud "SPLIT SHEET"
-warning is drawn and reported.
-
-Continuation callouts mark every point the PCF declares as leaving the
-sheet (END-CONNECTION-PIPELINE): an arrow along the run plus a block
-printing the declared reference -- "SEE ISO <line number>" -- and the
-declared point's plant coordinates. The render set only maps the
-declared neighbour to the sheets actually carrying it (SHT tags,
-split-junction phantoms) and warns when nothing carries it; the hand-off
-points themselves are never re-derived from geometry (see
-continuations.py).
-
-Dimensional callouts have isometric skew: leader bars, dimension lines and
-the *text itself* run along projected world axes, so the whole callout --
-glyphs included -- lies on the isometric plane its goalposts define. Point
-pairs that are not axis-aligned are decomposed into a dashed offset
-rectangle (one plane) or cuboid (three axes) whose legs are dimensioned
-individually on the least-colliding side. Whether a leg counts is decided
-in page millimetres rather than as a fraction of the model, so a small roll
-in a long line still gets its box. Three standard text placements are used
-according to how much room the dimension has: text breaking the dimension
-line, text leadered off a full-length line, or -- when the span is too
-short even for the arrows -- arrows outside the goalposts with leadered
-text. See _plan_dim_geometry().
+True isometric projection after north-axis/quadrant orientation, with
+picture-only departures: not-to-scale warp, plan shear tilting flat
+45-degree runs off vertical (RenderOptions.skew_deg / set_skew), and chain
+layout in schematic mode. Welds draw as dots -- numbered balloons live in
+the weld-tracking overlay -- with page positions captured in the same pass.
+Callouts are one style for everything; continuation callouts mark every
+declared sheet exit (see continuations.py); dimension lines and their text
+lie on isometric planes (see _plan_dim_geometry()).
 """
 
 from __future__ import annotations
@@ -117,59 +74,38 @@ class RenderOptions:
     # "MATERIAL": "A106-B"}. Insertion order is print order.
     properties: dict[str, str] = field(default_factory=dict)
     show_dimensions: bool = True
-    # Page length (mm) of the bar drawn across the gasket face of a flange
-    # (hand-drawn path). 不按比例图的固定杠长（与阀领结底边 2×1.9 同宽，
-    # 一个符号族）；按比例图按孔径走 _flange_face_ratio 拟合，此值仅在
-    # 缺孔径时兜底。
+    # Page length (mm) of the bar drawn across a flange's gasket face; 按比例
+    # 图按孔径拟合，此值仅在缺孔径时兜底。
     flange_bar_mm: float = 3.8
     show_bom: bool = True
     show_cut_table: bool = True
     detect_ffw: bool = False
     dims_sidecar: str | None = None  # read overrides from here when set
-    # Callout crowding: 1.0 = default spacing, 1.35 = one "spread out" step,
-    # 0.74 = one "pack closer" step. Clamped to [0.4, 3.0] at render time.
-    # Controls the leadered material (item-number) callouts; weld dots and
-    # in-place pipe labels are fixed to geometry and never move.
+    # Callout crowding: 1.0 default, 1.35 spread, 0.74 pack; clamped [0.4, 3.0]. Only
+    # leadered material callouts move; weld dots and pipe labels are fixed to geometry.
     balloon_spread: float = 1.0
-    # Balloon every instance of a material item, not just the first one on the
-    # sheet. A fabrication isometric has to let a fitter identify each fitting
-    # in front of them, so six elbows off one BOM row need six item-number
-    # boxes. Set False for the older one-balloon-per-BOM-row behaviour, which
-    # gives a much quieter page at the cost of leaving fittings unidentified.
+    # Balloon every instance of a material item so a fitter can identify each
+    # fitting; False = one balloon per BOM row (quieter, fittings unidentified).
     balloon_every_instance: bool = True
-    # Schematic (not-to-scale) drawing: pipe/nipple runs are compressed or
-    # stretched so every visible span lands between nts_min_mm and nts_max_mm
-    # on the page, and the sheet is stamped NOT TO SCALE. This warps ONLY the
-    # picture -- cut lengths, BOM totals, and dimension text are computed from
-    # the true 3D model and never change.
+    # Schematic drawing: runs compress/stretch so spans land in [nts_min_mm, nts_max_mm],
+    # sheet stamped NOT TO SCALE. Warps ONLY the picture; lengths/BOM/dimension text stay true.
     not_to_scale: bool = True
     nts_min_mm: float = 8.0
     nts_max_mm: float = 70.0
-    # Visual skew (degrees) applied to piping that is flat to the ground but
-    # runs on a 45/135/225/315-degree bearing: in a true isometric such a run
-    # draws as a dead vertical line, on top of how risers and downcomers
-    # read. The skew tilts it off vertical so the two cannot be confused. It
-    # is applied only to sheets that contain such a run, and like the
-    # not-to-scale warp it changes the picture only. 0 disables it.
+    # Visual skew (degrees): tilts flat 45/135/225/315-degree runs off vertical (they would
+    # project dead vertical like a riser). Only when such a run exists; picture-only. 0 disables.
     skew_deg: float = 10.0
-    # Hybrid (distance-split) mode: the grouping attribute whose values are
-    # the spools on this sheet (e.g. SPOOL-IDENTIFIER). When set, each spool
-    # region is labelled on the drawing and every weld joining two different
-    # spools is declared a field weld: "F.W." tag at the dot, label FW, and
-    # "Field Weld" in the welds CSV notes column.
+    # Hybrid mode: grouping attribute naming the spools (e.g. SPOOL-IDENTIFIER). Spool regions
+    # get labels; welds joining two spools become field welds ("F.W." tag, "Field Weld" CSV note).
     spool_key: str | None = None
     # 管线清单实时预览：只画图面内容（管线/符号/焊点/尺寸/注释/北向标/
     # NTS 戳），不出图框、标题栏、BOM/切割表等"图纸家具"。
     preview: bool = False
-    # Where the piping leaves this sheet: one entry per END-CONNECTION-
-    # PIPELINE declaration (point = its CO-ORDS, name = its reference),
-    # built by continuations.build_continuation_map() over the documents
-    # being rendered together -- the set only resolves which rendered
-    # sheets carry the declared neighbour (SHT tags, phantom mates).
+    # Sheet exits: one entry per END-CONNECTION-PIPELINE (point = CO-ORDS, name = reference),
+    # built by continuations.build_continuation_map() over the rendered document set.
     continuations: list[Continuation] = field(default_factory=list)
-    # 整套图纸的文档表（图名 → PcfDocument），由 render_pcf_files 在批量
-    # 渲染时传入。分图幻影件需要邻图文档才能把断点对侧的紧邻零件画成
-    # 虚线幻影；单图渲染（预览）为空时幻影件退化为只画接续标记。
+    # 图名 → PcfDocument（批量渲染传入）：分图幻影件需邻图文档画断点对侧虚线幻影；
+    # 单图渲染为空时幻影退化为只画接续标记。
     neighbour_docs: dict[str, PcfDocument] | None = None
 
 
@@ -261,9 +197,8 @@ class Projector:
     def __init__(self, options: RenderOptions):
         self.north_axis = options.north_axis
         self.quadrant = options.quadrant
-        # Optional not-to-scale warp: a monotonic per-axis world-coordinate
-        # remap applied before projection. Directions and topology survive;
-        # only drawn span lengths change.
+        # Optional not-to-scale warp: monotonic per-axis world remap before projection;
+        # directions/topology survive, only drawn span lengths change.
         self.warp = None
         # Plan shear that tilts the flat 45-degree run off vertical; see
         # set_skew(). 0.0 = pure isometric.
@@ -276,9 +211,8 @@ class Projector:
         # 出图模式：True=按比例（符号铺满实际端距），False=不按比例示意
         # （符号恒等比 sx=sy，端点/尺寸锚随符号端面走）。
         self.proportional = not options.not_to_scale
-        # 链式布局（示意）专用：整图示意缩放（管件尺寸与位置同乘，保持
-        # 搭积木不叠件）与最近点平移回退（未映射的派生世界点——尺寸盒
-        # 角点/设备管口——跟随最近的已布几何）。
+        # 链式布局（示意）专用：整图示意缩放（管件同乘、搭积木不叠件）与最近点平移
+        # 回退（未映射派生点——尺寸盒角点/设备管口——跟随最近已布几何）。
         self.schematic_scale = 1.0
         self.offset_nearest = False
 
@@ -329,11 +263,8 @@ class Projector:
         if apply_offset:
             off = self.point_offsets.get(p)
             if off is None and self.offset_nearest and self.point_offsets:
-                # 链式布局：未映射的派生世界点（尺寸盒角点/设备管口/流向
-                # 箭头/管架等）跟随邻近几何。只取最近点的平移，在管线被
-                # 摆位拉伸/压缩后会偏离段中位置（同段两端平移量不同），
-                # 派生符号就从管线上"掉下来"；这里取最近两点沿其连线按
-                # 投影比例插值平移，派生点落在摆位后管段的对应位置上。
+                # 链式布局：未映射派生点（尺寸盒角点/设备管口/流向箭头/管架等）跟随邻近
+                # 几何；最近两点沿连线按投影比例插值平移，避免管线两端平移量不同时掉线。
                 best: tuple[float, Vec3, Vec2] | None = None
                 second: tuple[float, Vec3, Vec2] | None = None
                 for k, d in self.point_offsets.items():
@@ -373,15 +304,10 @@ class Projector:
 # ---------------------------------------------------------------------------
 # Not-to-scale warp
 #
-# Schematic isometrics compress long runs and stretch short nipples so the
-# drawing stays readable. The warp is a monotonic piecewise-linear remap of
-# each world axis: the gap between adjacent coordinate planes is clamped so
-# its projected length lands in [nts_min_mm, nts_max_mm]. Monotonic per-axis
-# mapping preserves topology exactly -- everything that touched still
-# touches, parallel runs stay parallel and ordered -- while sub-gap features
-# (modelled 1/16" weld root gaps) are left untouched so they don't balloon
-# into visible openings. RENDERING ONLY: cut lengths, BOM totals, and
-# dimension text are always computed from the true model coordinates.
+# Monotonic per-axis world remap so drawn spans land in [nts_min_mm, nts_max_mm];
+# topology preserved exactly (touching stays touching, order kept) and sub-gap
+# features (modelled 1/16" weld root gaps) stay untouched. RENDERING ONLY:
+# lengths/BOM/dimension text use the true model coordinates.
 
 _NTS_ITERATIONS = 3
 # World gaps at or below this (inches) are never stretched: weld root gaps
@@ -396,52 +322,16 @@ def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
                     targets: list[list[tuple[float, float, float]]] | None = None):
     """Monotonic per-axis remap; distances are clamped via the current page
     scale (mm targets / scale = world-unit targets).
-
-    ``rigid`` is a per-axis list of ``(lo, hi, s)`` intervals to remap with one
-    shared slope ``s`` instead of clamping gap by gap. It is what keeps runs
-    that are **not parallel to a world axis** from being deformed. A run along
-    a world axis draws at a page direction that depends only on which axis it
-    is on, so any monotonic per-axis remap leaves it alone; a skewed run's page
-    direction is ``(sx*dx, sy*dy, sz*dz)``, and the three local slopes have
-    nothing to do with each other. Clamping them independently swings the run
-    to an arbitrary angle -- and swings an elbow leg and the pipe welded to it,
-    collinear in the model but sitting in different cells of the breakpoint
-    grid, to *different* arbitrary angles. Measured on real sheets that came
-    back from review, up to 47 degrees apart: the fitting visibly not on the
-    pipe. Inside a rigid interval every axis uses the same ``s``, so a skewed
-    run maps as ``p -> s*p + c``: direction exactly preserved, collinear stays
-    collinear, parallel stays parallel. See ``_skew_rigid_spans``.
-
-    ``targets`` is a per-axis list of ``(lo, hi, target_mm)`` intervals to map
-    to a FIXED page length: inline fittings (valves, flanges, concentric
-    reducers...) whose coordinate span is forced to their symbol's natural
-    page size. The schematic principle: parts print at symbol size whatever
-    the scale, and only straight pipe absorbs the non-to-scale stretching --
-    gaps inside a target interval are scaled proportionally so the whole
-    interval lands on ``target_mm``; the space that true-proportion fittings
-    would have eaten (or the [min,max] clamp would have inflated them to)
-    stays with the pipe runs.
-
-    ``rigid`` wins over ``keep`` where they overlap: a gap being scaled by a
-    shared slope is not being ballooned to ``min_mm``, which is the only thing
-    ``keep`` exists to prevent.
-
-    ``keep`` is a per-axis list of coordinate *intervals* to leave at true
-    proportion. The warp stretches short spans so they can be seen, but not
-    every small gap is a span worth seeing: an eccentric reducer's two weld
-    ends sit on centrelines half an inch to an inch apart, and blowing that
-    up to ``min_mm`` puts a dog-leg in the pipeline seven times the size of
-    the real offset -- and swamps the reducer's own flat side, which is the
-    eccentricity drawn at proportion. See ``_eccentric_offset_pairs``.
-
-    Any gap falling **wholly inside** a protected interval is left alone,
-    rather than only a gap whose two ends *are* the interval. The stricter
-    rule looked conservative and was simply broken: the moment anything else
-    on the sheet sat at a coordinate between a reducer's two ends -- the rest
-    of the spool, routinely, since the reducer straddles the run centreline
-    -- the interval was subdivided, neither sub-gap matched the pair, and the
-    offset was inflated after all. A protected interval is an inch wide at
-    most, so no leg of pipe can hide inside one.
+    
+    ``rigid``: per-axis (lo, hi, s) intervals remapped with one shared slope,
+    keeping non-axis-parallel runs' exact direction (independent per-gap
+    clamps would swing collinear elbow legs to different angles).
+    ``targets``: per-axis (lo, hi, target_mm) intervals mapped to a fixed
+    page length -- inline fittings print at symbol size, only straight pipe
+    absorbs stretching. ``rigid`` wins over ``keep`` where they overlap;
+    ``keep`` intervals (e.g. an eccentric reducer's weld-end offset) stay at
+    true proportion, and any gap wholly inside a protected interval is left
+    alone.
     """
     from bisect import bisect_right
 
@@ -455,10 +345,8 @@ def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
         vals = sorted({round(p[ax], 6) for p in points})
         src = [vals[0]]
         dst = [vals[0]]
-        # ``locked``/``forced`` are sorted and non-overlapping, so the only
-        # interval that can contain a gap is the last one starting at or
-        # before it. Binary search rather than scan, to keep this linear in
-        # the number of coordinates on sheets that carry thousands of both.
+        # ``locked``/``forced`` are sorted and non-overlapping, so only the last interval
+        # starting at or before a gap can contain it; binary search keeps this linear.
         lows = [lo for lo, _hi, _s in locked]
         flows = [lo for lo, _hi, _t in forced]
         for v in vals[1:]:
@@ -508,40 +396,26 @@ def _build_nts_warp(points: list[Vec3], scale: float, min_mm: float,
     return warp
 
 
-# A direction component below this (inches) is modelling noise, not a second
-# axis the run genuinely travels on. Far under anything a fabricator lays out,
-# and far under the connection tolerance, so it never reclassifies a real run.
+# A direction component below this (inches) is modelling noise, not a genuinely
+# second axis; far under anything a fabricator lays out or the connection tolerance.
 _SKEW_AXIS_FLOOR_INCHES = 1.0 / 64.0
 
 
 def _skew_segments(runs: list[tuple[Vec3, Vec3]], points: list[Vec3],
                    tol: float, inch_factor: float) -> list[tuple[Vec3, Vec3]]:
     """Skewed runs, cut at every model point that sits on them.
-
-    A run parallel to a world axis needs none of this: its page direction is
-    the projected axis whatever the warp does to lengths. Everything else is
-    cut into the pieces the sheet actually has landmarks on, so a piece can be
-    compressed or stretched on its own without dragging its neighbours -- a
-    45-degree elbow leg still gets stretched to a visible length beside the
-    twenty-foot diagonal it welds onto.
-
-    "Parallel to an axis" is judged **absolutely**, against a fabrication
-    floor, not as a fraction of the run's own length. Two reasons it cannot
-    be a fraction. A twenty-foot run that drifts two inches sideways is 1%
-    off axis and still a skewed run -- left to the clamp it swings by
-    degrees. And a fraction splits runs that are *collinear*: the same
-    direction reads as skewed on the long pipe and as axis-parallel on the
-    six-inch elbow leg welded to it, one gets a shared slope and the other
-    gets clamped, and the kink this exists to remove comes back at a fifth
-    of its size. The floor is well under anything a fabricator lays out, so
-    only genuine modelling noise falls through it.
+    
+    Runs parallel to a world axis are excluded, judged absolutely against the
+    fabrication floor (_SKEW_AXIS_FLOOR_INCHES), never as a fraction of run
+    length: a fraction swings near-axis runs by degrees and splits collinear
+    runs (long pipe vs. its short elbow leg) into different treatments.
+    Stations are the model's own points, never reconstructed from t.
     """
     from bisect import bisect_left, bisect_right
 
     floor = _SKEW_AXIS_FLOOR_INCHES / inch_factor
-    # One sorted index per axis, so a run only tests the points inside its own
-    # coordinate slab rather than every point on the sheet -- the naive
-    # product is runs x points, and both run to thousands on a large sheet.
+    # One sorted index per axis, so a run only tests points inside its own coordinate
+    # slab -- the naive product is runs x points, thousands on a large sheet.
     indexed = [sorted(points, key=lambda p, ax=ax: p[ax]) for ax in range(3)]
     keys = [[p[ax] for p in indexed[ax]] for ax in range(3)]
 
@@ -554,9 +428,8 @@ def _skew_segments(runs: list[tuple[Vec3, Vec3]], points: list[Vec3],
         if sum(1 for k in range(3) if abs(d[k]) > floor) < 2:
             continue
         u = tuple(c / length for c in d)
-        # Take the slab that actually excludes the most: the run's narrowest
-        # axis is not it. A flat 2D offset has zero extent in Z, and in a
-        # mechanical room every point at that elevation is in the Z slab.
+        # Take the slab that excludes the most (not the narrowest axis): a flat offset
+        # has zero Z extent, and every point at that elevation is in the Z slab.
         slabs = []
         for ax in range(3):
             lo, hi = sorted((a[ax], b[ax]))
@@ -567,10 +440,9 @@ def _skew_segments(runs: list[tuple[Vec3, Vec3]], points: list[Vec3],
         candidates = [p for p in indexed[pick][start:stop]
                       if all(box[ax][0] - tol <= p[ax] <= box[ax][1] + tol
                              for ax in range(3))]
-        # Stations are the model's own points, never a point reconstructed
-        # from t: the warp's breakpoints are the model coordinates rounded to
-        # six places, and a claim whose edge misses one of them by a float ulp
-        # stops covering the gap it was built for.
+        # Stations are the model's own points, never reconstructed from t: the warp's
+        # breakpoints are model coordinates rounded to six places; an edge off by a float
+        # ulp stops covering the gap it was built for.
         stations = {0.0: a, length: b}
         for p in candidates:
             off = geometry.sub(p, a)
@@ -588,43 +460,29 @@ def _skew_rigid_spans(proj: Projector, segments: list[tuple[Vec3, Vec3]],
                       tiny_world: float, min_mm: float, max_mm: float,
                       ) -> list[list[tuple[float, float, float]]] | None:
     """Coordinate intervals the warp must remap with one shared slope.
-
-    Each skewed segment asks for the slope that lands it in
-    ``[min_mm, max_mm]`` on the page -- the same target the gap-by-gap clamp
-    aims at -- and claims its own extent on each of the three axes. Because a
-    claim covers all three axes at once, the segment maps as ``p -> s*p + c``:
-    its direction is untouched, and two segments joined end to end stay in
-    line however differently they are scaled.
-
-    Two segments whose claims overlap on any axis cannot both have their way,
-    since the axis remap is a function. Those are merged into one group under
-    one slope, iterated to a fixed point so that in the end no two groups
-    overlap anywhere. The degenerate outcome -- one group across the whole
-    sheet -- is a sheet drawn at true proportion, which is the honest answer
-    for geometry that cannot be axis-warped without bending.
-
-    Takes the segments from ``_skew_segments``, which depend only on the
-    model and are cut once for the whole warp loop. Returns None when the
-    sheet is orthogonal, which is the common case: the warp is then built
-    exactly as it was before this existed.
+    
+    Each skewed segment claims its extent on all three axes with the slope
+    that lands it in [nts_min_mm, nts_max_mm]; overlapping claims merge into
+    one group under one slope, iterated to a fixed point, so members map as
+    p -> s*p + c and directions stay exact. The degenerate single-group
+    sheet prints at true proportion. Returns None for orthogonal sheets
+    (the common case).
     """
     if not segments:
         return None
 
-    # Page length of each segment as the warp is about to leave it: the rigid
-    # map is p -> s*p + c, so its projected length is s * (unwarped projected
-    # length) * scale. Measure unwarped, then solve for s. Sub-tolerance gaps
-    # (modelled weld root gaps) are left alone, exactly as the clamp does.
+    # Page length of each segment as the warp leaves it: rigid map is p -> s*p + c, so
+    # its projected length is s * (unwarped projected length) * scale; measure unwarped,
+    # then solve for s. Sub-tolerance gaps stay alone, exactly as the clamp does.
     warp, proj.warp = proj.warp, None
     try:
         lengths: list[float | None] = []
         for a, b in segments:
             pa, pb = proj.raw(a), proj.raw(b)
             page = math.hypot(pb[0] - pa[0], pb[1] - pa[1]) * proj.scale
-            # Sub-tolerance gaps are modelled weld root gaps. They ride the
-            # group's slope like everything else, but they must not be the
-            # thing that *sets* it: asking a 1/16" gap to reach nts_min_mm
-            # would blow the group up by two orders of magnitude.
+            # Sub-tolerance gaps are modelled weld root gaps: they ride the group's
+            # slope but must not *set* it -- asking a 1/16" gap to reach nts_min_mm
+            # would blow the group up by orders of magnitude.
             lengths.append(None if page < 1e-9
                            or geometry.dist(a, b) <= tiny_world else page)
     finally:
@@ -641,11 +499,9 @@ def _skew_rigid_spans(proj: Projector, segments: list[tuple[Vec3, Vec3]],
             i = group[i]
         return i
 
-    # "No two groups overlap on any axis" is the same statement as "no two
-    # *claims* from different groups overlap", because a group's claims are
-    # exactly its members'. So one sweep per axis reaches the fixed point --
-    # sort by lower edge, and chain each claim onto the run of claims it
-    # touches. No iterating to convergence, and no pairwise comparison.
+    # "No two groups overlap on any axis" equals "no two claims from different groups
+    # overlap" (a group's claims are its members'), so one sorted sweep per axis chains
+    # touching claims to the fixed point -- no iterating, no pairwise comparison.
     for ax in range(3):
         order = sorted((i for i in range(len(segments))
                         if boxes[i][ax][1] > boxes[i][ax][0]),
@@ -660,16 +516,10 @@ def _skew_rigid_spans(proj: Projector, segments: list[tuple[Vec3, Vec3]],
             else:
                 head, reach = i, hi
 
-    # One slope per group, so relative proportions *inside* a group are fixed
-    # whatever it is; all it decides is how big the group is beside the rest
-    # of the sheet. Take the smallest slope that lifts the group's shortest
-    # segment to nts_min_mm, then cap it so its longest stays under
-    # nts_max_mm. When the group's own span ratio exceeds max/min the two
-    # bounds cross and no slope satisfies both: the cap wins, so the sheet is
-    # never blown off the page, and the group prints at true proportion --
-    # the honest answer for geometry that cannot be axis-warped without
-    # bending. Staying at 1.0 when neither bound bites keeps a group that is
-    # already readable exactly where the model put it.
+    # One slope per group: take the smallest slope lifting the group's shortest segment
+    # to nts_min_mm, capped so its longest stays under nts_max_mm; when the span ratio
+    # exceeds max/min the cap wins and the group prints at true proportion (1.0 when
+    # neither bound bites).
     bounds: dict[int, tuple[float, float]] = {}
     for i, page in enumerate(lengths):
         if page is None:
@@ -699,22 +549,11 @@ def _skew_rigid_spans(proj: Projector, segments: list[tuple[Vec3, Vec3]],
 # ---------------------------------------------------------------------------
 # Isometric skew of flat 45-degree runs
 #
-# In a true isometric both plan axes project at 30 degrees, so a run that is
-# flat to the ground but bearing 45/135/225/315 degrees -- half of it along
-# each plan axis -- projects to a dead vertical line, indistinguishable from
-# a riser or a downcomer. Drafters break the tie by hand with a visual trick:
-# the diagonal run is drawn about 10 degrees off vertical. Nothing about the
-# pipe changes, only the picture; the dimensions, cut lengths and BOM are all
-# still taken from the true model.
-#
-# Projector.set_skew() is that trick as a plan shear. It moves ONLY the
-# diagonal that would collide: risers stay exactly vertical, and the plan
-# axes shift by about 2 degrees off 30 (a 45-degree line cannot be tilted by
-# a projection that leaves both axes it is made of untouched -- something has
-# to give, and 2 degrees on the axes buys 10 on the diagonal).
-#
-# It is applied only when the sheet actually has such a run, so an orthogonal
-# spool -- the common case -- still draws as a textbook isometric.
+# A run flat to the ground on a 45/135/225/315 bearing projects dead vertical and reads
+# like a riser; Projector.set_skew() applies the drafters' visual trick -- a plan shear
+# moving only the colliding diagonal ~10 degrees off vertical (risers stay exactly
+# vertical, plan axes shift ~2 degrees). Applied only when such a run exists;
+# picture-only: dimensions/cut lengths/BOM still come from the true model.
 
 # |dz| under this fraction of a run's length counts as flat to the ground.
 _SKEW_FLAT_FRACTION = 0.05
@@ -808,10 +647,9 @@ def _cap_height_mm(font_pts: float) -> float:
 # Renderer
 #
 # 双后端：_Canvas 与各 _draw_* 只面对统一绘图接口（fpdf2 同名方法 +
-# local_context/rotation/transform 上下文），由具体后端决定落向——
-# _FpdfBackend 原样转发 fpdf2 真正写出 PDF；_SceneBackend 收集自包含的
-# SceneItem（颜色/线宽/字号/变换全部随项快照），供 GUI 主线程用 tk.Canvas
-# 回放矢量预览，不再经 PyMuPDF 栅格化。
+# local_context/rotation/transform 上下文），由具体后端决定落向——_FpdfBackend
+# 原样转发 fpdf2 写出 PDF；_SceneBackend 收集自包含 SceneItem（颜色/线宽/字号/
+# 变换全部随项快照）供 GUI 主线程用 tk.Canvas 回放矢量预览。
 
 
 class _FpdfBackend:
@@ -830,8 +668,8 @@ class _FpdfBackend:
 
 
 # 字宽度量单例：布局决策（尺寸文字放线内/外、标签盒宽、_fit_text）依赖
-# get_string_width，预览回放必须与 PDF 用同一套 Helvetica 度量才能保证
-# 同版式。fpdf2 导入推迟到首次使用。
+# get_string_width，预览回放必须与 PDF 同一套 Helvetica 度量才能保证同版式。
+# fpdf2 导入推迟到首次使用。
 _metrics_fpdf = None
 
 
@@ -1158,23 +996,12 @@ class _Canvas:
 
     def iso_text(self, baseline: Vec2, message: str, size: float,
                  along: Vec2, up: Vec2) -> None:
-        """Draw text *skewed onto an isometric plane*, not merely rotated.
-
-        ``along`` is the direction the baseline runs and ``up`` the direction
-        the glyph strokes rise -- two projected world axes, so the letters lie
-        on the same plane as the callout that carries them. Rotation alone
-        cannot do this: it keeps the glyphs square to their own baseline,
-        which reads as flat text pasted onto an isometric picture. What a
-        drafter does by hand (and what AutoCAD's isometric text styles do) is
-        rotate *and* oblique, which is exactly the linear map that sends the
-        text-space axes onto the plane's two axes.
-
-        The text is centred on ``baseline`` along the baseline direction: the
-        half-width shift is applied before the transform, so it is carried
-        onto the plane with everything else. The background is knocked out
-        white first, in the same frame, so a value landing on a centreline
-        stays readable -- and so that the knockout is the shape of the text
-        rather than an upright box several times its size.
+        """Draw text skewed onto an isometric plane, not merely rotated.
+        
+        ``along`` is the baseline direction and ``up`` the glyph-rise direction --
+        two projected world axes -- so glyphs lie on the callout's plane (rotate
+        + oblique, AutoCAD isometric-style). Text is centred on ``baseline``
+        along it and knocked out white first in the same frame.
         """
         try:
             from fpdf.drawing_primitives import Transform
@@ -1185,9 +1012,8 @@ class _Canvas:
         width = self.pdf.get_string_width(message)
         cap = _cap_height_mm(size)
         x, y = baseline
-        # PDF matrix [a b c d e f]: x' = a.x + c.y + e, y' = b.x + d.y + f.
-        # Text space has x along the baseline and y *down*, so (1,0) -> along
-        # and (0,1) -> -up.
+        # PDF matrix [a b c d e f]: x' = a.x + c.y + e, y' = b.x + d.y + f. Text
+        # space has x along the baseline and y *down*: (1,0) -> along, (0,1) -> -up.
         matrix = Transform(along[0], along[1], -up[0], -up[1], 0.0, 0.0)
         pad = 0.35
         with self.pdf.transform(matrix.about(x, y)):
@@ -1200,31 +1026,14 @@ class _Canvas:
     def place_label(self, anchor: Vec2, w: float, h: float, away_from: Vec2,
                     min_leader: float = 5.0, avoid_geometry: bool = False,
                     clearance: float = 0.0) -> Vec2:
-        """Find a label centre near anchor that avoids earlier labels.
-
-        Candidates are swept around a *ring* of directions at increasing
-        radius, ordered so the natural placement -- straight out from the
-        drawing centre, shortest leader -- is tried first and still wins
-        whenever it is free. The search used to run along that one ray only,
-        which meant that once it walked past the edge of the drawing region
-        ``_clamp`` pinned every remaining candidate to the same point and the
-        rest of the budget was spent re-testing it.
-
-        With ``avoid_geometry`` the drawn segments are scored as well as the
-        earlier label boxes. That is what keeps a spool label off the pipeline
-        it names: without it the placer knows only about other labels and will
-        happily drop a box straight onto a centreline.
-
-        ``clearance`` (page mm, before spread) widens the box for that
-        geometry test only, so the label has to keep real whitespace rather
-        than merely not intersect. Not intersecting is a low bar: a box whose
-        edge grazes a centreline scores zero and is accepted at the shortest
-        leader, which is how these came out legibly placed but visually
-        crowded against the run.
-
-        If nothing is clean, the least-bad candidate is returned rather than
-        the anchor itself -- a label sitting exactly on its own component was
-        the old fallback and it is the worst position available.
+        """Find a label centre near ``anchor`` that avoids earlier labels.
+        
+        Candidates sweep rings of directions at increasing radius, natural
+        placement (straight out from the drawing centre, shortest leader) first.
+        With ``avoid_geometry``, drawn segments are scored too, so a label keeps
+        off the centreline it names; ``clearance`` widens the box for that test
+        (page mm, before spread). If nothing is clean the least-bad candidate
+        wins; the anchor itself is never returned.
         """
         pos, box, _score = self._best_placement(
             anchor, w, h, away_from, min_leader, avoid_geometry, clearance)
@@ -1235,21 +1044,13 @@ class _Canvas:
                           away_from: Vec2, min_leader: float = 5.0,
                           avoid_geometry: bool = False, clearance: float = 0.0,
                           anchor_cost=None) -> tuple[Vec2, Vec2]:
-        """Place one label, choosing among several places to *point at*.
-
-        ``place_label`` is good at moving the box and cannot move the leader's
-        foot, so a component that happens to have a fitting sitting on its
-        anchor gets a leader landing on that fitting every time -- which is
-        what a pipe with an olet welded on at its midpoint looks like. Given a
-        list of anchors it scores each one's best placement and takes the pair
-        that wins, so the callout can step along the run to somewhere clear.
-
-        ``anchor_cost(anchor) -> float`` prices the anchor itself: a foot
-        landing on a neighbouring fitting or a weld dot is bad however good
-        the box above it is. Anchors are offered best-first, so a tie leaves
-        the caller's preferred anchor (the midpoint) in place.
-
-        Returns ``(anchor, position)``.
+        """Place one label, choosing among several places to point at.
+        
+        Scores each anchor's best placement (plus ``anchor_cost`` pricing a foot
+        landing on a neighbour or weld dot) and takes the winning pair, so a
+        callout can step along a run to somewhere clear. Anchors arrive
+        best-first, so ties keep the caller's preferred anchor. Returns
+        ``(anchor, position)``.
         """
         best: tuple[float, Vec2, Vec2, tuple] | None = None
         for anchor in anchors:
@@ -1308,11 +1109,9 @@ class _Canvas:
             score = 5.0 * sum(1 for other in self.label_boxes
                               if _boxes_overlap(box, other, self.pad))
             if near:
-                # Graded, so that when nothing is clean the least-bad
-                # candidate is the roomiest one rather than merely the one
-                # with the shortest leader: crossing a line costs twice what
-                # crowding it does. With no clearance asked for, the two
-                # boxes are the same and this is the old flat count.
+                # Graded so that when nothing is clean the least-bad candidate is the
+                # roomiest rather than merely the shortest leader: crossing a line costs
+                # twice crowding it. With no clearance the two boxes coincide.
                 clear_box = (box[0] - grow, box[1] - grow,
                              box[2] + 2 * grow, box[3] + 2 * grow)
                 for p, q in near:
@@ -1455,9 +1254,8 @@ def _render_document(
                   if rec.type == "END-CONNECTION-EQUIPMENT"]
     all_points += [p.xyz for rec in equip_recs for p in rec.co_ords]
 
-    # 分图幻影件：邻图断点紧邻零件的关键点纳入投影/NTS 变形范围，
-    # 保证幻影几何与本图共用同一投影（含非比例伸缩）。只影响画面，
-    # 不进 BOM/切割清单/避让集合（那些只吃 doc 本身）。
+    # 分图幻影件：邻图断点紧邻零件的关键点纳入投影/NTS 变形范围，幻影与本图共用
+    # 同一投影（含非比例伸缩）。只影响画面，不进 BOM/切割清单/避让集合。
     for pxyz in _phantom_points(doc, options):
         all_points.append(pxyz)
 
@@ -1471,9 +1269,9 @@ def _render_document(
     floored = False
     if options.not_to_scale and len(all_points) > 1:
         try:
-            # 超幅：直管/腿档位按缩放比收缩重摆（符号端点对刚性，打包层
-            # 只压管线边），缩放比累计迭代到装得下；档位触底仍超幅（固定
-            # 件+符号自身占满图面）时才整体兜底缩（含符号，rigid off）。
+            # 超幅：直管/腿档位按缩放比收缩重摆（符号端点对刚性，打包层只压管线
+            # 边），缩放比累计迭代到装得下；档位触底仍超幅时才整体兜底缩（含符号，
+            # rigid off）。
             pipe_scale = 1.0
             chain = _chain_layout(projector, doc, comps, draw_region)
             for _ in range(4):
@@ -1495,16 +1293,16 @@ def _render_document(
     chain_on = chain is not None and bool(chain[0])
     if chain_on:
         projector.point_offsets.update(chain[0])
-        # 符号恒定：正常收敛（打包层只压管线边）时 schematic_scale=1.0，
-        # 符号端点对不缩、绘制尺寸不变；仅触底兜底时整体同缩保持自洽。
-        # 未映射派生点走最近点平移回退，跟随邻近几何
+        # 符号恒定：正常收敛（打包层只压管线边）时 schematic_scale=1.0，符号端点对
+        # 不缩、绘制尺寸不变；仅触底兜底时整体同缩保持自洽。未映射派生点走最近点
+        # 平移回退。
         projector.schematic_scale = chain[2] if floored else 1.0
         projector.offset_nearest = True
         if chain[1]:
             warnings.append(chain[1])
-        # 偏心变径：小端连通侧整体平移到符号出口（按 skey 正算的小端
-        # 中点，与 warp 通道同一机制）。链式只把变径两端摆上主轴
-        # （_sym_dir），偏心量由这里叠加，下游管线从符号小端中点续走
+        # 偏心变径：小端连通侧整体平移到符号出口（按 skey 正算的小端中点，与 warp
+        # 通道同一机制）。链式只把变径两端摆上主轴，偏心量由这里叠加，下游管线从
+        # 符号小端中点续走。
         for k, dv in _eccentric_small_side_offsets(
                 projector, doc, comps, reducer_runs,
                 proportional=False).items():
@@ -1512,13 +1310,11 @@ def _render_document(
             if prev is not None:
                 projector.point_offsets[k] = _v2_add(prev, dv)
     if not chain_on and options.not_to_scale and len(all_points) > 1:
-        # Fixed-count iteration: the warp targets depend on the page scale
-        # and the scale depends on the warped extents, so refit a few times.
-        # Deterministic -- same model and options always converge identically.
+        # Fixed-count iteration: warp targets depend on page scale and vice versa,
+        # so refit a few times; deterministic for same model and options.
         tiny_world = _NTS_TINY_INCHES / coord_to_inch_factor(doc.units_coords)
-        # 零件示意尺寸：直管件区间固定映射为符号自然图面长度，伸缩只由
-        # 直管吸收（见 _fitting_symbol_targets）。偏心变径的偏心量区间
-        # 仍按真实比例保护。
+        # 零件示意尺寸：直管件区间固定映射为符号自然图面长度，伸缩只由直管吸收
+        # （见 _fitting_symbol_targets）；偏心变径的偏心量区间仍按真实比例保护。
         keep = _eccentric_offset_pairs(doc, reducer_runs)
         sym_targets = _fitting_symbol_targets(comps, min_mm=options.nts_min_mm)
         # 只有直管/短管参与非比例伸缩；弯头腿和其他零件保持刚性。
@@ -1537,11 +1333,9 @@ def _render_document(
                 rigid, sym_targets)
             projector.fit(all_points, draw_region)
 
-    # Flat 45-degree runs project vertical, exactly like a riser; tilt them
-    # off vertical so the sheet can be read. Checked against the projector as
-    # already configured, so the warp is accounted for, and skipped entirely
-    # when nothing on this sheet collides. 链式布局不用 skew：平移表以
-    # 当时的投影为基准，后置 shear 会把映射整体带偏。
+    # Flat 45-degree runs project vertical like a riser; tilt them off vertical so the
+    # sheet reads (checked through the projector as configured, warp included). 链式布局
+    # 不用 skew：平移表以当时投影为基准，后置 shear 会把映射整体带偏。
     skew_deg = max(0.0, min(20.0, options.skew_deg))
     if (not chain_on and skew_deg
             and _draws_flat_run_vertically(projector, _straight_runs(comps))):
@@ -1559,17 +1353,15 @@ def _render_document(
             projector, doc, comps, reducer_runs,
             proportional=projector.proportional)
     if not projector.proportional:
-        # 小端后直接出图时没有下游管件可携带平移，接续线也要从符号 EXIT
-        # 接出；只改图面锚点，标注仍打印 PCF 声明坐标。按比例下接续锚点
-        # 即声明坐标的真实投影。
+        # 小端后直接出图时无下游管件携带平移，接续线也要从符号 EXIT 接出；只改
+        # 图面锚点，标注仍打印 PCF 声明坐标（按比例下即声明坐标的真实投影）。
         projector.point_offsets.update(_continuation_eccentric_offsets(
             projector, doc, options.continuations, reducer_runs,
             proportional=projector.proportional))
     if not chain_on and not projector.proportional:
-        # 等比符号端面带动连接点（仅示意模式）：管端修剪、焊点吸附、尺寸
-        # goalpost 都随符号实际端面走——端点/尺寸计算"考虑 skey"的统一
-        # 通道；按比例模式符号本就铺满端点，无需平移。
-        # 链式布局已产出全点位置表，本通道与其二选一。
+        # 等比符号端面带动连接点（仅示意模式）：管端修剪、焊点吸附、尺寸 goalpost
+        # 都随符号实际端面走（端点/尺寸计算"考虑 skey"的统一通道）；按比例模式符号
+        # 本就铺满端点无需平移；链式布局已产出全点位置表，二者取一。
         projector.point_offsets.update(_symbol_face_offsets(
             projector, doc, comps, reducer_runs, flange_face_pts))
 
@@ -1577,9 +1369,8 @@ def _render_document(
     _FLANGE_BANDS.clear()      # 每张图重置接带注册表（焊点吸附用）
     _FLANGE_WELDS.clear()
     _FLANGE_BAND_CACHE.clear()  # 接带计算缓存同图失效（proj 偏移已定型）
-    # 管架定向用的管段缓存同样按图重置：它以 id(proj) 为键，批量渲染时
-    # 新 Projector 可能复用已释放对象的 id，命中上一张图的残留缓存会把
-    # 管架对到别的图的管段上（31006 管架画成竖直的根因）。
+    # 管架定向管段缓存按图重置：它以 id(proj) 为键，批量渲染时新 Projector 可能
+    # 复用已释放对象的 id，命中残留缓存会把管架对到别的图的管段上。
     _PIPE_RUNS_CACHE.clear()
     # 符号生长避让：先登记所有非管件的页坐标占位点（含尚未绘制的），
     # 供 _growth_room 判断每个零件两端还有多少可生长空间。
@@ -1621,9 +1412,8 @@ def _render_document(
                                     draw_centre)
 
     # ---- welds (dots only) ------------------------------------------------
-    # The numbered balloons are drawn as an overlay layer by the weld-tracking
-    # system, not on the sheet -- but every weld's page position is still
-    # captured here so the weld-map upload has something to anchor to.
+    # Numbered balloons live in the weld-tracking overlay, not on the sheet; every
+    # weld's page position is still captured here so the weld-map upload has an anchor.
     welds = derive_welds(doc, detect_ffw=options.detect_ffw,
                          spool_key=options.spool_key)
     weld_positions: list[WeldPosition] = []
@@ -1674,8 +1464,8 @@ def _render_document(
         _draw_nts_stamp(canvas, draw_region)
 
     # ---- continuations (before dims/callouts: they are the bigger blocks) ---
-    # 分图（同管线断开）→ 邻图紧邻零件画虚线幻影 + SEE ISO/SHT/坐标标注；
-    # 跨管线接点（不同线号）→ 虚线示意短管 + SEE ISO 对方线号/坐标标注。
+    # 分图（同管线断开）→ 邻图紧邻零件虚线幻影 + SEE ISO/SHT/坐标标注；跨管线
+    # 接点（不同线号）→ 虚线示意短管 + SEE ISO 对方线号/坐标标注。
     drawn_continuations: list[Continuation] = []
     for cont in options.continuations:
         if not cont.label:
@@ -1698,8 +1488,8 @@ def _render_document(
                 "joint")
 
     # ---- END-POSITION 终点坐标（纯声明驱动，无几何判断、无接续线）----------
-    # PCF 用 END-POSITION-OPEN/CLOSED 声明管线终点：按声明点直接标坐标块。
-    # 与接图点重合时不再重复（接图块里已带同一份坐标行）。
+    # PCF 用 END-POSITION-OPEN/CLOSED 声明终点：按声明点直接标坐标块；与接图点
+    # 重合时不重复（接图块里已带同一份坐标行）。
     tol_end = geometry.model_tolerance(doc)
     for point in _declared_end_positions(doc):
         if any(geometry.dist(point, c.point) <= tol_end
@@ -1739,8 +1529,8 @@ def _render_document(
                                   tolerance=geometry.model_tolerance(doc) * 4)
 
     # ---- furniture ----------------------------------------------------------
-    # 预览模式仍画北向标/注释/NTS 戳（属于图面内容），只跳过
-    # 图框/BOM/切割表/标题栏等图纸家具。
+    # 预览模式仍画北向标/注释/NTS 戳（图面内容），只跳过图框/BOM/切割表/标题栏
+    # 等图纸家具。
     _draw_north_arrow(canvas, projector, (draw_region[0] + 8, draw_region[1] + 10))
     bom_truncated = cut_truncated = False
     if not options.preview:
@@ -1796,21 +1586,16 @@ def _box_edge_toward(pos: Vec2, target: Vec2, w: float, h: float) -> Vec2:
     return _v2_add(pos, _v2_scale(d, min(tx, ty, 1.0)))
 
 
-# The sheet's reading size, in points. The fab/spool label set it -- it is
-# the mark a fabricator on a noisy shop floor has to read first -- and the
-# dimension values and title-block entries are held to the same size, because
-# they are read in the same conditions and at the same arm's length. They used
-# to be 6.0 and 6.5/5.0 against the label's 8, which read as small print.
+# The sheet's reading size, in points: set by the fab/spool label (the mark a fabricator
+# must read first); dimension values and title-block entries held to the same size.
 _SHEET_FONT = 8.0
 
-# Whitespace a spool label must keep from any drawn line, in page mm before
-# spread. Merely not intersecting is not enough: a box that grazes a
-# centreline is legible but reads as crowded onto the run it names.
+# Whitespace a spool label must keep from any drawn line, in page mm before spread:
+# not intersecting is not enough -- a box that grazes a centreline reads as crowded.
 _SPOOL_LABEL_CLEARANCE_MM = 2.2
 
-# How far off the centreline an "F.W." tag stands, in page mm before spread.
-# Clear of a 0.55 mm run line and its weld dot, close enough to still read as
-# belonging to that joint.
+# How far off the centreline an "F.W." tag stands, in page mm before spread:
+# clear of the run line and its weld dot, close enough to read as that joint's tag.
 _FW_STANDOFF_MM = 3.6
 
 
@@ -1849,10 +1634,9 @@ def _draw_spool_annotations(canvas: _Canvas, proj: Projector,
         canvas.pdf.set_font("Helvetica", size=_SHEET_FONT)
         w = canvas.pdf.get_string_width(value) + 4.0
         h = 5.0
-        # Spool labels are the first thing placed on the sheet, so without
-        # geometry avoidance the very first candidate is accepted whatever it
-        # lands on -- which is how these ended up struck through by the run
-        # they name.
+        # Spool labels are the first thing placed on the sheet, so without geometry
+        # avoidance the very first candidate is accepted whatever it lands on --
+        # struck through by the run they name.
         pos = canvas.place_label(anchor, w, h, draw_centre, min_leader=12.0,
                                  avoid_geometry=True,
                                  clearance=_SPOOL_LABEL_CLEARANCE_MM)
@@ -1890,10 +1674,9 @@ def _draw_spool_annotations(canvas: _Canvas, proj: Projector,
                 canvas.line(edge, dot, width=0.2, record=False)
             continue
 
-        # Set parallel to the centreline and stood off it, the way a field
-        # weld is tagged by hand. Free-placed horizontally the tag came to
-        # rest across the pipe at whatever angle the run happened to be, and
-        # four letters lying over a centreline are not readable.
+        # Set parallel to the centreline and stood off it, the way a field weld is
+        # tagged by hand; free-placed, four letters lying over a centreline are
+        # not readable.
         angle = math.degrees(math.atan2(-along[1], along[0]))
         if angle > 90 or angle < -90:
             angle += 180          # never upside down
@@ -1902,11 +1685,9 @@ def _draw_spool_annotations(canvas: _Canvas, proj: Projector,
         if off[0] * away[0] + off[1] * away[1] < 0:
             off = _v2_scale(off, -1.0)      # stand it off outwards
         pos = _v2_add(dot, _v2_scale(off, _FW_STANDOFF_MM * canvas.spread))
-        # Knock the background out before drawing: a near miss still leaves a
-        # centreline or an extension line running through the letters. The
-        # knockout is rotated *with* the text -- squared to the page it is
-        # much taller than the glyphs at 30 degrees and takes a bite out of
-        # the run line and the weld dot it is standing next to.
+        # Knock the background out before drawing, rotated *with* the text: squared
+        # to the page the knockout is much taller than the glyphs at 30 degrees and
+        # takes a bite out of the run line and the weld dot next to it.
         with canvas.pdf.local_context():
             canvas.pdf.set_fill_color(255, 255, 255)
             with canvas.pdf.rotation(angle, pos[0], pos[1]):
@@ -1920,18 +1701,12 @@ def _draw_spool_annotations(canvas: _Canvas, proj: Projector,
 # ---------------------------------------------------------------------------
 # Continuation callouts
 #
-# Every point where the piping runs off the sheet is marked with the run
-# carried a little past the hand-off, an arrowhead on the end of it, and a
-# block naming the drawing it continues onto plus the plant coordinates of
-# that point. The coordinates are what lets a fitter or a surveyor tie the
-# two sheets together in the field without hunting for the matching end, so
-# they are printed whether or not the drawing name resolved.
-#
-# The name is the NEXT RENDERED DRAWING. It cannot come from the PCF: the
-# file knows only which *pipeline or spool* carries on, and a sheet is not a
-# spool -- a distance split puts several spools on one drawing. See
-# continuations.py for how the set of sheets is cross-matched. The file's own
-# reference is used only as a last resort, and says so in the warnings.
+# Every sheet exit: run carried a little past the hand-off with an arrowhead, plus a
+# block naming the NEXT RENDERED DRAWING it continues onto plus the point's plant
+# coordinates. Coordinates are printed whether or not the name resolved -- a fitter
+# ties the two sheets together in the field by them, not by name. The PCF knows only
+# which pipeline/spool carries on, never sheets; see continuations.py for the
+# cross-matching contract.
 
 _CONT_FONT = 5.2
 _CONT_CAP = _cap_height_mm(_CONT_FONT)
@@ -2343,18 +2118,14 @@ def _draw_line_tie_in(canvas: _Canvas, proj: Projector, cont: Continuation,
 
 def _olet_header_points(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     """For each olet, the two end points of the header run it sits on.
-
-    A set-on olet record carries only its CENTRE-POINT (on the header
-    centreline) and its branch point -- it has no end points of its own, and
-    it lands mid-pipe so the connectivity graph does not join it to the
-    header either. To draw the fitting *tangent to the pipeline*, as a
-    fabricator expects, we have to go and find the run its centre lies on.
-
-    Returns the run's own end points rather than a direction, so the caller
-    can project both. The header is *drawn* as the straight page segment
-    between those two projections, so a direction taken from them is exactly
-    parallel to the line on the sheet -- which a direction sampled a short
-    way along the axis is not, once the not-to-scale warp has had its way.
+    
+    A set-on olet carries only its CENTRE-POINT and branch point -- no end
+    points of its own, and connectivity does not join it to the header; the
+    run behind its centre is found here so the fitting draws tangent to the
+    pipeline. Run end points are returned rather than a direction: the
+    header is drawn as the straight segment between those projections, so a
+    direction from them is exactly parallel to the drawn line (a model-space
+    sample is not, post-warp).
     """
     comps = doc.real_components()
     tol = geometry.model_tolerance(doc)
@@ -2390,13 +2161,12 @@ _RUN_AXIS_CLASSES = {"PIPE", "FLANGE", "VALVE"}
 def _run_axis_at(comp: Component, at: Vec3, tol: float
                  ) -> tuple[Vec3, Vec3] | None:
     """Two points on ``comp``'s centreline through the port ``at``.
-
-    Straight-bodied components hand back their own two ends. A fitting has to
-    say which of its legs the caller is standing on: an elbow's end-to-end
-    chord is the diagonal across the bend, and a tee's is its run whichever
-    port you arrived at, so taking either blindly gives a direction the pipe
-    never goes. Returns None when ``at`` is not on this component, or when
-    the leg through it is too short to give a direction.
+    
+    Straight-bodied components hand back their own ends; a fitting must say
+    which leg the caller is on -- an elbow's end-to-end chord is the bend
+    diagonal and a tee's chord is its run whichever port you arrived at.
+    Returns None when ``at`` is not on this component or the leg is too
+    short.
     """
     cls = classify(comp.type, comp.skey)
     eps = comp.end_points
@@ -2440,24 +2210,14 @@ def _run_axis_at(comp: Component, at: Vec3, tol: float
 
 def _reducer_runs(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     """For each reducer, the end points of the run it is welded into.
-
-    An eccentric reducer's two weld ends sit on two *different* centrelines,
-    offset across the run by half the difference in outside diameters. The
-    chord between them is therefore tilted off the pipe axis -- and a symbol
-    built on that chord has no edge parallel to the pipeline, which is the
-    one thing an eccentric reducer has to show. So the axis is taken from a
-    neighbour instead.
-
-    Returns the neighbour's own end points, like ``_olet_header_points``, so
-    the caller can project both: the direction between two projections is
-    exactly parallel to the line drawn on the sheet, which a direction
-    sampled in model space is not once the not-to-scale warp has had its way.
-
-    Reducers weld straight onto elbows and tees often enough that those count
-    too, via ``_run_axis_at`` -- but on the leg the reducer is actually on,
-    never the fitting's end-to-end chord. The neighbour on the *large* end is
-    preferred, since the body is drawn from that end, but either does: both
-    runs are parallel.
+    
+    An eccentric reducer's two weld ends sit on different centrelines, so
+    the chord between them is tilted off the pipe axis and a symbol built on
+    it has no edge parallel to the pipeline -- the one thing an eccentric
+    reducer must show. The axis comes from a neighbour via ``_run_axis_at``
+    (elbows/tees count, on the leg the reducer is actually on), preferring
+    the large end; neighbour end points are returned so projections give an
+    exactly parallel direction (cf. ``_olet_header_points``).
     """
     comps = doc.real_components()
     tol = geometry.model_tolerance(doc)
@@ -2523,9 +2283,8 @@ def _eccentric_small_end_exit(
     e2 = _v2_sub(eb, ea)
     if _v2_len(e2) > 1e-9 and (e2[0] * v[0] + e2[1] * v[1]) * centre < 0:
         v = (-v[0], -v[1])
-    # 出口跟随符号：按比例=实际端距投影（旧行为）；示意=等比自然
-    # 长度（与 _draw_symbol_2pt 同款规则），小端管线落符号真实出口
-    # schematic_scale：链式整图缩放时符号同倍缩小，出口偏移也同倍
+    # 出口跟随符号：按比例=实际端距投影；示意=等比自然长度（与 _draw_symbol_2pt
+    # 同款规则），小端管线落符号真实出口；schematic_scale 时出口偏移同倍缩小。
     sy = 4.5 / (2.0 * big_half)
     sy *= getattr(proj, "schematic_scale", 1.0)
     if proportional:
@@ -2632,10 +2391,9 @@ def _natural_run_length(skey: str | None) -> float | None:
 
 def _chain_pipe_len(world_len: float, scale: float = 1.0) -> float:
     """链式布局的直管图面长度档位（真实长度单调分档，保长短关系）。
-
-    基准档位 ×1.5（2026-11-14 定稿）：管线拉长腾出注释空间，全图风格
-    一致（固定倍数，不做自适应填满）。scale 是管线自适应因子：首轮
-    1.0，超幅时按缩放比重摆——只有直管档位与腿收缩，符号尺寸恒定。
+    
+    基准档位 ×1.5（管线拉长腾出注释空间，固定倍数不做自适应填满）。
+    ``scale`` 是管线自适应因子：首轮 1.0，超幅时按缩放比重摆。
     """
     if world_len < 500.0:
         b = 12.0
@@ -2686,9 +2444,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         return (d[0] / n, d[1] / n) if n > 1e-9 else None
 
     def _sym_dir(a: Vec3, b: Vec3) -> Vec2 | None:
-        # 直通符号件（阀/法兰/变径…）的走向取主轴投影：偏心变径两端点
-        # 带垂直于管轴的偏心量，直接投影弦线会把符号画歪。主轴占比 <90%
-        # 的是真斜管（如 45° 平面走向），保留弦线投影
+        # 直通符号件（阀/法兰/变径…）走向取主轴投影：偏心变径两端点带垂直偏心量，
+        # 直接投影弦线会画歪符号；主轴占比 <90% 是真斜管（45° 平面走向），保留弦线。
         w = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
         ln = math.sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2])
         if ln <= 1e-9:
@@ -2702,18 +2459,14 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
 
     def _cps(c: Component) -> list[Vec3]:
         pts = [p.xyz for p in c.connection_points()]
-        # OLET/TEE-STUB 的主管贴附点存在 CENTRE-POINT（connection_points
-        # 不收）：不收进来走链就走不过主管——支管台两侧的管子会各成一组，
-        # 后到的直管只能横跨两组之间的间隙（斜弦断桥的根因）
+        # OLET/TEE-STUB 的主管贴附点存在 CENTRE-POINT（connection_points 不收）：
+        # 不收进来走链走不过主管——支管台两侧管子各成一组，后到直管横跨间隙。
         if classify(c.type, c.skey) == "OLET":
             pts += [p.xyz for p in c.centre_points]
         return pts
 
-    # 垫片两端点隔开的"共点"是假共点：垫片常只有 4.5mm 厚、小于整图
-    # 连接容差 tol，法兰面与阀端会被 tol 判成同点，BFS 于是跨过垫片把阀
-    # 直接放到法兰面上（阀 natural 长度从法兰面起排），随后垫片又把阀
-    # 端点写到 +1mm——符号绘制从阀端点起画 natural 长度，与布局错位
-    # 1mm，恰把另一侧垫片缝整个吃掉。真实走链必须穿过垫片，不能跳过。
+    # 垫片两端点隔开的"共点"是假共点：垫片厚小于整图连接容差 tol，BFS 会跨过垫片
+    # 致符号绘制与布局错位、垫片缝被吃掉——真实走链必须穿过垫片，不能跳过。
     gasket_ends: list[tuple[Vec3, Vec3]] = []
     for c in real:
         if classify(c.type, c.skey) == "GASKET":
@@ -2772,17 +2525,13 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         刚性件（弯头/三通/符号/点件）登记闭合修正，直管直接横跨。
         """
         cls = classify(comp.type, comp.skey)
-        # 垫片常只有 4.5mm 厚，小于整图连接容差；不能用 tol 把另一端
-        # 滤成“同点”，否则阀/法兰直接相邻，垫片的图面空隙被吞掉。
-        # 注意：1e-6 只给垫片——通用化会让 BFS 穿过短管/点件产生闭合差
-        # 级联（box-shift 整组平移把弯头腿撕到别组坐标，BR3R-30001）。
+        # 垫片厚小于整图连接容差：不能用 tol 把另一端滤成“同点”，否则垫片图面空隙
+        # 被吞。1e-6 只给垫片——通用化会让 BFS 穿过短管/点件产生闭合差级联。
         point_tol = 1e-6 if cls == "GASKET" else tol
         others = [c for c in _cps(comp) if geometry.dist(c, s) > point_tol]
         if cls == "PIPE" and not others:
-            # 短管拯救：两端距在 tol 内的短管（stub/nipple）也要占住图面
-            # 档位长度，否则远端被吸附回近端、短管画成零长度消失。
-            # 只写占位、不延伸 frontier——短管不做走链通道，邻件保持
-            # 原有到达路径（防闭合差连锁撕裂）。
+            # 短管拯救：两端距在 tol 内的短管也要占住图面档位长度，否则远端被吸回
+            # 近端画成零长度；只写占位不延伸 frontier——短管不做走链通道（防闭合差连锁）。
             exact = [c for c in _cps(comp) if geometry.dist(c, s) > 1e-6]
             if exact:
                 far = max(exact, key=lambda c: geometry.dist(s, c))
@@ -2850,9 +2599,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             for c in others:
                 _write(idx, c, p_in, s)
         else:
-            # 双端符号件（阀/法兰/变径/短接/仪表…）：固定自然长度直通；
-            # 多余接点按腿长展开（多口件兜底）。垫片不画符号，但要占住
-            # 一小段图面长度——否则法兰面与阀面/盲板贴死，垫片空隙丢失
+            # 双端符号件（阀/法兰/变径/短接/仪表…）：固定自然长度直通，多余接点按
+            # 腿长展开；垫片不画符号但占住一小段图面长度，否则法兰面与阀面贴死。
             natural = _natural_run_length(comp.skey)
             if natural is None:
                 natural = 1.0 if cls == "GASKET" else 6.0
@@ -2987,9 +2735,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             f"{next((c for c in cps if c in pos), None)}")
         if not cps:
             continue
-        # 跨组共点：接点已在已摆结构上（如支座坐在弯头端点）——锚在
-        # 原位置接着摆，不另起原点、不参与竖排打包，否则共点被撕成
-        # 两个图面位置（弯头腿被拽长的根因之一）
+        # 跨组共点：接点已在已摆结构上（如支座坐在弯头端点）——锚在原位置接着摆，
+        # 不另起原点、不参与竖排打包，否则共点被撕成两个图面位置。
         anchor0 = next((c for c in cps if c in pos), None)
         if anchor0 is not None:
             s = anchor0
@@ -3019,13 +2766,11 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             pos[s] = (0.0, 0.0)
         frontier: list[tuple[Vec3, Vec2]] = []
         _place(start, comp, s, pos[s], din, frontier)
-        # 起步件近端（s 侧）的邻件也要走链：frontier 只带远端出口，近端
-        # 邻件落不到链上会各自另起组——盲法兰被甩出阀组、垫片链断开的
-        # 根因。行进方向取反（从 s 向组外走）
+        # 起步件近端（s 侧）的邻件也要走链：frontier 只带远端出口，近端邻件落不到链
+        # 上会各自另起组（盲法兰被甩出阀组）。行进方向取反（从 s 向组外走）。
         frontier.append((s, _v2_scale(din, -1.0)))
-        # 非管优先、直管靠后（deferred）：环路尽量由直管闭合——直管是
-        # 弹性件，横跨现状间隙即可；无管可闭合时由 _absorb_closures
-        # 把闭合差摊进闭合侧最顺向的那根直管。
+        # 非管优先、直管靠后（deferred）：环路尽量由直管闭合——直管是弹性件，横跨
+        # 现状间隙即可；无管可闭合时由 _absorb_closures 摊进闭合侧最顺向的直管。
         pending = deque((start, pt, d) for pt, d in frontier)
         deferred: deque[tuple[int, Vec3, Vec2, int, Vec3]] = deque()
         while pending or deferred:
@@ -3083,9 +2828,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
     if not pos:
         return None
 
-    # 中段贴附件（支座/仪表等挂在管壁中段、与任何接点都不重合的件）
-    # 自成一个松散组：先标记并排除出竖排打包，打包后再按所挂直管的
-    # 最终图面位置整组平移吸附（打包前吸附会被主结构的平移撕掉）
+    # 中段贴附件（支座/仪表挂在管壁中段、不与任何接点重合）自成松散组：排除出竖排
+    # 打包，打包后再按所挂直管的最终图面位置整组平移吸附（打包前吸附会被撕掉）。
     pipe_segs: list[tuple[Vec3, Vec3]] = []
     for c in real:
         if classify(c.type, c.skey) != "PIPE":
@@ -3118,9 +2862,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         if hit:
             to_snap.append((keys, *hit))
         elif len(keys) == 1:
-            # 离轴单点松散件（支座/仪表挂在管端外、不在任何管线轴上）：
-            # 不进打包、不写 point_offsets——绘制时 page() 最近段插值把
-            # 它钳到所挂管线的最终图面位置（拉长后不再悬空）
+            # 离轴单点松散件（支座/仪表挂在管端外、不在任何管线轴上）：不进打包、
+            # 不写 point_offsets——绘制时 page() 最近段插值钳到所挂管线最终图面位置。
             free_drop.add(keys[0])
         else:
             kept_boxes.append(box)
@@ -3137,11 +2880,9 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         for k in keys:
             pos[k] = (pos[k][0] + dx, pos[k][1] + dy)
         cursor_y += (gy1 - gy0) + 14.0
-    # 贴附件吸附：改在最终 rebuild 之后按 new_pos 线段插值执行（见下方
-    # 二次吸附）——打包后此刻吸附会被随后的弹性拉伸撕掉（管线边逐轮
-    # ×s 累计拉长、贴附点走自由分支刚性缩放，变换不一致=掉线根因）
-    # 未覆盖点（孤立接点/中心点）吸附到世界最近的已布点——必须在打包
-    # 之后做，否则吸附点留在锚点打包前的旧位置上（飞出件的根因）
+    # 贴附件吸附：改在最终 rebuild 之后按 new_pos 线段插值执行——打包后
+    # 此刻吸附会被随后的弹性拉伸撕掉；未覆盖点（孤立接点/中心点）也必须
+    # 在打包之后吸附到世界最近的已布点，否则留在打包前的旧位置上（飞出）。
     mapped = list(pos)
     unmap_twin: dict[Vec3, Vec3] = {}
     for comp in real:
@@ -3166,11 +2907,10 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
     warn = None
     if s < 0.999:
         warn = f"chain layout scaled to {s:.2f} to fit the sheet"
-    # 按边弹性缩放（符号恒定的关键）：超幅只压管线边——直管/弯头/三通
-    # 摆放的边 ×s，符号/垫片/点件边刚性跟随（长度不变）。全局绕中心乘 s
-    # 会把符号端点对一起压近，符号库双点仿射随之把符号画小（管线拉长
-    # 白拉）。rigid_symbols=False（档位触底仍超幅的极端兜底）时全体弹性，
-    # 退回整体缩小。沿摆放谱系按写入序重放：parent 必先于 child 入表。
+    # 按边弹性缩放（符号恒定的关键）：超幅只压管线边（直管/弯头/三通摆放
+    # 的边 ×s），符号/垫片/点件边刚性跟随长度不变——全局绕中心乘 s 会把
+    # 符号端点对一起压近、符号随之画小。rigid_symbols=False 极端兜底时
+    # 全体弹性退回整体缩小。沿摆放谱系按写入序重放：parent 先于 child。
     flex_cls = ("PIPE", "ELBOW", "TEE") if rigid_symbols else ()
     new_pos: dict[Vec3, Vec2] = {}
     for k in pos:
@@ -3193,8 +2933,7 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             new_pos[k] = (base[0] + (p[0] - src[0]) * f,
                           base[1] + (p[1] - src[1]) * f)
     # 贴附件二次吸附（最终空间）：按世界比例 t 插值到管线段的最终图面
-    # 位置——rebuild 的弹性拉伸只作用在管线边上，贴附点若沿用打包后的
-    # 旧位置会被撕离管线（拉长模式下的掉线根因），此处整组平移归位
+    # 位置——贴附点沿用打包后旧位置会被 rebuild 弹性拉伸撕离管线，整组平移归位。
     for keys, k, a, b, t in to_snap:
         if a not in new_pos or b not in new_pos or k not in new_pos:
             continue
@@ -3220,20 +2959,12 @@ def _symbol_face_offsets(proj: "Projector", doc: PcfDocument,
                          ) -> dict[Vec3, Vec2]:
     """等比符号端面带动连接点的图面平移（端点/尺寸锚随符号走）。
 
-    双端符号（VALVE/FLANGE/…）：符号恒等比后 EXIT 落在自然长度处而非
-    模型端点——把两侧模型连接点的投影平移到符号实际端面，管端、焊点、
-    尺寸 goalpost 投影时自动落在符号面上（通道与偏心变径小端一致：
-    point_offsets，点对点精确匹配）。同一模型点被多个管件注册（直焊
-    法兰-阀门等）时取均值——两边画到同一点保持相连。
-
-    弯头/三通**不注册**（2026-11-13 试过固定腿长+弦线交点两版均造成
-    斜向弯头与管线折角/脱开，用户定稿回退）：腿画到模型端点，角度
-    随管线（正确），两侧长度不强制等长，短的由 _grown_leg_end 补长。
-
-    法兰端点重合的按接带 top 定 START 面（含垫片空隙）；非重合法兰按
-    配合面翻转让 START 对准面。偏心变径已由 _eccentric_small_side_offsets
-    单独接管，此处跳过以免双算。与绘制端（_draw_component 符号调度）
-    同一套规则的预计算镜像；两侧规则改动必须同步。
+    双端符号件恒等比后 EXIT 落在自然长度处而非模型端点：把两侧模型连接
+    点的投影平移到符号实际端面（经 point_offsets 点对点匹配，同一模型点
+    被多个管件注册取均值保持相连）。弯头/三通不注册——腿画到模型端点、
+    角度随管线，短腿由 _grown_leg_end 补长。偏心变径由
+    _eccentric_small_side_offsets 单独接管以免双算。与绘制端
+    （_draw_component 符号调度）同一套规则的预计算镜像，两侧必须同步。
     """
     real = [c for c, _r in comps]
     desired: dict[Vec3, list[Vec2]] = {}
@@ -3293,26 +3024,14 @@ def _symbol_face_offsets(proj: "Projector", doc: PcfDocument,
 def _eccentric_offset_pairs(doc: PcfDocument,
                             runs: dict[int, tuple[Vec3, Vec3]],
                             ) -> list[set[tuple[float, float]]]:
-    """Coordinate-value pairs the not-to-scale warp must leave alone.
+    """Coordinate-value intervals the not-to-scale warp must leave alone.
 
-    An eccentric reducer's two weld ends are on centrelines offset across the
-    run by half the difference in outside diameters -- half an inch to an
-    inch on the sizes these drawings carry. That is fitting geometry, not a
-    leg of pipe, and the warp has no business stretching it to its minimum
-    visible span: doing so bends the pipeline by seven times the real offset
-    at every reducer, and leaves the reducer symbol unable to show the flat
-    side that the offset *is*.
-
-    Returns one set per axis of ``(lo, hi)`` **intervals**, rounded to match
-    the warp's own quantisation. Every gap inside such an interval is left at
-    true proportion, not merely a gap that spans it exactly. The old
-    exact-pair rule failed on any sheet where something else sat at a
-    coordinate between the reducer's two ends -- the rest of the spool
-    usually does, since the reducer straddles the run centreline -- and on
-    those sheets the offset was inflated to two full ``nts_min_mm`` steps.
-    That is what tore the reducer symbol off the small side of its own run.
-    An interval is only ever the width of one fitting's eccentricity, so
-    nothing a fabricator needs to see can hide inside it.
+    An eccentric reducer's two weld ends sit on centrelines offset across the
+    run by half the outside-diameter difference -- fitting geometry, not a
+    pipe leg: stretching it to the minimum visible span bends the pipeline and
+    hides the flat side the offset *is*. Returns one set per axis of (lo, hi)
+    intervals rounded to the warp's quantisation; every gap inside an interval
+    keeps true proportion.
     """
     keep: list[set[tuple[float, float]]] = [set(), set(), set()]
     for comp in doc.real_components():
@@ -3343,12 +3062,10 @@ def _fitting_symbol_targets(comps: list[tuple[Component, str]],
                             ) -> list[list[tuple[float, float, float]]]:
     """直管件（阀门/法兰/同心变径/短接等单轴双端件）的示意尺寸目标。
 
-    每个件的坐标区间在 warp 中固定映射为 max(符号自然图面长度,
-    min_mm)——与旧版"每个间隙 ≥nts_min"给零件的 8mm 跨度一致，但上限
-    封顶在示意尺寸：不再被拉长（FLWN 曾被组斜率拉到 19mm）。非比例
-    伸缩只由直管吸收。跨轴件（弯头/三通）不走此机制：它们的腿即管段
-    空间，由间隙 clamp 与腿外延处理；偏心变径由 keep 保护真实偏心量。
-    返回 [axis] -> [(lo, hi, target_mm)]。
+    每个件的坐标区间在 warp 中固定映射为 max(符号自然图面长度, min_mm)，
+    上限封顶示意尺寸，非比例伸缩只由直管吸收。跨轴件（弯头/三通）不走此
+    机制：腿即管段空间，由间隙 clamp 与腿外延处理；偏心变径由 keep 保护
+    真实偏心量。返回 [axis] -> [(lo, hi, target_mm)]。
     """
     out: list[list[tuple[float, float, float]]] = [[], [], []]
     try:
@@ -3372,9 +3089,8 @@ def _fitting_symbol_targets(comps: list[tuple[Component, str]],
         ax = axes[0]
         lo, hi = sorted((round(a[ax], 6), round(b[ax], 6)))
         if c == "GASKET":
-            # 垫片模型厚度（~1.5mm）在示意比例下不可见：warp 固定为
-            # 0.6mm 图面间隙——法兰面与配合件之间露出垫片位，法兰
-            # EXIT 仍精确落焊端，无需平移符号
+            # 垫片模型厚度（~1.5mm）示意比例下不可见：warp 固定为 0.6mm 图面
+            # 间隙露出垫片位，法兰 EXIT 仍精确落焊端，无需平移符号
             out[ax].append((lo, hi, _GASKET_GAP_MM))
             continue
         found = find_symbol_full(comp.skey or "")
@@ -3399,18 +3115,12 @@ def _fitting_symbol_targets(comps: list[tuple[Component, str]],
 def _olet_branch_connected(doc: PcfDocument) -> set[int]:
     """Ids of olets whose outlet actually has something connected to it.
 
-    An olet record always carries a BRANCH1-POINT, whether or not the branch
-    was ever piped: it says where the outlet *faces*, not that anything is on
-    it. Running the branch centreline out to that point unconditionally
-    litters the sheet with long bare stubs leaving fittings that, on this
-    spool, are spare or capped -- and a fabricator reads a centreline as
-    "pipe continues here".
-
-    "Connected" is any connection point of another real component landing on
-    the olet's branch point, using the same tolerance as the connectivity
-    graph. Components on *other* sheets do not count: this is a per-sheet
-    document, and if the branch is piped elsewhere the stub is not this
-    drawing's to show.
+    BRANCH1-POINT says where the outlet *faces*, not that anything is on it;
+    running the branch centreline out unconditionally litters the sheet with
+    bare stubs off spare or capped fittings. "Connected" = any connection
+    point of another real component landing on the branch point at
+    connectivity-graph tolerance; components on other sheets do not count --
+    a branch piped elsewhere is not this drawing's to show.
     """
     comps = doc.real_components()
     olets = [c for c in comps
@@ -3568,15 +3278,10 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     reducer_runs: dict[int, tuple[Vec3, Vec3]] | None = None,
                     ) -> Vec2 | None:
     cls = classify(comp.type, comp.skey)
-    # 宽度体系按出图模式分开：
-    # - 按比例（真实比例图）：孔径正比宽度 2·_bore_half_w(D)；法兰杠与
-    #   法兰端口的阀/方块再乘 B16.5 突面比例 _flange_face_ratio(D)
-    #   （1/2"≈1.64 → 24"≈1.14，随管径单调收窄），整组同宽读作一个
-    #   法兰连接。
-    # - 不按比例（示意）：退回固定尺寸——法兰杠 flange_bar_mm、阀领结
-    #   半宽 1.9、符号 4.5 恒等比（ISOGEN 示意惯例：符号统一可读大小，
-    #   不随管径变化）。
-    # 缺孔径时按比例模式回退 flange_bar_mm 固定杠。
+    # 宽度体系按出图模式分开：按比例=孔径正比宽度 2·_bore_half_w(D)，法兰
+    # 杠与法兰端口的阀/方块再乘 B16.5 突面比例 _flange_face_ratio(D)（1/2"
+    # ≈1.64→24"≈1.14），整组同宽读作一个法兰连接；不按比例（示意）退回
+    # 固定尺寸（ISOGEN 惯例），缺孔径时按比例模式回退 flange_bar_mm 固定杠。
     prop_mode = bool(getattr(proj, "proportional", False))
     bore_in = _bore_to_in(comp.bore, doc.units_bore) if prop_mode else None
     if bore_in is not None:
@@ -3601,16 +3306,11 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     cos = [proj.page(p.xyz) for p in comp.co_ords]
     pps = [proj.page(p.xyz) for p in comp.port_points]
 
-    # Flanges arrive misclassified often enough (weld-neck flanges exported
-    # as COUPLING records) that the symbol dispatch trusts the description
-    # too, not just the record type. Material accounting still uses
-    # classify() alone, so the BOM is untouched by this.
-    # 符号库优先（统一入口）：SKEY 查到几何的双端组件先画官方符号——
-    # START(首点)→eps[0]、EXIT(收笔点)→eps[1] 双点仿射对齐。
-    # 手写分支仅作无符号时的回退；支撑(SUPPORT)走自己的方向模式分支。
-    # 注意：必须先于下方 flange_face 特殊分支，法兰符号才优先生效。
-    # 爆破片（SAFETY-DISC，SKEY=RD）在 classify 里归 GASKET，但官方
-    # 符号必须画——只让普通垫片走"不画、项号并父标"分支。
+    # 法兰常被误导出为 COUPLING 记录：符号派发兼看 description，BOM 仍只用
+    # classify() 不受影响。符号库优先（统一入口）：SKEY 查到几何的双端组件
+    # 先画官方符号（START→eps[0]、EXIT→eps[1] 双点仿射），手写分支仅作回退；
+    # 必须先于下方 flange_face 特殊分支。SAFETY-DISC 在 classify 归 GASKET
+    # 但官方符号必须画——只让普通垫片走"不画、项号并父标"分支。
     sym_first = cls == "GASKET" and (
         (comp.type or "").upper().replace("_", "-").startswith("SAFETY-DISC")
         or type_from_skey(comp.skey) == "SAFETY-DISC")
@@ -3624,9 +3324,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     and is_weld_coupling(comp.type, comp.description,
                                          comp.skey))
     # 按比例模式整体走上游手绘路径（轴向=真实端点、横向=固定可读页宽），
-    # 不走 SKEY 符号——符号 X 轴对齐管轴的仿射对齐在偏心件上靠下游平移
-    # 补偿，与"忠实坐标"语义冲突。SAFETY-DISC（sym_first）无手绘等价物，
-    # 仍走符号库。
+    # 不走 SKEY 符号——符号 X 轴仿射对齐在偏心件上靠下游平移补偿，与
+    # "忠实坐标"语义冲突；SAFETY-DISC（sym_first）无手绘等价物仍走符号库。
     if (cls in ("VALVE", "FLANGE", "ELBOW", "REDUCER", "COUPLING", "FILTER",
                 "INSTRUMENT", "MULTIPORT", "OLET") or sym_first) \
             and not skip_sym and len(eps) >= 2 \
@@ -3637,9 +3336,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
         sp0, sp1 = eps[0], eps[1]
         best = None            # (距离, 焊点=最近管端, 管段远端)
         if _v2_len(_v2_sub(eps[1], eps[0])) < 0.5:
-            # 两端点几乎重合（平焊法兰 face-to-face≈0）：轴向取最近管段。
-            # 方向感必须指向该管段的"远端"（从接头沿管道离开）——直接用管段
-            # 方向向量的正负是随机的，会把符号翻进阀门里。
+            # 两端点几乎重合（平焊法兰 face-to-face≈0）：轴向取最近管段，
+            # 方向必须指向该管段"远端"（沿管道离开接头），否则符号翻进阀门里。
             try:
                 for c in doc.real_components():
                     if classify(c.type, c.skey) != "PIPE" or len(c.end_points) < 2:
@@ -3670,15 +3368,13 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                 face = proj.page(fpt)
                 if _v2_len(_v2_sub(face, eps[1])) < _v2_len(_v2_sub(face, eps[0])):
                     sp0, sp1 = eps[1], eps[0]      # 配合面在 eps[1]：翻转使 START 对准面
-                # 登记焊端：管端与焊点都吸到 EXIT 锚定的这一点。
-                # 不做垫片间隙平移——平移会把 EXIT 推过焊端 0.6mm，
-                # 符号与管端/焊点错开（实测偏差就是它）
+                # 登记焊端：管端与焊点都吸到 EXIT 锚定的这一点；不做垫片
+                # 间隙平移——平移会把 EXIT 推过焊端、符号与管端/焊点错开
                 _FLANGE_WELDS.append(sp1)
         axis_override = None
         if cls == "REDUCER":
-            # 偏心大小头：管轴取主管走向（原项目 reducer_runs，两端同轴
-            # 导出的场合），符号 X→管轴，偏心量按符号 Y 保留——不能沿
-            # p0→p1 对角线对齐（会扭斜端面）
+            # 偏心大小头：管轴取主管走向（reducer_runs，两端同轴导出场合），
+            # 符号 X→管轴、偏心量按符号 Y 保留——沿 p0→p1 对角线对齐会扭斜端面
             run = (reducer_runs or {}).get(id(comp))
             if run is not None:
                 a3 = proj.page(run[0])
@@ -3734,10 +3430,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     "room1": _growth_room(sp1, ax_u, id(comp))}
             if cls == "FLANGE":
                 prop_kw["no_grow"] = True
-        # 符号路径宽度体系同样按模式分开：按比例图走孔径正比宽度
-        # （法兰杠/法兰端口件 = flange_bar，其余 = 管径本身宽度 2·
-        # _bore_half_w）；不按比例图不传 width_mm，维持 4.5 恒等比
-        # 固定尺寸（长度校准也在那里）
+        # 符号路径宽度体系同样按模式分开：按比例=孔径正比宽度（法兰杠/法兰
+        # 端口件=flange_bar，其余=管径宽 2·_bore_half_w）；示意=恒定 4.5 不传 width_mm
         sym_w = None
         if prop_mode and bore_in is not None:
             sym_w = (flange_bar if (cls == "FLANGE" or flange_widen != 1.0)
@@ -3930,9 +3624,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                       if run else None)
             connected = (olet_branch_connected is None
                          or id(comp) in olet_branch_connected)
-            # SKEY 符号库优先（WT 支管台等）：主管中心→支管端 两接点对齐，
-            # 跨向仍取世界轴投影；支管未连接或按比例模式（手绘路径）保持
-            # _draw_olet 原行为
+            # SKEY 符号库优先（WT 支管台等）：主管中心→支管端两接点对齐，
+            # 跨向取世界轴投影；支管未连接或按比例模式保持 _draw_olet 原行为
             if connected and not proj.proportional:
                 c3 = (comp.centre_points[0].xyz if comp.centre_points
                       else comp.end_points[0].xyz)
@@ -3988,20 +3681,14 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
 
     elif cls == "COUPLING":
         if len(eps) >= 2:
-            # Measure the gap in the MODEL, not on the page. This used to test
-            # the projected page span, which the not-to-scale warp exists to
-            # inflate: a 1/16" shop-weld gap got stretched past the 3 mm
-            # threshold, so the coupling escaped suppression and stamped its
-            # body line and bar across the weld dot -- the "line on top of a
-            # weld dot" that made every weld read the same.
+            # 联管节 gap 在模型空间测量（页空间会被 NTS warp 拉大误判）：
+            # 超过阈值才画本体线+横杠，小 gap 焊耦合并入焊点语义不画符号
             gap_in = (comp.end_points[0].distance_to(comp.end_points[1])
                       * coord_to_inch_factor(doc.units_coords))
             if gap_in <= GAP_COUPLING_MAX_INCHES and is_weld_coupling(
                     comp.type, comp.description, comp.skey):
-                # Weld couplings surface through weld derivation, not as a
-                # symbol -- but the run still has to read as continuous. The
-                # warp can stretch a 1/16" gap to most of a centimetre, and
-                # leaving it unstroked breaks the centreline at every weld.
+                # 焊接联管节经焊点派生呈现、不画符号，但中心线仍须连续：
+                # warp 可把 1/16" gap 拉到近 1cm，不描线会在每个焊点处断线
                 canvas.line(eps[0], eps[1], width=0.55)
                 return None
             axis = _v2_norm(_v2_sub(eps[1], eps[0]))
@@ -4040,11 +3727,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             return _v2_mid(eps[0], eps[1])
 
     elif cls == "CONNECTION":
-        # Nothing: the continuation pass owns these points. It has to, because
-        # what belongs on the sheet is the name of the NEXT DRAWING, and this
-        # record knows only which pipeline carries on -- which is a different
-        # thing as soon as a sheet holds more than one spool. (Unreachable
-        # from render_pdf, whose component list is real_components().)
+        # Nothing: 接图点由 continuation 阶段负责画——图上该出现的是下一张
+        # 图名，本记录只知道管线接续；render_pdf 的 real_components() 到不了这里
         return None
 
     elif cls == "MESSAGE":
@@ -4055,18 +3739,17 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
         return None
 
     elif cls == "WELD":
-        # The weld pass draws the joint symbol. Stroking the record's own
-        # body here as well put a stray line under every weld dot, which is
-        # what made socket welds read as "a line on top of a dot".
+        # 焊点符号由焊点阶段画；此处再描本体线会在每个焊点下多一条线，
+        # socket weld 变成"点上有线"
         if len(eps) >= 2:
             return _v2_mid(eps[0], eps[1])
         return eps[0] if eps else (cos[0] if cos else None)
 
     else:
         if len(eps) >= 3 and _v2_len(_v2_sub(eps[1], eps[0])) > 1e-6:
-            # 未知多口件（≥3 端点）：画 NC 式箱体（Isogen NC 符号——矩形
-            # 箱体，两端接点 + 上下 tap）。箱体沿前两个端点，其余端点
-            # （第 3 个起，不限个数）从箱体中心各拉一条 tap 线到真实坐标。
+            # 未知多口件（≥3 端点）：画 NC 式箱体（Isogen NC 符号——矩形箱
+            # 体，两端接点+上下 tap）；第 3 个起的其余端点从箱体中心各拉一条
+            # tap 线到真实坐标。
             a, b = eps[0], eps[1]
             u = _v2_norm(_v2_sub(b, a))
             ep3 = comp.end_points
@@ -4116,21 +3799,10 @@ def _iso_cross_dir(proj: Projector, run: Vec2) -> Vec2:
     """A projected world axis to draw across ``run``, on an isometric plane.
 
     Screen-perpendicular bars read as flat marks pasted onto an isometric
-    picture. Choosing the world axis most nearly perpendicular to the run
-    instead puts the bar on an iso plane at 30 degrees, the way a flange is
-    drawn by hand. Elevation is tried first so a flange on any horizontal
-    run draws as an upright bar, which is the conventional reading; ties
-    after that resolve in a fixed order, so the sheet is deterministic.
-
-    The tie band has to be **wide**. Whenever a run lies along one iso axis
-    -- the common case, not a corner case -- the other two are both exactly
-    30 degrees off perpendicular and score identically, so the winner is
-    decided entirely by the tie-break. At the old 1e-6 the two halves of a
-    bolted flange pair, whose runs point at each other and differ only by
-    accumulated projection noise, scored 0.866010 against 0.866041 and chose
-    *different* axes: the two face bars came out 60 degrees apart and drew a
-    great X across the joint. Real distinctions here are 0.866 against 0.5 or
-    0, so a band of 1e-3 cannot merge two axes that are genuinely different.
+    picture; the world axis most nearly perpendicular puts the bar on an iso
+    plane at 30 degrees. Elevation first so a flange on any horizontal run
+    draws upright; the tie band must stay wide -- runs along an iso axis leave
+    the other two axes scoring identically, so ties decide by fixed order.
     """
     dirs = _axis_screen_dirs(proj)
     best, best_score = None, 0.0
@@ -4143,11 +3815,8 @@ def _iso_cross_dir(proj: Projector, run: Vec2) -> Vec2:
     return best
 
 
-# How far back from the gasket face the black face bar stands, in page mm.
-# Two flanges bolted together are coincident in the model, so their bars
-# landed on the same point and the joint drew as a *single* bar -- one
-# flange, not two faces with a gasket between them. Setting each bar back by
-# this much opens a black | white | black gap that reads as the gasket.
+# How far back from the gasket face the black face bar stands, in page mm --
+# opens a black|white|black gap on a bolted pair that reads as the gasket.
 _FLANGE_GASKET_GAP_MM = 0.55
 
 
@@ -4155,18 +3824,10 @@ def _draw_flange(canvas: _Canvas, proj: Projector, e0: Vec2, e1: Vec2,
                  comp: Component, face_first: bool, bar_mm: float) -> None:
     """Flange body plus one long iso-plane bar just behind the gasket face.
 
-    The bar goes on the *flanged* end only -- the welded end is just a butt
-    weld like any other and is already marked by its weld dot. It is drawn
-    about twice the length of a standard dimension offset so a flanged
-    connection is unmistakable at a glance on a full sheet.
-
-    The body stops ``_FLANGE_GASKET_GAP_MM`` short of the face and the bar
-    stands there, with a white knockout painted across the face itself. On a
-    bolted pair -- where both faces are the same point -- that draws two black
-    bars a millimetre apart with clear white between them, which is how a
-    fabricator reads a gasketed joint. The knockout is unrecorded, so it never
-    enters the collision geometry that label placement scores against, and it
-    is narrower than the setback so it cannot eat the other half's bar.
+    Bar on the flanged end only (welded end already has its weld dot), ~2x a
+    dimension offset long; body stops _FLANGE_GASKET_GAP_MM short of the face
+    with an unrecorded white knockout across it -- on a bolted pair that draws
+    black|white|black, reading as the gasket.
     """
     face, back = (e0, e1) if face_first else (e1, e0)
     run = _v2_norm(_v2_sub(face, back))
@@ -4500,10 +4161,10 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
         # 消化（管端/焊点/尺寸锚随符号端面走，warp 目标同源等比锚距）。
         sx = sgn * sy
     if width_mm is not None:
-        # 横向宽度按孔径独立覆盖（与手绘回退/法兰杠同宽）：恒等比只在
-        # 缺省时成立——height_mm 的 4.5 同时校准着轴向自然长度（VB**
-        # X 跨 800→9.0mm、FLWN 500→4.09mm 均等于链式占位），改高度会
-        # 把长度一起缩放、在链上留下死区，所以宽度走单独通道。
+        # 横向宽度按孔径独立覆盖（与手绘回退/法兰杠同宽）：恒等比只在缺省时
+        # 成立——height_mm 的 4.5 同时校准轴向自然长度（VB** X 跨 800→9.0mm、
+        # FLWN 500→4.09mm 均等于链式占位），改高度会连带缩放长度、链上留死区，
+        # 所以宽度走单独通道。
         sy = width_mm / max(perp, 1e-6)
         if proj is not None and getattr(proj, "schematic_scale", 1.0) != 1.0:
             sy *= proj.schematic_scale
@@ -4518,9 +4179,8 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
         bx = (bx[0] + rx / span, bx[1] + ry / span)
     x0, y0 = p0
     if drop_isolated and len(sym) > 1:
-        # 孤立腿 = 与其他任何腿都不共端点的腿：轮廓腿围成闭环共端点，
-        # tap 标记线浮在体内（端点落在轮廓边线内部）——按 ISOGEN 约定，
-        # 组件没有 BRANCH-POINT 时不画
+        # 孤立腿 = 与其他任何腿都不共端点的腿：轮廓腿围成闭环共端点，tap 标记线
+        # 浮在体内（端点落在轮廓边线内部）——按 ISOGEN 约定组件无 BRANCH-POINT 时不画
         def _near(p, q, tol=1.0):
             return abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol
         kept = []
@@ -4549,12 +4209,10 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
         pts.append(b)
         draw(a, b, width=width, record=True)
     if operator and pts:
-        # 阀柄叠加：柄是独立 skey 的符号，厂商坐标系以阀中心连接点为
-        # START、阀杆沿符号 +X 伸出（01SP=T 形柄、03SP=杠杆、04SP=手轮、
-        # 10SP=疏水器浮子…，独立块见 symbols/ALIAS.asc 的 N**SP）。柄
-        # 符号已归一到 START=(0,0)：锚到阀中心连接点（收笔点中程、两端
-        # 点页面中点），符号 +X 旋到 SPINDLE-DIRECTION 图面投影方向；
-        # 缩放沿用阀体高度标尺 sy——柄与阀体同一符号坐标系，等比不失真。
+        # 阀柄叠加：柄是独立 skey 的符号（01SP=T 形柄、03SP=杠杆、04SP=手轮、
+        # 10SP=疏水器浮子…，独立块见 ALIAS.asc 的 N**SP），厂商坐标系以阀中心
+        # 连接点为 START、阀杆沿符号 +X 伸出；已归一到 START=(0,0)，锚到阀中心
+        # 连接点、+X 旋到 SPINDLE-DIRECTION 图面投影，缩放沿用阀体高度标尺 sy。
         op_skey, sp2 = operator
         from .asc_symbols import find_symbol_full
         op_sym = find_symbol_full(op_skey)[0] if op_skey else None
@@ -4593,13 +4251,11 @@ def _bore_half_w(bore_in: float | None) -> float:
     return 1.2 * max(bore_in, 0.125)
 
 
-# 法兰突面(垫片面)直径 ÷ 管外径，随标称管径 D(英寸)变化的平滑函数。
-# 法兰垫片面不是随管径等比放大的：小管径的法兰相对更"肥"（1/2" 的突面
-# 是管外径的 1.64 倍），管径越大比例越瘦（24" 只剩 1.14 倍）。下式对
-# ASME B16.5 Class 150 全表（1/2"~24"，21 档；各压力等级同尺寸突面直径
-# 相同，pipedata.org 与厂商样本互证）做最小二乘拟合，最大偏差 0.05，
-# 折算到垫片面杠 ≤0.15mm——图面上不可辨，但免查表、任意孔径连续取值。
-# 数据锚点：1/2"→1.64、2"→1.53、6"→1.28、12"→1.18、24"→1.14。
+# 法兰突面(垫片面)直径 ÷ 管外径，随标称管径 D(英寸)变化的平滑函数。法兰垫
+# 片面不随管径等比放大：小管径相对更"肥"（1/2" 突面是管外径的 1.64 倍），
+# 越大越瘦（24" 只剩 1.14 倍）。下式对 ASME B16.5 Class 150 全表（1/2"~24"
+# 21 档，各压力等级同尺寸突面直径相同）最小二乘拟合，最大偏差 0.05（≤0.15mm 不可辨），
+# 免查表、任意孔径连续取值。数据锚点：1/2"→1.64、2"→1.53、6"→1.28、12"→1.18、24"→1.14。
 def _flange_face_ratio(bore_in: float) -> float:
     """突面直径/管外径（B16.5 表拟合曲线）；bore_in 为英寸孔径。"""
     # 钳到最小标称管径 1/8"：导出脏数据（负/零/近 -6.3 孔径）会让分母
@@ -4695,36 +4351,12 @@ def _draw_reducer(canvas: _Canvas, proj: Projector, comp: Component,
                   units_bore: str = "INCH") -> None:
     """Trapezoid spanning the reducer's own two weld ends, on an iso plane.
 
-    **Both ends of the body sit on the reducer's own projected weld points.**
-    The body used to be built out along a neighbour's run axis to a point
-    ``big + axis * reach`` -- the small end dropped onto that axis -- so
-    whenever the small end was genuinely off the axis the symbol's tip landed
-    somewhere the pipeline was not, and the fitting drew as a thin wedge
-    floating clear of the run it reduces. That is the bad assumption: the
-    neighbour's axis says which way the pipeline *points*, and nothing about
-    where this fitting *ends*.
-
-    ``run`` still decides the direction the body is squared to, because the
-    chord between the two ends will not do: on an eccentric it leans across
-    the run by the centreline offset, and end faces square to that chord lean
-    with it -- which is how these came out as rhomboids lying across the pipe.
-
-    The cross direction is a **projected world axis**, the way a flange bar is
-    (`_iso_cross_dir`), never a screen perpendicular. A screen perpendicular
-    lies on no isometric plane, so the fitting read as a flat mark pasted onto
-    the picture. On an eccentric it is the projection of the measured flat
-    direction itself, so a reducer that is flat on the bottom draws with its
-    flat on the elevation plane and its taper on top -- which is the whole
-    thing an eccentric reducer exists to show.
-
-    The flat side is **schematic**, like every other symbol on the sheet: one
-    edge parallel to the run with both ends on it, and the small end hugging
-    it so only the far side slopes. It is not the offset drawn to scale --
-    at true proportion a 1" offset is a third of a millimetre on the page and
-    the fitting would read as concentric. Which side it falls on *is* taken
-    from the model (see ``_reducer_flat_offset``). The centreline offset
-    itself stays at true proportion; ``_eccentric_offset_pairs`` keeps the
-    not-to-scale warp from inflating it into a dog-leg.
+    Both body ends sit on the reducer's own projected weld points (never built
+    out along a neighbour's run axis). ``run`` only squares the body -- the
+    chord leans across an eccentric's run and faces squared to it lean with it.
+    Cross direction is a projected world axis (`_iso_cross_dir`); the flat side
+    is schematic, its side from the model (_reducer_flat_offset); the centreline
+    offset stays true proportion (_eccentric_offset_pairs guards the warp).
     """
     pts = comp.end_points
     large_first = (pts[0].bore or 0.0) >= (pts[-1].bore or 0.0)
@@ -4758,13 +4390,10 @@ def _draw_reducer(canvas: _Canvas, proj: Projector, comp: Component,
         across = _v2_norm(_v2_sub(proj.raw(offset), proj.raw((0, 0, 0))))
         step = _step_across(_v2_sub(small, big), axis, across)
         if across != (0.0, 0.0) and step is not None:
-            # How far the centreline moves across the run *on the page*. The
-            # body has to be at least that deep or the small end falls off
-            # the bottom of it -- which drew the two long edges crossing in a
-            # bowtie. Growing the big end by exactly the step is also what
-            # makes the flat come out parallel to the run: on a real fitting
-            # the offset *is* half the difference in diameters.
-            # `across` already points at the flat, so the flat is always +1.
+            # How far the centreline moves across the run *on the page*: the body
+            # must be at least that deep or the small end falls off the bottom and
+            # the two long edges cross in a bowtie; growing the big end by exactly
+            # the step also keeps the flat parallel to the run (flat is always +1).
             half_big = max(half_big, half_small + max(step, 0.0))
     else:
         across = _iso_cross_dir(proj, axis)
@@ -4833,13 +4462,11 @@ def _draw_box_on_axis(canvas: _Canvas, proj: "Projector", e0: Vec2,
 # ---------------------------------------------------------------------------
 # Dimensions
 #
-# Dimensions are drawn with *isometric skew*: the extension (leader) bars and
-# the dimension line always run along projected world-axis directions, so the
-# whole callout lies on an isometric plane instead of being screen-
-# perpendicular. Point pairs that are not axis-aligned get an *offset box*:
-# a dashed rectangle (two axes differ) or cuboid (all three differ) whose
-# axis-aligned legs are dimensioned individually, each on the side that
-# collides least with geometry, labels, and earlier dimensions.
+# Dimension lines and extension bars run along projected world-axis directions
+# (isometric skew), so callouts lie on an iso plane instead of screen-
+# perpendicular. Point pairs that are not axis-aligned get an *offset box*: a
+# dashed rectangle (two axes differ) or cuboid (all three) whose axis-aligned
+# legs are dimensioned individually, each on the side that collides least.
 
 _AXIS_VECS: tuple[Vec3, ...] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
 _DIM_FONT = _SHEET_FONT
@@ -4848,9 +4475,8 @@ _DIM_CAP = _cap_height_mm(_DIM_FONT)
 # Arrowhead: length tip-to-base and half the width across the barbs.
 _ARROW_MM = 1.4
 _ARROW_HALF_MM = 0.45
-# A dimension line has to be at least four arrowheads long before both arrows
-# will fit between its goalposts and still read as a double arrow. Under that
-# the arrows go outside, opposing each other -- style "outside".
+# A dimension line must be at least four arrowheads long before both arrows fit
+# between its goalposts; under that the arrows go outside, opposing each other.
 _MIN_ARROWS_INSIDE_MM = 4 * _ARROW_MM
 # Clear space each side of a value that breaks the dimension line.
 _DIM_TEXT_GAP_MM = 0.9
@@ -4859,14 +4485,10 @@ _DIM_LEADER_MM = 4.0
 # How far the arrow tails reach past the goalposts in the "outside" style.
 _OUTSIDE_TAIL_MM = 3.6
 
-# Whether an offset leg counts as "spanned" is decided on the page, not in
-# the model: a leg must draw at least this many mm AND be more than a
-# modelling artifact in the world. Judging it against the model diagonal (as
-# the readability threshold for whole dimensions does) made offset boxes
-# vanish on large spools -- a 3" roll in a 40' line is under 1% of the
-# diagonal, so the box collapsed and the callout degenerated into a single
-# skewed line. Page-space is the honest test, and it accounts for the
-# not-to-scale warp, which stretches exactly those short legs into view.
+# Whether an offset leg counts as "spanned" is decided on the page, not in the
+# model: the leg must draw at least this many mm AND exceed a modelling artifact
+# in the world. Model-diagonal thresholds made offset boxes vanish on large
+# spools; page-space also accounts for the warp, which stretches those legs.
 _MIN_LEG_MM = 1.5
 _MIN_LEG_INCH = 0.25
 
@@ -4907,9 +4529,8 @@ def _segs_cross(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool:
     ab_len = _v2_len(ab)
     if ab_len < 1e-9:
         return False
-    # |orient| / ab_len is the point-to-line distance: both endpoints of cd
-    # within 0.3mm of ab's line means near-collinear; overlap iff cd's
-    # projection onto ab intersects the (0, 1) parameter span.
+    # |orient| / ab_len is the point-to-line distance: both cd endpoints within
+    # 0.3mm of ab's line = near-collinear; overlap iff cd's projection hits (0,1).
     if abs(o1) < 0.3 * ab_len and abs(o2) < 0.3 * ab_len:
         t1 = ((c[0] - a[0]) * ab[0] + (c[1] - a[1]) * ab[1]) / (ab_len * ab_len)
         t2 = ((d[0] - a[0]) * ab[0] + (d[1] - a[1]) * ab[1]) / (ab_len * ab_len)
@@ -5127,10 +4748,9 @@ def _plan_best_dim(canvas: _Canvas, proj: Projector, p3a: Vec3, p3b: Vec3,
     """
     a, b = proj.page(p3a), proj.page(p3b)
     if coaxial:
-        # 偏心变径的大小端在平行中心线上。符号布局会给小端侧额外横向
-        # 平移；尺寸不能直接连接两个实际图面端点，否则仍沿偏心斜弦画。
-        # 以大端为锚，把小端图面位置投影回原始管轴：去掉横向位移，
-        # 保留轴向位移（示意模式下仍与符号的实际图面长度一致）。
+        # 偏心变径的大小端在平行中心线上，符号布局给小端侧额外横向平移；
+        # 尺寸不能直接连两个实际图面端点（会沿偏心斜弦画）——以大端为锚，
+        # 小端投影回原始管轴：去横向位移、保留轴向位移。
         raw_a = proj.page(p3a, apply_offset=False)
         raw_b = proj.page(p3b, apply_offset=False)
         run = _v2_sub(raw_b, raw_a)
@@ -5287,9 +4907,8 @@ def _draw_olet(canvas: _Canvas, proj: Projector, centre: Vec2, branch: Vec2,
     if along == (0.0, 0.0):
         along = _iso_cross_dir(proj, out)
 
-    # Stand the boss clear of the weld dot at its root: the weld pass stamps
-    # a 0.9 mm filled dot on the header centreline here, and a box sharing
-    # that edge is half swallowed by it.
+    # Stand the boss clear of the weld dot at its root: the weld pass stamps a
+    # 0.9 mm filled dot there, and a box sharing that edge is half swallowed.
     base = _v2_add(centre, _v2_scale(out, _OLET_BASE_MM))
     half = _v2_scale(along, _OLET_HALF_MM)
     rise = _v2_scale(out, _OLET_RISE_MM)
@@ -5312,17 +4931,10 @@ def _draw_weld_symbol(canvas: _Canvas, proj: Projector, weld: Weld,
                       dot: Vec2) -> None:
     """The symbol for one weld, chosen by joint type.
 
-    A butt weld is a filled dot -- the whole joint is the circumference, and
-    that is what a fabricator expects. A **socket** weld is not: the pipe,
-    nipple or swage is inserted into a socket and filleted at the shoulder,
-    and the convention is a square bracket sitting at the joint, opening
-    towards the inserted member. Everything used to draw as the same dot, so
-    the two joint types were indistinguishable on the sheet even though the
-    weld table counted them separately.
-
-    Drawn with ``record=False``: weld symbols are small and sit on the run,
-    and letting them into ``canvas.segments`` would start perturbing
-    dimension placement on drawings that are otherwise unchanged.
+    A butt weld is a filled dot (the whole joint is the circumference); a
+    **socket** weld is a square bracket opening towards the inserted member.
+    Drawn with ``record=False``: weld symbols sit on the run and must not
+    perturb dimension placement.
     """
     if weld.joint != "SW" or weld.insert_toward is None:
         canvas.dot(dot, r=0.9)
@@ -5345,12 +4957,10 @@ def _draw_weld_symbol(canvas: _Canvas, proj: Projector, weld: Weld,
 
 # --- 传统 Isogen 管架符号 ---------------------------------------------------
 # SKEY 语义来自 Smart Isogen SystemMaterialData.xml 的 Supports 段：
-#   01HG/空 = 默认承重支撑, ANCH=固定架, GUID=导向架, SPRG=弹簧支吊架,
-#   HANG=吊架（DUCK/SKID/SLVE 等暂按承重画法）。
-# .ASC 符号方向模式（501 尾参）：
-#   0 = 顺管道方向（符号 X 轴对齐管道走向，如 01HG 两线平行于管道）
-#   2 = 固定方向（SUPPORT-DIRECTION UP/DOWN 上下翻转）
-#   3 = 三轴六向（如 ANCH 双箭头，方向由 SUPPORT-DIRECTION 的世界轴决定）
+#   01HG/空=承重支撑, ANCH=固定架, GUID=导向架, SPRG=弹簧支吊架, HANG=吊架
+#   （DUCK/SKID/SLVE 等暂按承重画法）。.ASC 方向模式（501 尾参）：
+#   0=顺管道方向, 2=固定方向（SUPPORT-DIRECTION UP/DOWN 翻转）,
+#   3=三轴六向（ANCH 双箭头，方向由 SUPPORT-DIRECTION 的世界轴决定）。
 _SUPPORT_WORLD_DIRS = {
     "UP": (0, 0, 1), "DOWN": (0, 0, -1),
     "NORTH": (0, 1, 0), "N": (0, 1, 0), "Y+": (0, 1, 0), "Y": (0, 1, 0),
@@ -5366,14 +4976,10 @@ def _nearest_pipe_run_dir(proj: "Projector", doc, at: Vec2,
                           world_at: Vec3 | None = None):
     """支架点附近管道走向；返回 (页空间方向, 世界空间方向)，找不到返回 None。
 
-    世界方向用于推导跨管的世界轴（等轴测里跨管偏移沿世界轴的 30° 投影，
-    而不是页面上管轴的垂线）。
-
-    world_at 给定时（支架自身世界坐标），凡世界距离≈0（支架真立在管线
-    上）的管段优先，其间再按页面距离定夺：支架常立在弯头端口上，页面
-    最近的可能只是邻跨的接续短管（39021 管架被对到接续线上画成斜线
-    的根因）。候选集因此补上弯头/三通的腿（centre→端点），端口上的
-    支架才能命中真正所在的管轴。
+    世界方向用于推导跨管的世界轴（等轴测里跨管偏移沿世界轴的 30° 投影）。
+    world_at 给定时，世界距离≈0（支架真立在管线上）的管段优先，其间再按
+    页面距离定夺——支架常立在弯头端口上，页面最近的可能只是邻跨接续短管。
+    候选集含弯头/三通的腿（centre→端点），端口上的支架才能命中真正管轴。
     """
     runs = _PIPE_RUNS_CACHE.get(id(proj))
     if runs is None:
@@ -5730,15 +5336,13 @@ _CALLOUT_LEADER_MM = 6.0     # shortest leader the placer will accept
 _CALLOUT_CLEARANCE_MM = 1.0  # whitespace a box keeps from drawn geometry
 
 
-# Whitespace a callout's *leader foot* keeps from a neighbouring fitting's
-# anchor or a weld dot, in page mm. Inside this the leader reads as pointing
-# at the neighbour rather than at the run.
+# Whitespace a callout's *leader foot* keeps from a neighbouring fitting's anchor
+# or a weld dot, in page mm -- inside it the leader reads as pointing at the neighbour.
 _ANCHOR_CLEARANCE_MM = 3.0
 
-# Where along a pipe its cut-piece callout may point, as fractions of the run.
-# The midpoint is first so it still wins wherever it is clear, and today's
-# sheets are unchanged; the quarter points are the escape route when a fitting
-# is welded on at the middle.
+# Where along a pipe its cut-piece callout may point, as fractions of the run:
+# midpoint first, quarter points as the escape route when a fitting is welded
+# on at the middle.
 _PIPE_ANCHOR_FRACTIONS = (0.5, 0.3, 0.7)
 
 
@@ -5780,17 +5384,11 @@ def _draw_callout_box(canvas: _Canvas, anchor: Vec2, label: str,
                       occupied: list[Vec2] | None = None) -> tuple[Vec2, Vec2]:
     """One square or rectangular callout box with a leader to the run.
 
-    The single style used for **everything the shop has to identify** -- a
-    fitting's item number and a cut piece's label alike. They are the same
-    kind of mark (this is the part in front of you, here is its number in the
-    table), so drawing them differently only asks the reader to learn two
-    conventions for one idea.
-
-    Cut labels used to be written bare against the centreline with no leader.
-    That saved a line and cost clarity: with no leader, which run a label
-    belongs to is inferred from proximity alone, and on a busy sheet -- or
-    wherever the not-to-scale warp brings two runs close -- proximity is not
-    an answer. Every callout now stands clear of the centreline and points.
+    The single style for **everything the shop has to identify** -- a fitting's
+    item number and a cut piece's label alike: same kind of mark, one convention.
+    Every callout stands clear of the centreline and points at its run -- bare
+    labels force proximity-inference, which fails on busy sheets or wherever
+    the warp brings two runs close.
     """
     canvas.pdf.set_font("Helvetica", size=_CALLOUT_FONT)
     tw = canvas.pdf.get_string_width(label)
@@ -5856,9 +5454,9 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
         if not label:
             continue
         anchor = anchors[idx]
-        # What the foot must keep clear of: every *other* component's anchor
-        # and every weld dot. The pipe's own anchor is excluded -- it is one
-        # of the candidates, and a run must not be crowded out by itself.
+        # What the foot must keep clear of: every *other* component's anchor and
+        # every weld dot -- the pipe's own anchor is one of the candidates, not
+        # an obstacle.
         occupied = [p for i, p in anchors.items() if i != idx] + dots
         with canvas.tagged("callout", label):
             anchor, pos = _draw_callout_box(
@@ -5871,8 +5469,8 @@ def _draw_callouts(canvas: _Canvas, proj: Projector, comps, anchors, bom_rows,
             leadered=True))
 
     # -- pass 2: material item-number callouts ------------------------------
-    # 垫片/螺栓优先并入任一端实际相邻的法兰，顺序为“法兰/螺栓/垫片”；
-    # 两端都没有法兰时不并入阀门、三通等父件，而单独出“螺栓/垫片”球标。
+    # 垫片/螺栓优先并入任一端实际相邻的法兰（顺序“法兰/螺栓/垫片”）；两端都
+    # 没有法兰时不并入阀门、三通等父件，单独出“螺栓/垫片”球标。
     flanges = [(i, comp) for i, (comp, _ref) in enumerate(comps)
                if looks_like_flange(comp.type, comp.description, comp.skey)]
     flange_children: dict[int, dict[str, str]] = {}
@@ -6109,9 +5707,8 @@ def _item_sort_key(item: str):
         return (1, 0, str(item))
 
 
-# Field *labels* in the title block stay a step below their values, which is
-# the hierarchy the block already read with. Only the values are held to
-# _SHEET_FONT -- they are the part anyone actually reads off the sheet.
+# Field *labels* in the title block stay a step below their values -- the
+# hierarchy the block already read with; only values are held to _SHEET_FONT.
 _TITLE_LABEL_FONT = 6.5
 
 

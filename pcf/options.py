@@ -24,9 +24,8 @@ from .splitmerge import default_split_distance, survey_split_keys
 from .welds import derive_welds
 
 OPTION_NUMBERS = {"none": 1, "key": 2, "distance": 3, "hybrid": 4}
-# Tie-break preference when several options score equally against the
-# target band: simplest first, but hybrid beats plain distance because it
-# costs nothing extra and keeps spool traceability.
+# Tie-break preference when options score equally against the target band: simplest
+# first, but hybrid beats plain distance (no extra cost, keeps spool traceability).
 _PREFERENCE = {"none": 0, "key": 1, "hybrid": 2, "distance": 3}
 # Soft components-per-drawing target used to rank options; the user can
 # override it per run (--target) or per job (project.json).

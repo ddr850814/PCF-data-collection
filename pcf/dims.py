@@ -59,15 +59,13 @@ from .units import format_length
 
 Vec3 = tuple[float, float, float]
 
-# Landmarks closer together than this fraction of the model diagonal do not
-# get their own dimension (they'd be unreadable). When a pair is that close
-# the better-ranked landmark absorbs the other rather than both surviving
-# undimensioned.
+# Landmarks closer together than this fraction of the model diagonal do not get
+# their own dimension (unreadable); the better-ranked landmark absorbs the other.
 _MIN_DIM_FRACTION = 0.01
 
-# Standard perpendicular offset (page mm) of a dimension line from the run
-# it measures. The renderer also uses it as the yardstick for the flange
-# face bar, which is drawn twice this long.
+# Standard perpendicular offset (page mm) of a dimension line from the run it
+# measures; the renderer also uses it as the yardstick for the flange face bar
+# (drawn twice this long).
 DEFAULT_OFFSET_MM = 6.0
 
 # Landmark ranks: lower wins when two landmarks coincide or crowd.
@@ -75,10 +73,9 @@ RANK_CENTRE = 0    # ELL CENTER / BRANCH CL -- what a fitter lays out to
 RANK_FACE = 1      # FLG FACE / VALVE CL / CAP
 RANK_END = 2       # LINE END -- genuinely open ends
 
-# Component classes whose ends are never landmarks even when the
-# connectivity graph calls them open: welds, bolting and gaskets have no
-# meaning as a dimension target, and their "open" ends are modelling
-# artifacts of root gaps and set-on attachments.
+# Component classes whose ends are never landmarks even when the connectivity
+# graph calls them open: welds, bolting and gaskets -- their "open" ends are
+# modelling artifacts of root gaps and set-on attachments.
 _NEVER_OPEN_END = {"WELD", "BOLT", "GASKET", "SUPPORT", "CONNECTION",
                    "MESSAGE", "GAP"}
 
@@ -117,10 +114,9 @@ class _Landmark:
     point: Vec3
     name: str
     rank: int   # lower rank wins when landmarks coincide or crowd
-    # id() of the component this landmark belongs to, when it has one. A
-    # component contributing *two* landmarks (only reducers do) must never be
-    # dimensioned across itself -- that is its catalogue length, not a shop
-    # number -- so the chain walk refuses a consecutive same-owner pair.
+    # id() of the owning component, when it has one: a component contributing
+    # *two* landmarks (only reducers) must never be dimensioned across itself --
+    # that is its catalogue length, so the chain walk refuses a same-owner pair.
     owner: int | None = None
 
 
@@ -150,17 +146,10 @@ def _collect_landmarks(doc: PcfDocument) -> list[_Landmark]:
             speaks_for_itself.add(id(comp))
 
     # -- pass 2: genuinely open ends, only where nothing better exists -----
-    # add() already refuses to downgrade a coincident rank-0/1 landmark, so
-    # a flange face or cap end that is also "open" keeps its own name.
-    #
-    # END-POSITION-OPEN/CLOSED records are the file *declaring* where the
-    # line stops, and they are believed over the connectivity walk: a run
-    # that dead-ends in a modelled field weld leaves that weld's outboard
-    # end within tolerance of its own inboard end, so the graph sees it as
-    # connected and the spool boundary would otherwise carry no landmark at
-    # all. END-CONNECTION-* records are skipped -- those are continuations
-    # into another pipeline, which lands mid-run on a merged sheet.
-    #
+    # add() refuses to downgrade a coincident rank-0/1 landmark. END-POSITION-*
+    # records *declare* where the line stops and are believed over the connectivity
+    # walk (a modelled field weld joins to itself, or the spool boundary gets no
+    # landmark); END-CONNECTION-* are continuations into another pipeline, skipped.
     # Believed, but not blindly: see _is_run_terminus().
     cont = _continuity(doc, comps)
     for comp in doc.all_components():
@@ -171,10 +160,8 @@ def _collect_landmarks(doc: PcfDocument) -> list[_Landmark]:
                 continue
             add(pt.xyz, "LINE END", RANK_END)
 
-    # The connectivity walk needs the same judgement as the records above,
-    # and for the same reason: a zero-length drafting mark dropped in the
-    # middle of a run is joined to nothing, so the graph calls both of its
-    # ends open and hands back a landmark that cuts the run in half.
+    # Same judgement for the connectivity walk: a zero-length drafting mark mid-run
+    # joins to nothing -- the graph would hand back a landmark cutting the run in half.
     for comp, pt in geometry.open_ends(doc, tol):
         if classify(comp.type, comp.skey) in _NEVER_OPEN_END:
             continue
@@ -199,8 +186,7 @@ class _Continuity:
 
 
 # An elbow's two weld ends are joined by the diagonal across the bend, which
-# is not a line the drawing ever draws and not material anything sits inside.
-# _leg_segments() splits it into arms for the same reason.
+# the drawing never draws -- _leg_segments() splits it into arms.
 _NO_STRAIGHT_BODY = {"ELBOW", "BEND"}
 
 
@@ -368,9 +354,8 @@ def _cap_end(comp: Component, comps: list[Component],
     return eps[1 - welded].xyz
 
 
-# Neighbours that mean "the run is welded on here", strongest first. A bare
-# coupling is weaker evidence than a length of pipe, and a valve weaker still
-# because it is as often bolted on as welded.
+# Neighbours that mean "the run is welded on here", strongest first: a bare
+# coupling is weaker evidence than pipe, a valve weaker still (often bolted on).
 _WELDED_BY_RANK = (
     ("PIPE", "ELBOW", "TEE", "OLET", "REDUCER"),
     ("COUPLING", "WELD", "VALVE"),
@@ -393,9 +378,9 @@ def _welded_end_index(eps, comps: list[Component],
     claimed, the answer must not depend on adjacency order.
     """
     best: tuple[int, int] | None = None
-    # 垫片只存在于法兰（螺栓）连接侧：一端贴着垫片时另一端必为焊端。
-    # 这条结构证据优先于 rank 表——否则隔着垫片 1.5mm 的邻件（如 TEE，
-    # rank-0）会抢先认领垫片侧端点，把焊端判反（法兰面杠画向管道）。
+    # 垫片只存在于法兰（螺栓）连接侧：一端贴着垫片时另一端必为焊端。这条
+    # 结构证据优先于 rank 表——否则隔着垫片 1.5mm 的邻件（如 TEE，rank-0）
+    # 会抢先认领垫片侧端点，把焊端判反（法兰面杠画向管道）。
     gasket_ends: set[int] = set()
     for other_idx in graph.neighbours(idx):
         other = comps[other_idx]
@@ -540,10 +525,9 @@ def _leg_segments(comp: Component) -> list[tuple[Vec3, Vec3]]:
         return [(eps[0].xyz, corner), (eps[-1].xyz, corner)]
     if classify(comp.type, comp.skey) in _LEG_CLASSES or looks_like_flange(
             comp.type, comp.description, comp.skey):
-        # 偏心变径不建弦 leg：两端在平行中心线上，弦是斜线而非管线
-        # 走的线（与弯头不建弦同理）。建了它，偏心端点与邻近 landmark
-        # 会挂上斜弦配出倾斜尺寸。两端各自落在相邻管段的 leg 上，本体
-        # 长度由 _reducer_body_dimensions 沿主管轴标注。
+        # 偏心变径不建弦 leg：两端在平行中心线上，弦是斜线而非管线走的线
+        # （与弯头不建弦同理），偏心端点会挂上斜弦配出倾斜尺寸。两端各自落
+        # 在相邻管段的 leg 上，本体长度由 _reducer_body_dimensions 沿主管轴标注。
         if (classify(comp.type, comp.skey) == "REDUCER"
                 and reducer_is_eccentric(comp.type, comp.skey)):
             return []
@@ -668,10 +652,9 @@ def infer_dimensions(doc: PcfDocument) -> list[Dimension]:
             for (_t1, lm1), (_t2, lm2) in zip(chain, chain[1:]):
                 if lm1.owner is not None and lm1.owner == lm2.owner:
                     continue  # a component's own body length is a catalogue number
-                # 同轴化：端点取 leg 轴线上的垂足。偏心变径的端点带横向
-                # 偏心（小端中心线平移了半圈壁厚差），直接用原始点配对会
-                # 让尺寸线倾斜、渲染端多出 offset 盒——链式尺寸量的是
-                # 沿线距离，端点理应落在线上。
+                # 同轴化：端点取 leg 轴线上的垂足。偏心变径端点带横向偏心
+                # （小端中心线平移了半圈壁厚差），直接配对会让尺寸线倾斜、
+                # 渲染端多出 offset 盒——链式尺寸量的是沿线距离，端点应落在线上。
                 p1 = geometry.add(leg.origin, geometry.scale(leg.unit, _t1))
                 p2 = geometry.add(leg.origin, geometry.scale(leg.unit, _t2))
                 dim_id = _dim_id(p1, p2)
@@ -726,10 +709,9 @@ def _reducer_body_dimensions(comps: list[Component], legs: list[_Leg],
         if geometry.length(delta) <= off_tol:
             continue
         chord = geometry.normalize(delta)
-        # 轴向取邻接管段：大端优先，无则取小端（客侧副本变径大端悬空，
-        # 而两侧中心线平行，小端管段同样给出主管轴）。拿不到才回退弦
-        # 线本身——同心变径弦即轴，偏心变径两腿至少一端有管（否则两
-        # 端都悬空，只剩孤件）。绝不沿斜弦标注：那不是同轴尺寸。
+        # 轴向取邻接管段：大端优先，无则取小端（客侧副本变径大端悬空，而两侧
+        # 中心线平行，小端管段同样给出主管轴）。拿不到才回退弦线本身——同心
+        # 变径弦即轴，偏心变径两腿至少一端有管。绝不沿斜弦标注：那不是同轴尺寸。
         axis = chord
         for want in (big, small):
             hit = next((leg.unit for leg in legs
@@ -760,24 +742,11 @@ def _overall_dimensions(comps: list[Component], landmarks: list[_Landmark],
                         min_span: float) -> list[Dimension]:
     """Overall extent of each spool the leg walk could not dimension.
 
-    Landmarks are chained *along a leg*, which needs them to share a
-    straight line. They do not always: put an eccentric reducer between two
-    flanges and the two faces sit on parallel centrelines an inch apart, so
-    neither leg holds both and the spool went out with no dimension on it.
-    For such a group the two landmarks furthest apart are dimensioned. The
-    renderer decomposes a pair that is not axis-aligned into a dashed offset
-    box, so an eccentric spool prints its overall length *and* its offset --
-    which is what a fitter needs from it.
-
-    This runs **per connected group**, not once for the sheet. A sheet
-    carrying a laid-out run plus a detached flange-and-reducer stub used to
-    get nothing for the stub twice over: the fallback only fired when the
-    whole sheet had produced no dimension at all, and it refused outright
-    whenever more than one group was present. Each group is still dimensioned
-    only within itself -- nothing is ever measured across the gap between two
-    disjoint spools -- and only when the span is worth printing. A ship-loose
-    item, with one landmark or none, still gets nothing; there is nothing on
-    it to lay out.
+    Landmarks are chained along a leg (a straight line); an eccentric between two
+    flanges puts the faces on parallel centrelines, so the group gets its two
+    furthest landmarks dimensioned (the renderer shows a non-axis-aligned pair as
+    a dashed offset box: overall length *and* offset). Runs per connected group,
+    never across disjoint spools; a ship-loose item with <2 landmarks gets nothing.
     """
     graph = geometry.ConnectivityGraph(comps, off_tol)
     out: list[Dimension] = []
@@ -804,10 +773,9 @@ def _overall_dimensions(comps: list[Component], landmarks: list[_Landmark],
         if a is None or geometry.dist(a.point, b.point) < min_span:
             continue
         p_from, p_to = a.point, b.point
-        # 组内含偏心变径时按同轴处理：最远两点各落在变径一侧的中心线
-        # 上，横向差是偏心量（半圈壁厚差）而非布局尺寸。沿变径主管轴
-        # 投影小概率横向分量，渲染端才不会把总长拆成带偏心腿的 offset
-        # 盒（尺寸线倾斜）。
+        # 组内含偏心变径时按同轴处理：最远两点各落在变径一侧中心线上，横向
+        # 差是偏心量（半圈壁厚差）而非布局尺寸。沿变径主管轴投影掉横向分量，
+        # 渲染端才不会把总长拆成带偏心腿的 offset 盒（尺寸线倾斜）。
         for idx in group:
             c = comps[idx]
             if (classify(c.type, c.skey) != "REDUCER"
@@ -846,10 +814,9 @@ def _group_is_dimensioned(dims: list[Dimension],
 
 
 def sidecar_path(pdf_path: str | Path) -> Path:
-    # Build the name by hand rather than chaining with_suffix(): line numbers
-    # and spool ids routinely put dots inside the stem ("12.5878 - BREWSTER
-    # ..._SHT_1.pdf"), and with_suffix would replace everything after the
-    # *first* dot -- collapsing every sheet of a job onto one "12.dims.json".
+    # Build the name by hand rather than with_suffix(): line numbers/spool ids
+    # put dots inside the stem, and with_suffix would replace everything after
+    # the *first* dot -- collapsing every sheet onto one "12.dims.json".
     pdf_path = Path(pdf_path)
     return pdf_path.with_name(pdf_path.stem + ".dims.json") \
         if pdf_path.suffix == ".pdf" else Path(str(pdf_path) + ".dims.json")

@@ -54,15 +54,12 @@ class Weld:
     description: str | None
     uci: str | None
     neighbors: list[str] = field(default_factory=list)
-    # Geometry the renderer needs to draw a socket weld the right way round.
-    # `insert_toward` is a point on the side the pipe/nipple/swage enters
-    # from -- a socket weld symbol is a bracket that opens towards the
-    # inserted member. None when no neighbour is pipe-like, or for a set-on
-    # branch, in which case the symbol falls back to a plain dot.
+    # `insert_toward` = a point on the side the pipe/nipple/swage enters from --
+    # a socket weld symbol is a bracket opening towards the inserted member. None
+    # (plain dot) when no neighbour is pipe-like, or for a set-on branch.
     insert_toward: tuple[float, float, float] | None = None
-    # Populated only when derive_welds is given a spool_key: the weld's spool
-    # ("SP-1"), or both spools for an inter-spool joint ("SP-1 / SP-2"), in
-    # which case notes carries the "Field Weld" declaration.
+    # Only when derive_welds is given a spool_key: the weld's spool ("SP-1"), or
+    # both spools at an inter-spool joint ("SP-1 / SP-2" + "Field Weld" in notes).
     spool: str = ""
     notes: str = ""
 
@@ -304,9 +301,8 @@ def derive_welds(
         spool_of = component_spools(doc, spool_key, graph=graph)
         for weld, (sort_key, _kw) in zip(welds, raw):
             idx = sort_key[0]
-            # The spools this joint touches: the weld record's own flooded
-            # value plus every neighbour's. Two distinct spools meeting at
-            # one joint is the definition of a field weld between spools.
+            # The spools this joint touches: the weld record's own flooded value
+            # plus every neighbour's. Two distinct spools at one joint = field weld.
             touching = {spool_of[idx]}
             touching.update(spool_of[n] for n in graph.neighbours(idx))
             touching.discard(None)

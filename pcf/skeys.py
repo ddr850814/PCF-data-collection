@@ -50,10 +50,10 @@ def connection_from_skey(skey: str | None) -> str | None:
 
 
 # -- SKEY -> PCF 类型反查（skeys.json "skey_to_types" 段） -------------------
-# 官方映射表：skey（含 ** 通配，** 占两个字符的端接代码）-> PCF 组件类型
-# 列表。仅当 COMPONENT-TYPE 分类落到 OTHER 时作为兜底——出口器把管件写成
-# 非标类型但保留标准 SKEY 时（如 TYPE=FITTING + SKEY=RCBW 的同心变径），
-# 绘制、尺寸、报表仍按真实类别处理；标准数据零影响。
+# 官方映射表：skey（含 ** 通配，** 占两个字符的端接代码）-> PCF 组件类型列表。
+# 仅当 COMPONENT-TYPE 分类落到 OTHER 时兜底——出口器把管件写成非标类型但保留
+# 标准 SKEY 时（如 TYPE=FITTING + SKEY=RCBW 的同心变径），绘制、尺寸、报表仍按
+# 真实类别处理；标准数据零影响。
 
 _SKEY_TYPES_EXACT: dict[str, str] = {}
 _SKEY_TYPES_WILD: list[tuple[re.Pattern[str], str]] = []
@@ -127,11 +127,10 @@ def _classify_type(component_type: str) -> str:
         return "ELBOW"
     if t.startswith(("TEE-SET-ON", "TEE-STUB", "OLET", "ELBOLET", "CROSS-SET-ON", "CROSS-STUB")):
         return "OLET"
-    # Branch bosses come out of real exporters under their trade names --
-    # WELDOLET, SOCKOLET, THREDOLET, NIPOLET, LATROLET -- none of which
-    # *start* with "OLET", so they used to fall through to OTHER and draw as
-    # a bare line. Hyphens and underscores are already normalised above, and
-    # stripping them catches THREAD-O-LET too.
+    # Branch bosses come out of real exporters under trade names (WELDOLET,
+    # SOCKOLET, THREDOLET, NIPOLET, LATROLET) that don't *start* with "OLET" and
+    # fell through to OTHER (bare line); stripping hyphens/underscores catches
+    # THREAD-O-LET too.
     if "OLET" in t.replace("-", ""):
         return "OLET"
     if t.startswith("TEE") or t.startswith("CROSS") or t.startswith("Y-PIECE"):
@@ -219,12 +218,11 @@ def is_slip_on_flange(description: str | None) -> bool:
     return "slip-on" in hay or "slip on" in hay or "(slip-on)" in hay or " so " in f" {hay} "
 
 
-# Real exports are inconsistent about flanges: plenty of them arrive as
-# COUPLING/OTHER records whose only evidence of being a flange is the
-# description ("Sch.80 Weld Neck Flange RF #300") or a FL- SKEY. Symbol
-# dispatch and dimension landmarks need to see those as flanges; the BOM,
-# cut list, and weld derivation keep using classify() unchanged so material
-# accounting is never altered by a display heuristic.
+# Real exports are inconsistent about flanges: plenty arrive as COUPLING/OTHER
+# records whose only evidence is the description ("Sch.80 Weld Neck Flange RF
+# #300") or a FL- SKEY. Symbol dispatch and dimension landmarks use this to see
+# them as flanges; the BOM/cut list/weld derivation keep classify() unchanged --
+# material accounting is never altered by a display heuristic.
 _FLANGE_WORDS = ("flange", "flg", "blind")
 
 
@@ -268,19 +266,12 @@ def is_annotation_symbol(component_type: str, description: str | None = None,
                          skey: str | None = None) -> bool:
     """A record that is a drawing symbol rather than a piece of material.
 
-    Exporters emit pipe flow arrows and slope arrows as MISC-COMPONENT
-    records carrying a single repeated point and zero weight. They classify
-    as INSTRUMENT, so they used to earn a BOM row, an item number and a
-    balloon apiece -- a fabricator was being asked to buy a slope arrow --
-    while drawing nothing, because a symbol whose two ends are the same
-    point has no axis to draw a body along.
-
-    Matched on the description, which is unambiguous ("6 inch pipe slope
-    arrow"): no real material is named a flow or slope arrow. The SKEY these
-    arrive under (CHPL) is not specific enough to key on by itself. Pass the
-    *resolved* description -- the component's own, falling back to the
-    MATERIALS table -- because plenty of exports name the part in only one
-    of the two.
+    Exporters emit flow/slope arrows as MISC-COMPONENT records: one repeated
+    point, zero weight, classify as INSTRUMENT -- they drew nothing (both ends
+    the same point) yet earned a BOM row and balloon apiece. Matched on the
+    description ("6 inch pipe slope arrow" -- no real material is named that);
+    the SKEY (CHPL) alone is not specific enough. Pass the *resolved* description
+    (own, else MATERIALS table) -- exports often name the part in only one.
     """
     hay = (description or "").lower()
     return any(word in hay for word in _ANNOTATION_WORDS)

@@ -40,18 +40,15 @@ ARCHIVE_DIR = "archive"
 DEFAULT_WORKSPACE_NAME = "pcf2isometric"
 
 # Split sheets are derived files: <parent stem>_SHT_<n>.pcf for geometric
-# splits, <parent stem>_SPL_<value>.pcf for key-based (spool/line) splits.
-# They are never sources, never snapshot targets, and never part of the
-# source audit.
+# splits, <parent stem>_SPL_<value>.pcf for key-based (spool/line) splits --
+# never sources, never snapshot targets, never part of the source audit.
 SHEET_RE = re.compile(r"_SHT_(\d+)$", re.IGNORECASE)
 KEY_SHEET_RE = re.compile(r"_SPL_.+$", re.IGNORECASE)
 
-# Zips are transport, never a deliverable. An archive found inside a
-# workspace or a CAD export folder is always a defect: either outputs were
-# zipped up "for convenience" instead of being left on disk as the folder
-# tree, or a transport zip was delivered and never unpacked. Both hide the
-# real deliverable and break the source audit, so every entry point that
-# touches a workspace scans for these and says so loudly.
+# Zips are transport, never a deliverable. An archive inside a workspace or a
+# CAD export folder is always a defect -- outputs zipped "for convenience" or
+# a delivered transport zip never unpacked; either hides the real deliverable
+# and breaks the source audit, so every entry point scans and says so loudly.
 ARCHIVE_SUFFIXES = (
     ".zip", ".7z", ".rar", ".tar", ".tgz", ".tbz2", ".txz",
     ".tar.gz", ".tar.bz2", ".tar.xz",
@@ -133,34 +130,29 @@ class ProjectConfig:
     project: str = ""
     job: str = ""
     requirements: list[str] = field(default_factory=list)
-    # Standing drawing notes (numbered NOTES block on every sheet) and
-    # drawing properties (title-block key/value column), applied to every
-    # render in this job.
+    # Standing drawing notes (numbered NOTES block on every sheet) and drawing
+    # properties (title-block key/value column), applied to every render in this job.
     notes: list[str] = field(default_factory=list)
     properties: dict[str, str] = field(default_factory=dict)
     detect_ffw: bool = False
     # Balloon crowding preference; adjusted semantically via
     # render_iso.py --spread-welds / --pack-welds and remembered per job.
     balloon_spread: float = 1.0
-    # The CAD-managed folder the customer's PCF exports live in (absolute, or
-    # relative to the project root). The tools only ever READ from it;
-    # check_source.py compares it against source/ and pulls copies in.
+    # The CAD-managed folder the customer's PCF exports live in (absolute or
+    # relative to the project root). Tools only READ from it; check_source.py audits.
     src_dir: str | None = None
-    # Sheet-splitting policy: split_by_distance.py separates piping groups
-    # further apart than split_distance (native units; null = 1 inch / 25 mm
-    # by the file's units). With auto_split true the agent applies a needed
-    # split without asking first.
+    # Sheet-splitting policy: split_by_distance.py separates piping groups further
+    # apart than split_distance (native units; null = 1 inch / 25 mm by the file's
+    # units). With auto_split true the agent applies a needed split without asking.
     split_distance: float | None = None
     auto_split: bool = False
-    # Key-based splitting: split_by_key.py splits masters into one sheet per
-    # value of this attribute (e.g. SPOOL-IDENTIFIER). When set, it is the
-    # job's preferred split and the pre-render check runs against it instead
-    # of the distance grouping.
+    # Key-based splitting: split_by_key.py splits masters into one sheet per value
+    # of this attribute (e.g. SPOOL-IDENTIFIER). When set it is the job's preferred
+    # split and the pre-render check runs against it instead of the distance grouping.
     split_key: str | None = None
-    # The job's split policy, chosen from process_pcf.py's four options:
-    # "none" (full-file render), "key" (one sheet per split_key value),
-    # "distance" (geometric sheets), or "hybrid" (distance sheets with spool
-    # labels and Field Weld declarations between spools). None = not chosen
+    # The job's split policy from process_pcf.py: "none" (full-file render), "key"
+    # (one sheet per split_key value), "distance" (geometric sheets), or "hybrid"
+    # (distance sheets + spool labels + Field Weld declarations). None = not chosen
     # yet; a legacy split_key alone implies "key".
     split_mode: str | None = None
     # Hybrid mode's labelling attribute (usually SPOOL-IDENTIFIER): spools
@@ -170,18 +162,15 @@ class ProjectConfig:
     # options presented to the user; any option can still be chosen.
     target_min_components: int = 10
     target_max_components: int = 20
-    # Drawings are schematic by default: pipe runs are compressed/stretched
-    # into a readable range and the sheet is stamped NOT TO SCALE. Rendering
-    # only -- cut lengths, BOM and dimension text always stay true.
+    # Drawings are schematic by default: runs compress/stretch into a readable range,
+    # sheet stamped NOT TO SCALE. Rendering only -- cut lengths/BOM/dimension text stay true.
     not_to_scale: bool = True
-    # Degrees of visual skew given to piping that is flat to the ground but
-    # runs on a 45/135/225/315-degree bearing, which a true isometric would
-    # draw as a vertical line on top of the risers. Set 0 for a strict
-    # isometric. Rendering only.
+    # Visual skew (degrees) for piping flat to the ground on a 45/135/225/315
+    # bearing, which a true isometric draws as a vertical line on top of the
+    # risers. Set 0 for a strict isometric. Rendering only.
     skew_deg: float = RenderOptions().skew_deg
-    # Page length (mm) of the bar drawn across a flange's gasket face.
-    # Defaults to twice the standard dimension offset; raise it if a shop
-    # wants flanges to shout louder on a busy sheet.
+    # Page length (mm) of the bar drawn across a flange's gasket face (defaults
+    # to twice the standard dimension offset; raise it if flanges must shout louder).
     flange_bar_mm: float = RenderOptions().flange_bar_mm
 
     def render_options(self, **overrides) -> RenderOptions:

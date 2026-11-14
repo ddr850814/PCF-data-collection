@@ -2,18 +2,9 @@
 
 Flat public API; scripts and agents should import from here.
 """
-# 本地修改：
-# render.py:
-# 1. _build_bom 跳过无 ITEM-CODE 的 WELD 记录（焊缝不是材料，避免占 BOM 行）；
-# 2. BOM 项号/气球固定用行顺序号 1..N（Isogen 惯例），原料号存 code 列
-#    （BomLine 新增 code 字段；图面 BOM 描述前缀带料号）；
-# 3. 直管(PIPE)气球改标 BOM 项号（原为切割标签 C1/C2 或不标）；
-# 4. 管架(SUPPORT)符号优先取 symbols/ 目录下 Isogen Symbol Editor 导出的
-#    .ASC 符号库（SUPPORT-DIRECTION 控制朝向）；无符号库时回退内置画法；
-# 5. FLOW-ARROW 流向箭头（SKEY=FLOW）：优先取符号库官方符号（沿最近管段
-#    定向，FLOW=2 反向），无符号时回退实心小三角；且不进 BOM。
-# asc_symbols.py（本地新增）：.ASC 符号库解析器（规则详见
-#    symbols/ASC符号格式规则.md）。
+# 本地修改：render.py——BOM 跳过无 ITEM-CODE 焊缝；项号/气球固定行序号 1..N（原料号存 code 列）；
+# 直管气球标 BOM 项号；SUPPORT/FLOW-ARROW 优先用 .ASC 符号库（SUPPORT-DIRECTION/FLOW 控向，
+# 无库回退内置画法，箭头不进 BOM）。asc_symbols.py 为本地新增解析器（见 symbols/ASC符号格式规则.md）。
 
 from .continuations import Continuation, build_continuation_map
 from .cutlist import BranchInfo, CutPiece, EndInfo, build_cutlist

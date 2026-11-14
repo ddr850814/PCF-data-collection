@@ -166,10 +166,9 @@ def split_document(
 
     graph = geometry.ConnectivityGraph(comps, tol)
 
-    # Sever adjacency at every cut point using a cut plane: components near
-    # the cut are classified to one side or the other along the joint axis,
-    # and only edges crossing the plane are severed. (Pairwise severing would
-    # isolate the short weld coupling that typically spans the joint.)
+    # Sever adjacency via a cut plane: components near the cut are classified
+    # to one side along the joint axis, only edges crossing the plane are severed
+    # (pairwise severing would isolate the short weld coupling spanning the joint).
     for cut in cut_points:
         at_cut = geometry.components_at_point(comps, cut, tol * 4)
         if not at_cut:
@@ -203,9 +202,8 @@ def split_document(
         )
 
     # Primary groups are the ones the cuts actually touched; any other group
-    # (piping that was already disconnected in the source, floating
-    # instruments, ...) rides along with the nearest primary group instead of
-    # becoming its own file.
+    # (source-disconnected piping, floating instruments, ...) rides along with
+    # the nearest primary group instead of becoming its own file.
     touched: set[int] = set()
     for cut in cut_points:
         touched.update(geometry.components_at_point(comps, cut, tol * 4))
@@ -369,9 +367,9 @@ class KeySurvey:
     total: int              # real components in the document
     distinct: int           # distinct values
     values: dict[str, int]  # value -> component count
-    # Fraction of value-groups that are a single connected island (1.0 =
-    # every value maps to one contiguous piece of piping -- the signature
-    # of a true spool/line grouping). None when not computed.
+    # Fraction of value-groups that are a single connected island (1.0 = every value
+    # maps to one contiguous piece of piping -- a true spool/line grouping); None if
+    # not computed.
     cohesion: float | None = None
 
     @property
