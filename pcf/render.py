@@ -16,7 +16,7 @@ import json
 import math
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date as _date
 from itertools import permutations
 from pathlib import Path
@@ -27,9 +27,11 @@ from .cutlist import CutPiece, build_cutlist
 from .dims import (DEFAULT_OFFSET_MM, Dimension, flange_face,
                    infer_dimensions, load_sidecar, merge_with_sidecar)
 from .model import Component, PcfDocument, Point
+from .sheetpack import PagePlan, SheetInfo, plan as _plan_sheets
 from .skeys import (classify, connection_from_skey, is_annotation_symbol,
                     is_slip_on_flange, is_weld_coupling, looks_like_flange,
                     reducer_is_eccentric, type_from_skey, valve_subtype)
+from .splitmerge import split_pages
 from .units import (coord_to_inch_factor, format_bore, format_feet_inches,
                     format_length, format_mm, is_metric_units)
 from .welds import (GAP_COUPLING_MAX_INCHES, Weld, component_spools,
@@ -126,6 +128,7 @@ class WeldPosition:
     uci: str = ""        # UNIQUE-COMPONENT-IDENTIFIER of the weld record
     spool: str = ""      # spool value ("SP-1"; "SP-1 / SP-2" at a boundary)
     notes: str = ""      # "Field Weld" for inter-spool joints (hybrid mode)
+    sheet: str = ""      # 分页页号（"p1"；单页输出为空）
 
 
 @dataclass
@@ -139,6 +142,7 @@ class BomLine:
     weight: float
     ucis: str = ""       # ";"-joined UNIQUE-COMPONENT-IDENTIFIERs in the row
     code: str = ""       # original ITEM-CODE (balloon uses sequential item no.)
+    sheet: str = ""      # 分页页号（"p1"；单页输出为空）
 
 
 @dataclass
@@ -166,6 +170,7 @@ class RenderResult:
     bom_truncated: bool = False
     cut_truncated: bool = False
     warnings: list[str] = field(default_factory=list)
+    pages: int = 1       # NTS 1:1 自动分页后的页数（单页恒 1）
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +220,10 @@ class Projector:
         # 回退（未映射派生点——尺寸盒角点/设备管口——跟随最近已布几何）。
         self.schematic_scale = 1.0
         self.offset_nearest = False
+        # NTS 1:1 分页落位（chain_preset）：raw 是真实比例，派生点直接加最近点
+        # 平移会把 raw 差量按真实长度画出页外（尺寸偏移盒 sprawled）；置 True 时
+        # 最近点回退改用局部压缩比 σ 缩放 raw 差量（链式方向=raw 轴测方向）。
+        self.nearest_local_scale = False
 
     def set_skew(self, degrees: float) -> None:
         """Tilt the plan diagonal that projects vertical by ``degrees``.
@@ -290,6 +299,27 @@ class Projector:
                                t1[1] + (t2[1] - t1[1]) * rel)
                 if off is None:
                     off = best[2] if best is not None else (0.0, 0.0)
+                if best is not None and self.nearest_local_scale:
+                    # 分页 1:1：以最近两点的 打包距/raw距 估局部压缩比 σ，把
+                    # 派生点的 raw 差量缩到打包尺度（方向沿用 raw 轴测方向）。
+                    _dd1, k1, d1 = best
+                    r1 = self.raw(k1)
+                    sigma = 1.0
+                    if second is not None:
+                        _dd2, k2, d2 = second
+                        r2 = self.raw(k2)
+                        num = math.hypot((r2[0] - r1[0]) * self.scale + d2[0] - d1[0],
+                                         (r2[1] - r1[1]) * self.scale + d2[1] - d1[1])
+                        den = math.hypot((r2[0] - r1[0]) * self.scale,
+                                         (r2[1] - r1[1]) * self.scale)
+                        if den > 1e-9:
+                            sigma = num / den
+                    base1 = (r1[0] * self.scale + self.offset[0] + d1[0],
+                             r1[1] * self.scale + self.offset[1] + d1[1])
+                    return (base1[0] + (page[0] - self.offset[0]
+                                       - r1[0] * self.scale) * sigma,
+                            base1[1] + (page[1] - self.offset[1]
+                                       - r1[1] * self.scale) * sigma)
             dx, dy = off if off is not None else (0.0, 0.0)
             page = (page[0] + dx, page[1] + dy)
         return page
@@ -1190,13 +1220,321 @@ def render_pdf(
     pdf = _Pdf(orientation="landscape" if page_w >= page_h else "portrait",
                unit="mm", format=(page_h, page_w) if page_w >= page_h else (page_w, page_h))
     pdf.set_auto_page_break(False)
-    pdf.add_page()
     pdf.set_text_color(0, 0, 0)
     pdf.set_draw_color(0, 0, 0)
-    result = _render_document(doc, options, _FpdfBackend(pdf),
-                              page_w, page_h, pdf_path=output_path)
+    backend = _FpdfBackend(pdf)
+    if options.not_to_scale and not options.preview:
+        # NTS 固定 1:1：超幅自动分页（测量遍装箱 → 逐页 preset 落位）
+        result = _render_pdf_nts(doc, options, backend, pdf, page_w, page_h,
+                                 output_path)
+    else:
+        pdf.add_page()
+        result = _render_document(doc, options, backend, page_w, page_h,
+                                  pdf_path=output_path)
     pdf.output(str(output_path))
     return result
+
+
+_NTS_WINDOW_MARGIN = 0.82   # 与 fit()/链式打包同一标注带余量
+_COMP_BOX_MARGIN_MM = 4.5   # 非 PIPE 件图面盒外扩（手轮/球标/法兰杠出头）
+
+
+def _drawable_comps(doc: PcfDocument) -> list[tuple[Component, str]]:
+    comps: list[tuple[Component, str]] = []
+    for pipeline in doc.pipelines:
+        for comp in pipeline.real_components():
+            comps.append((comp, pipeline.reference))
+    return comps
+
+
+def _usable_window(draw_region: tuple) -> tuple:
+    rx, ry, rw, rh = draw_region
+    m = _NTS_WINDOW_MARGIN
+    uw, uh = rw * m, rh * m
+    return (rx + (rw - uw) / 2, ry + (rh - uh) / 2, uw, uh)
+
+
+def _measure_chain(doc: PcfDocument, comps: list[tuple[Component, str]],
+                   draw_region: tuple, options: RenderOptions):
+    """NTS 1:1 测量遍：跑一次 fit=False 链式布局产出装箱输入。
+
+    返回 (全点平移表, SheetInfo) 或 None（链式失败 → 调用方回退 warp 整页）。
+    测量投影只取方向（scale/offset 不影响链式几何），warp 必须为空。
+    """
+    proj = Projector(options)
+    info: dict = {}
+    chain = _chain_layout(proj, doc, comps, draw_region, fit=False, collect=info)
+    if chain is None or not chain[0]:
+        return None
+    delta = chain[0]
+    pos = info["pos"]
+    materials = doc.materials_descriptions()
+    boxes: list = []
+    pts_list: list = []
+    pipes: list[bool] = []
+    pipe_axes: list = []
+    bom_keys: list = []
+    for comp, _ref in comps:
+        pts = [p.xyz for p in (*comp.connection_points(), *comp.centre_points)
+               if p.xyz in pos]
+        pts_list.append(pts)
+        cls = classify(comp.type, comp.skey)
+        is_pipe = cls == "PIPE" and len(pts) >= 2
+        if is_pipe:
+            eps = comp.end_points
+            axis = (eps[0].xyz, eps[1].xyz)
+            # 零长/极短轴切不开（切点必须在管内部），不作为候选
+            if geometry.dist(axis[0], axis[1]) <= 1e-3:
+                is_pipe = False
+        pipes.append(is_pipe)
+        if is_pipe:
+            pipe_axes.append(axis)
+        else:
+            pipe_axes.append(None)
+        if pts:
+            x0 = min(pos[k][0] for k in pts)
+            x1 = max(pos[k][0] for k in pts)
+            y0 = min(pos[k][1] for k in pts)
+            y1 = max(pos[k][1] for k in pts)
+            if cls not in ("PIPE", "WELD", "BOLT", "GASKET"):
+                # 手轮/球标/法兰杠会伸出符号体，图面盒留出头余量
+                x0 -= _COMP_BOX_MARGIN_MM
+                x1 += _COMP_BOX_MARGIN_MM
+                y0 -= _COMP_BOX_MARGIN_MM
+                y1 += _COMP_BOX_MARGIN_MM
+            boxes.append((x0, y0, x1, y1))
+        else:
+            boxes.append(None)
+        bom_keys.append(_bom_row_key(comp, materials))
+    sheet_info = SheetInfo(boxes=boxes, pts=pts_list, pipes=pipes,
+                           pipe_axes=pipe_axes, bom_keys=bom_keys, pos=pos)
+    return delta, sheet_info
+
+
+def _page_sheet_name(options: RenderOptions, doc: PcfDocument, n: int) -> str:
+    stem = options.drawing_no or (Path(doc.source_path).stem if doc.source_path
+                                  else "drawing")
+    return f"{stem}_SHT_{n}"
+
+
+def _render_pdf_nts(doc: PcfDocument, options: RenderOptions, backend, pdf,
+                    page_w: float, page_h: float, output_path: Path) -> RenderResult:
+    """NTS 固定 1:1 输出编排：测量遍网格切片 →（需要时）切管分页 → 逐页落位。
+
+    预览（render_scene）不受影响：仍走 fit 自适应缩放的整段路径。
+    链式失败时回退旧整页路径（warp 兜底缩），保证出图不中断。
+    """
+    warnings: list[str] = []
+    border = 6.0
+    bom_w = page_w * 0.24 if options.show_bom else 0.0
+    title_h = page_h * 0.16
+    draw_region = (border + 2, border + 2,
+                   page_w - 2 * border - bom_w - 4,
+                   page_h - 2 * border - title_h - 4)
+    comps = _drawable_comps(doc)
+    if not comps:
+        pdf.add_page()
+        return _render_document(doc, options, backend, page_w, page_h,
+                                pdf_path=output_path)
+    measured = _measure_chain(doc, comps, draw_region, options)
+    if measured is None:
+        # 链式失败（极少数拓扑）：回退旧整页路径（含 warp 兜底缩）
+        pdf.add_page()
+        result = _render_document(doc, options, backend, page_w, page_h,
+                                  pdf_path=output_path)
+        result.warnings.append(
+            "chain layout unavailable; sheet scaled to fit as before")
+        return result
+    delta, info = measured
+    usable = _usable_window(draw_region)
+    capacity = _bom_capacity(draw_region[3], options.show_cut_table)
+    tol = geometry.model_tolerance(doc)
+    plans, cuts, comp_cell, seg_cells, notes = _plan_sheets(
+        info, usable, capacity, options.show_cut_table, conn_tol=tol)
+    warnings.extend(notes)
+
+    total = len(plans)
+    page_names = [_page_sheet_name(options, doc, k + 1) for k in range(total)]
+    sheet_no_of = {p.cell: k + 1 for k, p in enumerate(plans)}
+    proj0 = Projector(options)   # 与测量遍同参投影（raw 基准一致）
+
+    def pos_of(w: Vec3, pipe_idx: int) -> Vec2:
+        """世界点 w（在 pipe_idx 轴上）的打包图面位：直查位表，否则轴向插值。"""
+        if w in info.pos:
+            return info.pos[w]
+        a, b = info.pipe_axes[pipe_idx]
+        pa, pb = info.pos.get(a), info.pos.get(b)
+        if pa is None or pb is None:
+            return proj0.raw(w)
+        axis = geometry.sub(b, a)
+        l2 = geometry.dot(axis, axis)
+        t = 0.0 if l2 <= 1e-18 else max(0.0, min(1.0,
+                geometry.dot(geometry.sub(w, a), axis) / l2))
+        return (pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t)
+
+    # （需要时）切管分页：页归属闭包按盒中心/管段轴向中点归格
+    subdocs: list = []
+    placed_cuts: list[Vec3] = []
+    if total > 1:
+        def page_of(comp: Component) -> tuple[int, int]:
+            oidx = getattr(comp, "_orig_idx", -1)
+            segs = seg_cells.get(oidx)
+            if segs is None:
+                if 0 <= oidx < len(comp_cell):
+                    return comp_cell[oidx]
+                return plans[0].cell
+            eps = comp.end_points
+            a, b = info.pipe_axes[oidx]
+            axis = geometry.sub(b, a)
+            l2 = geometry.dot(axis, axis)
+            mid = geometry.scale(geometry.add(eps[0].xyz, eps[1].xyz), 0.5)
+            t = 0.0 if l2 <= 1e-18 else geometry.dot(
+                geometry.sub(mid, a), axis) / l2
+            for t0, t1, cell in segs:
+                if t0 - 1e-9 <= t <= t1 + 1e-9:
+                    return cell
+            return segs[-1][2] if t > 0.5 else segs[0][2]
+
+        subdocs, cells, cut_notes, placed_cuts = split_pages(
+            doc, [c[0] for c in cuts], page_of)
+        warnings.extend(f"page split: {n}" for n in cut_notes)
+        if cells != [p.cell for p in plans]:
+            # 归格与切片计划不一致（不应发生）：回退整页，保证出图不中断
+            pdf.add_page()
+            result = _render_document(doc, options, backend, page_w, page_h,
+                                      pdf_path=output_path)
+            result.warnings.append(
+                "page grouping mismatch; sheet rendered whole")
+            return result
+    else:
+        subdocs = [doc]
+    # 落刀点精确键（.4f 重写后的解析值）← (pipe_idx, 计划切点)
+    placed_of: dict[tuple[int, Vec3], Vec3] = {}
+    for (wp, pipe_idx, _t), placed in zip(cuts, placed_cuts):
+        placed_of[(pipe_idx, wp)] = placed
+
+    # 页间断点合成接续声明（声明驱动同通道：箭头 + SEE ISO / SHT n），
+    # 幻影件经 neighbour_docs 指向相邻页子文档。
+    neighbour_base = dict(options.neighbour_docs or {})
+    for k, part in enumerate(subdocs):
+        if part is not doc:
+            neighbour_base[page_names[k]] = part
+
+    results: list[RenderResult] = []
+    for k in range(total):
+        plan = plans[k]
+        page_deltas: dict[Vec3, Vec2] = {}
+        page_pts: set[Vec3] = set()
+        cut_here = {pidx for pidx, _a, _b in plan.pieces}
+        for cid in plan.comp_ids:
+            if cid in cut_here:
+                continue                # 被切管只带本页管段端点（下循环）
+            for pt in info.pts[cid]:
+                page_pts.add(pt)
+                if pt in delta:
+                    page_deltas[pt] = delta[pt]
+        for pidx, wa, wb in plan.pieces:
+            for w in (wa, wb):
+                page_pts.add(w)
+                if w in delta:
+                    page_deltas[w] = delta[w]
+                elif w not in info.pos:
+                    # 内部切点：子文档端点是落刀精确键，显式补 delta（投影仿射）
+                    wkey = (pidx, tuple(round(v, 4) for v in w))
+                    placed = placed_of.get(wkey)
+                    if placed is None:
+                        continue
+                    pp = pos_of(placed, pidx)
+                    base = proj0.raw(placed)
+                    page_deltas[placed] = (pp[0] - base[0], pp[1] - base[1])
+                    page_pts.add(placed)
+
+        # 页盒（未切件整盒 + 被切管本页段）中心 → 可用窗口中心 = 本页 offset；
+        # 盒略超窗口时钳位贴边，防符号余量出界。
+        box = None
+        for cid in plan.comp_ids:
+            if cid in cut_here:
+                continue
+            box = _union_box(box, info.boxes[cid])
+        for pidx, wa, wb in plan.pieces:
+            pa, pb = pos_of(wa, pidx), pos_of(wb, pidx)
+            box = _union_box(box, (min(pa[0], pb[0]), min(pa[1], pb[1]),
+                                   max(pa[0], pb[0]), max(pa[1], pb[1])))
+        if box is None:
+            box = (usable[0], usable[1], usable[0] + usable[2],
+                   usable[1] + usable[3])
+        ox = usable[0] + usable[2] / 2 - (box[0] + box[2]) / 2
+        oy = usable[1] + usable[3] / 2 - (box[1] + box[3]) / 2
+        lo, hi = usable[0] - box[0], usable[0] + usable[2] - box[2]
+        if lo <= hi:
+            ox = min(max(ox, lo), hi)
+        lo, hi = usable[1] - box[1], usable[1] + usable[3] - box[3]
+        if lo <= hi:
+            oy = min(max(oy, lo), hi)
+        offset = (ox, oy)
+
+        conts = [c for c in options.continuations
+                 if any(geometry.dist(c.point, pt) <= tol * 4 for pt in page_pts)]
+        for wp, nb_cell, pidx, inb in plan.outs:
+            nb_no = sheet_no_of.get(nb_cell)
+            if nb_no is None:
+                continue
+            if pidx < 0:
+                # 跨格组件接续（短管不切兜底）：无线号/管径引用
+                conts.append(Continuation(
+                    point=wp, drawing=page_names[nb_no - 1],
+                    reference="", inboard=inb, bore=None,
+                    sheets=[page_names[nb_no - 1]],
+                    sheet_tag=f"SHT {nb_no}"))
+                continue
+            comp, ref = comps[pidx]
+            eps = comp.end_points
+            conts.append(Continuation(
+                point=placed_of.get((pidx, wp), wp),
+                drawing=page_names[nb_no - 1],
+                reference=ref or "", inboard=inb,
+                bore=eps[0].bore if eps else None,
+                sheets=[page_names[nb_no - 1]], sheet_tag=f"SHT {nb_no}"))
+
+        opt = replace(options, continuations=conts,
+                      neighbour_docs=dict(neighbour_base))
+        pdf.add_page()
+        res = _render_document(subdocs[k], opt, backend, page_w, page_h,
+                               pdf_path=output_path,
+                               chain_preset={"deltas": page_deltas,
+                                             "offset": offset},
+                               sheet_no=k + 1, sheet_total=total)
+        if total > 1:
+            res.warnings = [f"[SHT {k + 1}] {w}" for w in res.warnings]
+        results.append(res)
+    return _merge_results(results, output_path)
+
+
+def _union_box(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _merge_results(results: list[RenderResult], output_path: Path) -> RenderResult:
+    base = results[0]
+    return RenderResult(
+        pdf_path=output_path,
+        page_width_mm=base.page_width_mm,
+        page_height_mm=base.page_height_mm,
+        welds=[w for r in results for w in r.welds],
+        dimensions=[d for r in results for d in r.dimensions],
+        cut_pieces=[c for r in results for c in r.cut_pieces],
+        bom=[b for r in results for b in r.bom],
+        callouts=[c for r in results for c in r.callouts],
+        continuations=[c for r in results for c in r.continuations],
+        bom_truncated=any(r.bom_truncated for r in results),
+        cut_truncated=any(r.cut_truncated for r in results),
+        warnings=[w for r in results for w in r.warnings],
+        pages=len(results),
+    )
 
 
 def render_scene(
@@ -1223,7 +1561,13 @@ def _render_document(
     page_w: float,
     page_h: float,
     pdf_path: Path | None = None,
+    chain_preset: dict | None = None,
+    sheet_no: int = 0,
+    sheet_total: int = 0,
 ) -> RenderResult:
+    """chain_preset（NTS 1:1 分页路径）：{"deltas": 全点平移表, "offset": 本页
+    平移}。给定时跳过 fit/链式/warp，直接按测量遍结果摆件；sheet_no/total
+    进标题栏 SHEET 字段并给焊点/BOM/切割件打页号。"""
     warnings: list[str] = []
 
     # ---- layout regions -------------------------------------------------
@@ -1238,10 +1582,7 @@ def _render_document(
     spread = max(0.4, min(3.0, options.balloon_spread))
     canvas = _Canvas(backend, bounds=draw_region, spread=spread)
 
-    comps: list[tuple[Component, str]] = []
-    for pipeline in doc.pipelines:
-        for comp in pipeline.real_components():
-            comps.append((comp, pipeline.reference))
+    comps = _drawable_comps(doc)
     if not comps:
         raise ValueError("document contains no drawable components")
 
@@ -1260,46 +1601,56 @@ def _render_document(
         all_points.append(pxyz)
 
     projector = Projector(options)
-    projector.fit(all_points, draw_region)
-
     reducer_runs = _reducer_runs(doc)
 
-    # 搭积木链式布局（示意模式）：位置由拓扑走链决定；失败回退 warp
+    # 搭积木链式布局（示意模式）：位置由拓扑走链决定；失败回退 warp。
+    # 分页路径（chain_preset）已带测量遍结果，这里只落位不再布局。
     chain = None
     floored = False
-    if options.not_to_scale and len(all_points) > 1:
-        try:
-            # 超幅：直管/腿档位按缩放比收缩重摆（符号端点对刚性，打包层只压管线
-            # 边），缩放比累计迭代到装得下；档位触底仍超幅时才整体兜底缩（含符号，
-            # rigid off）。
-            pipe_scale = 1.0
-            chain = _chain_layout(projector, doc, comps, draw_region)
-            for _ in range(4):
-                if chain is None or chain[2] >= 0.98:
-                    break
-                pipe_scale *= chain[2]
-                if pipe_scale < 0.15:
-                    pipe_scale = 0.15
-                    floored = True
-                chain = _chain_layout(projector, doc, comps, draw_region,
-                                      pipe_scale=pipe_scale,
-                                      rigid_symbols=not floored)
-                if floored:
-                    break
-        except Exception as exc:
-            # 失败必须可见：静默回退会让"链式没生效"伪装成布局缺陷
-            chain = None
-            warnings.append(f"chain layout failed ({exc}); fell back to warp")
-    chain_on = chain is not None and bool(chain[0])
-    if chain_on:
-        projector.point_offsets.update(chain[0])
-        # 符号恒定：正常收敛（打包层只压管线边）时 schematic_scale=1.0，符号端点对
-        # 不缩、绘制尺寸不变；仅触底兜底时整体同缩保持自洽。未映射派生点走最近点
-        # 平移回退。
-        projector.schematic_scale = chain[2] if floored else 1.0
+    chain_on = False
+    if chain_preset is not None:
+        chain_on = True
+        projector.scale = 1.0
+        projector.offset = chain_preset["offset"]
+        projector.point_offsets.update(chain_preset["deltas"])
         projector.offset_nearest = True
-        if chain[1]:
-            warnings.append(chain[1])
+        projector.nearest_local_scale = True
+    else:
+        projector.fit(all_points, draw_region)
+        if options.not_to_scale and len(all_points) > 1:
+            try:
+                # 超幅：直管/腿档位按缩放比收缩重摆（符号端点对刚性，打包层只压管线
+                # 边），缩放比累计迭代到装得下；档位触底仍超幅时才整体兜底缩（含符号，
+                # rigid off）。
+                pipe_scale = 1.0
+                chain = _chain_layout(projector, doc, comps, draw_region)
+                for _ in range(4):
+                    if chain is None or chain[2] >= 0.98:
+                        break
+                    pipe_scale *= chain[2]
+                    if pipe_scale < 0.15:
+                        pipe_scale = 0.15
+                        floored = True
+                    chain = _chain_layout(projector, doc, comps, draw_region,
+                                          pipe_scale=pipe_scale,
+                                          rigid_symbols=not floored)
+                    if floored:
+                        break
+            except Exception as exc:
+                # 失败必须可见：静默回退会让"链式没生效"伪装成布局缺陷
+                chain = None
+                warnings.append(f"chain layout failed ({exc}); fell back to warp")
+        chain_on = chain is not None and bool(chain[0])
+    if chain_on:
+        if chain_preset is None:
+            projector.point_offsets.update(chain[0])
+            # 符号恒定：正常收敛（打包层只压管线边）时 schematic_scale=1.0，符号端点对
+            # 不缩、绘制尺寸不变；仅触底兜底时整体同缩保持自洽。未映射派生点走最近点
+            # 平移回退。
+            projector.schematic_scale = chain[2] if floored else 1.0
+            projector.offset_nearest = True
+            if chain[1]:
+                warnings.append(chain[1])
         # 偏心变径：小端连通侧整体平移到符号出口（按 skey 正算的小端中点，与 warp
         # 通道同一机制）。链式只把变径两端摆上主轴，偏心量由这里叠加，下游管线从
         # 符号小端中点续走。
@@ -1309,7 +1660,7 @@ def _render_document(
             prev = projector.point_offsets.get(k)
             if prev is not None:
                 projector.point_offsets[k] = _v2_add(prev, dv)
-    if not chain_on and options.not_to_scale and len(all_points) > 1:
+    if chain_preset is None and not chain_on and options.not_to_scale and len(all_points) > 1:
         # Fixed-count iteration: warp targets depend on page scale and vice versa,
         # so refit a few times; deterministic for same model and options.
         tiny_world = _NTS_TINY_INCHES / coord_to_inch_factor(doc.units_coords)
@@ -1448,6 +1799,7 @@ def _render_document(
             neighbors=" | ".join(weld.neighbors),
             uci=weld.uci or "",
             spool=weld.spool, notes=weld.notes,
+            sheet=f"p{sheet_no}" if sheet_no else "",
         ))
 
     # ---- spool labels + field-weld tags (hybrid mode) ----------------------
@@ -1518,6 +1870,9 @@ def _render_document(
     # ---- callouts -----------------------------------------------------------
     bom_rows = _build_bom(doc, comps)
     cut_pieces = build_cutlist(doc)
+    if sheet_no:
+        for piece in cut_pieces:
+            piece.sheet = f"p{sheet_no}"
     pipe_labels = {c.comp_index: c.label
                    for c in cut_pieces if c.comp_index is not None}
     callouts: list[Callout] = []
@@ -1548,13 +1903,15 @@ def _render_document(
                             "into smaller spools")
             _draw_overflow_warning(canvas, draw_region, which)
         _draw_title_block(canvas, doc, options, x=border, y=page_h - border - title_h,
-                          w=page_w - 2 * border, h=title_h)
+                          w=page_w - 2 * border, h=title_h,
+                          sheet=(sheet_no, sheet_total) if sheet_total > 1 else None)
 
     bom_lines = [
         BomLine(item=str(r["item"]), description=r["description"], nps=r["nps"],
                 cls=r["class"], qty=r["qty"], length_in=round(r["length_in"], 3),
                 weight=round(r["weight"], 3),
-                ucis=";".join(sorted(r["_ucis"])), code=r["code"])
+                ucis=";".join(sorted(r["_ucis"])), code=r["code"],
+                sheet=f"p{sheet_no}" if sheet_no else "")
         for r in sorted(bom_rows.values(), key=lambda r: _item_sort_key(r["item"]))
     ]
 
@@ -1571,6 +1928,7 @@ def _render_document(
         bom_truncated=bom_truncated,
         cut_truncated=cut_truncated,
         warnings=warnings,
+        pages=sheet_total or 1,
     )
 
 
@@ -1742,24 +2100,17 @@ def _coordinate_text(point: Vec3, doc: PcfDocument,
 def _draw_continuation(canvas: _Canvas, proj: Projector, cont: Continuation,
                        doc: PcfDocument, options: RenderOptions,
                        draw_centre: Vec2) -> None:
-    """分图接续标记：沿线箭头 + SEE ISO 管线号/SHT/坐标文字块（仅分图型）。"""
+    """分图接续标记：SEE ISO 管线号/SHT/坐标文字块（仅分图型）。
+
+    断口处不再画箭头/短管——虚线幻影接续线已表达方向与对侧内容。
+    """
     at = proj.page(cont.point)
-    out: Vec2 | None = None
-    if cont.inboard is not None:
-        out = _v2_norm(_v2_sub(at, proj.page(cont.inboard)))
-    if not out or out == (0.0, 0.0):
-        out = _v2_norm(_v2_sub(at, draw_centre)) or (0.7071, -0.7071)
-
-    tip = _v2_add(at, _v2_scale(out, _CONT_STUB_MM))
-    canvas.line(at, tip, width=0.35)
-    _draw_arrowhead(canvas, tip, _v2_scale(out, -1.0))
-
     lines = _cont_callout_lines(doc, cont, options)
     canvas.pdf.set_font("Helvetica", size=_CONT_FONT)
     text_w = max(canvas.pdf.get_string_width(line) for line in lines)
     w = text_w + 2 * _CONT_PAD_MM
     h = len(lines) * _CONT_LINE_MM + 2 * _CONT_PAD_MM - (_CONT_LINE_MM - _CONT_CAP)
-    pos = canvas.place_label(tip, w, h, draw_centre, min_leader=7.0,
+    pos = canvas.place_label(at, w, h, draw_centre, min_leader=7.0,
                              avoid_geometry=True, clearance=_CONT_CLEARANCE_MM)
 
     with canvas.pdf.local_context():
@@ -1770,9 +2121,9 @@ def _draw_continuation(canvas: _Canvas, proj: Projector, cont: Continuation,
     for n, line in enumerate(lines):
         canvas.text((pos[0], top + n * _CONT_LINE_MM), line, size=_CONT_FONT)
 
-    edge = _box_edge_toward(pos, tip, w, h)
-    if _v2_len(_v2_sub(tip, edge)) > 0.8:
-        canvas.line(edge, tip, width=0.15)
+    edge = _box_edge_toward(pos, at, w, h)
+    if _v2_len(_v2_sub(at, edge)) > 0.8:
+        canvas.line(edge, at, width=0.15)
 
 
 def _declared_end_positions(doc: PcfDocument) -> list[Vec3]:
@@ -1831,6 +2182,8 @@ def _junction_kind(doc: PcfDocument, cont: Continuation,
     用 PCF 自己声明的引用判断：引用里的线号不等于本图管线号 → 跨管线。
     """
     own = _sheet_line_refs(doc)
+    if cont.sheet_tag is not None:
+        return "split"    # 人工合成的页间断点，无需查邻图
     if cont.resolved:
         for name in cont.sheets:
             ndoc = (options.neighbour_docs or {}).get(name)
@@ -1887,9 +2240,15 @@ def _cont_callout_lines(doc: PcfDocument, cont: Continuation,
     names = _declared_ref_lines(cont.reference)
     lines = [f"SEE ISO {names[0]}", *names[1:]] if names else []
     if _junction_kind(doc, cont, options) == "split":
-        tags = [_sheet_tag(n) for n in cont.sheets]
+        if cont.sheet_tag is not None:
+            tags = [cont.sheet_tag]
+        else:
+            tags = [_sheet_tag(n) for n in cont.sheets]
         if tags:
-            lines.append(" / ".join(tags))
+            tag_line = " / ".join(tags)
+            # 无线号引用（跨格组件接续）时页号行冠 SEE ISO，与声明型同风格
+            lines.append(tag_line) if lines else lines.append(
+                f"SEE ISO {tag_line}")
     if not lines:
         return list(coords)    # 不接任何东西 → 只写坐标
     return [*lines, *coords]
@@ -1944,6 +2303,25 @@ def _draw_phantom_mate(canvas: _Canvas, proj: Projector, doc: PcfDocument,
     """
     at3 = cont.point
     at = proj.page(at3)
+    base_raw = proj.raw(at3)
+    # 幻影映射锚定断点：远端点不走 offset_nearest 回退（可能锚到世界
+    # 最近但方向错误的点，把 raw 差量画歪——BR3R-30001 立管切点案例）；
+    # σ 取断点→inboard 的页距/raw距局部压缩比，幻影按打包尺度贴断点展开。
+    sigma = proj.scale
+    if cont.inboard is not None:
+        pg = proj.page(cont.inboard)
+        pg_l = _v2_len(_v2_sub(pg, at))
+        raw_l = _v2_len(_v2_sub(proj.raw(cont.inboard), base_raw))
+        if pg_l > 1e-6 and raw_l > 1e-12:
+            sigma = pg_l / raw_l
+
+    def pmap(w: Vec3) -> Vec2:
+        if w in proj.point_offsets:
+            return proj.page(w)
+        r = proj.raw(w)
+        return (at[0] + (r[0] - base_raw[0]) * sigma,
+                at[1] + (r[1] - base_raw[1]) * sigma)
+
     for comp in _neighbour_mates(doc, cont, options):
         cls = classify(comp.type, comp.skey)
         if cls in ("BOLT", "GASKET", "SUPPORT", "MESSAGE"):
@@ -1955,8 +2333,8 @@ def _draw_phantom_mate(canvas: _Canvas, proj: Projector, doc: PcfDocument,
             near = 0 if (geometry.dist(eps[0].xyz, at3)
                          <= geometry.dist(eps[-1].xyz, at3)) else -1
             far = eps[1] if near == 0 else eps[-2]
-            pa = proj.page(eps[near].xyz)
-            pb = proj.page(far.xyz)
+            pa = pmap(eps[near].xyz)
+            pb = pmap(far.xyz)
             d = _v2_sub(pb, pa)
             ln = _v2_len(d)
             if ln > 1e-6:
@@ -1973,8 +2351,8 @@ def _draw_phantom_mate(canvas: _Canvas, proj: Projector, doc: PcfDocument,
         if len(eps) >= 2:
             # 幻影管件：SKEY 符号虚线，符号首点对齐断点（与设备管口
             # 虚线画法同模式，法兰等符号按真实朝向落在幻影位置）
-            e0 = proj.page(eps[0].xyz)
-            e1 = proj.page(eps[-1].xyz)
+            e0 = pmap(eps[0].xyz)
+            e1 = pmap(eps[-1].xyz)
             u = _v2_norm(_v2_sub(e1, e0))
             if u == (0.0, 0.0):
                 continue
@@ -1988,15 +2366,15 @@ def _draw_phantom_mate(canvas: _Canvas, proj: Projector, doc: PcfDocument,
             # ASC 库缺符号时的手写虚线回退：弯头画两腿折线，三通/支管台
             # 画主管加支管腿，其余退化为两端虚线
             if cls == "ELBOW" and comp.centre_points:
-                corner = proj.page(comp.centre_points[0].xyz)
+                corner = pmap(comp.centre_points[0].xyz)
                 canvas.dashed(e0, corner, width=0.3)
                 canvas.dashed(corner, e1, width=0.3)
             elif cls in ("TEE", "OLET") and comp.centre_points:
-                centre = proj.page(comp.centre_points[0].xyz)
+                centre = pmap(comp.centre_points[0].xyz)
                 canvas.dashed(e0, centre, width=0.3)
                 canvas.dashed(centre, e1, width=0.3)
                 for bp in (*comp.branch1_points, *comp.branch2_points):
-                    canvas.dashed(centre, proj.page(bp.xyz), width=0.3)
+                    canvas.dashed(centre, pmap(bp.xyz), width=0.3)
             else:
                 canvas.dashed(e0, e1, width=0.3)
 
@@ -2414,6 +2792,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
                   draw_region: tuple,
                   pipe_scale: float = 1.0,
                   rigid_symbols: bool = True,
+                  fit: bool = True,
+                  collect: dict | None = None,
                   ) -> tuple[dict[Vec3, Vec2], str | None, float] | None:
     """搭积木链式布局（示意模式专用）：位置由拓扑走链决定。
 
@@ -2422,6 +2802,10 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
     永不断开；每段方向 = 该管段世界轴向的无 warp 投影（轴测 30° 族），
     弯头按模型转角转。坐标不参与图面定位，只提供方向；尺寸/坐标文字
     仍取模型真值。多连通组竖排打包；整体超幅时等比缩放并返回警告。
+
+    fit=False（NTS 固定 1:1 测量遍）：不缩放、不居中、不警告——打包后
+    内容平移到原点，缩放由分页装箱接管。collect 给定时回填打包测量
+    数据：pos（打包后绝对图面位表，不含 free_drop）。
 
     返回 (全点图面平移表, 警告|None)；与 point_offsets 通道一致。
     失败返回 None，调用方回退 warp 布局。
@@ -2683,7 +3067,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
                     best_i, best_dot = i, dot
             if best_i < 0:
                 # 闭合侧无直管可吸收（如点件跨树闭合）：刚性平移较小
-                # 的那一侧整组，闭合差整体搬走，组内几何不动
+                # 的那一侧整组，再把闭合两侧合并；否则后续竖排打包会把
+                # 已经对齐的两组重新分开，将跨组符号拉成长线。
                 bq, ba = key_box.get(q), key_box.get(anchor)
                 tgt, delta = None, err
                 if bq is not None and ba is not None:
@@ -2699,6 +3084,16 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
                     box = group_boxes[tgt]
                     for kk in box[4]:
                         pos[kk] = _v2_add(pos[kk], delta)
+                    if bq is not None and ba is not None and bq != ba:
+                        other = ba if tgt == bq else bq
+                        merged = group_boxes[other][4]
+                        box[4].extend(merged)
+                        for kk in merged:
+                            key_box[kk] = tgt
+                        group_boxes[other][4] = []
+                    elif (bq is None) != (ba is None):
+                        # 无包盒的一侧属于正在摆放的当前组，待当前组登记后再合并。
+                        pending_merges.add(bq if bq is not None else ba)
                     xs = [pos[k][0] for k in box[4]]
                     ys = [pos[k][1] for k in box[4]]
                     box[0], box[1] = min(xs), min(ys)
@@ -2762,6 +3157,7 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         if din is None:
             din = (1.0, 0.0)
         before = set(pos)
+        pending_merges: set[int] = set()
         if anchor0 is None:
             pos[s] = (0.0, 0.0)
         frontier: list[tuple[Vec3, Vec2]] = []
@@ -2809,21 +3205,41 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             # 锚定组：并入锚点所在的包盒，打包时随主结构一起平移，
             # 否则主结构平移后锚定件被撕在原地（腿被拽长的根因）
             bi = key_box.get(anchor0)
-            if bi is not None and keys:
+            if bi is not None and (keys or pending_merges):
                 box = group_boxes[bi]
                 box[4].extend(keys)
                 for k in keys:
                     key_box[k] = bi
+                for other in pending_merges:
+                    if other == bi:
+                        continue
+                    merged = group_boxes[other][4]
+                    box[4].extend(merged)
+                    for k in merged:
+                        key_box[k] = bi
+                    group_boxes[other][4] = []
                 xs = [pos[k][0] for k in box[4]]
                 ys = [pos[k][1] for k in box[4]]
                 box[0], box[1] = min(xs), min(ys)
                 box[2], box[3] = max(xs), max(ys)
             continue
         if keys:
-            xs = [pos[k][0] for k in keys]
-            ys = [pos[k][1] for k in keys]
-            key_box.update({k: len(group_boxes) for k in keys})
-            group_boxes.append([min(xs), min(ys), max(xs), max(ys), keys])
+            bi = len(group_boxes)
+            key_box.update({k: bi for k in keys})
+            group_boxes.append([0.0, 0.0, 0.0, 0.0, keys])
+            box = group_boxes[bi]
+            for other in pending_merges:
+                if other == bi:
+                    continue
+                merged = group_boxes[other][4]
+                box[4].extend(merged)
+                for k in merged:
+                    key_box[k] = bi
+                group_boxes[other][4] = []
+            xs = [pos[k][0] for k in box[4]]
+            ys = [pos[k][1] for k in box[4]]
+            box[0], box[1] = min(xs), min(ys)
+            box[2], box[3] = max(xs), max(ys)
 
     if not pos:
         return None
@@ -2842,6 +3258,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
     free_drop: set[Vec3] = set()
     for box in group_boxes:
         keys = box[4]
+        if not keys:             # 跨组闭合时已并入其他包盒
+            continue
         hit = None
         for k in keys:
             for a, b in pipe_segs:
@@ -2901,12 +3319,19 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
     bh = max(by1 - by0, 1e-6)
     rx, ry, rw, rh = draw_region
     m = 0.82
-    s = min(1.0, rw * m / bw, rh * m / bh)
-    cx_t, cy_t = rx + rw / 2.0, ry + rh / 2.0
-    bcx, bcy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
-    warn = None
-    if s < 0.999:
-        warn = f"chain layout scaled to {s:.2f} to fit the sheet"
+    if fit:
+        s = min(1.0, rw * m / bw, rh * m / bh)
+        cx_t, cy_t = rx + rw / 2.0, ry + rh / 2.0
+        bcx, bcy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+        warn = None
+        if s < 0.999:
+            warn = f"chain layout scaled to {s:.2f} to fit the sheet"
+    else:
+        # 1:1 测量遍：只平移到原点，不缩放不居中（分页装箱接管适配）
+        s = 1.0
+        warn = None
+        cx_t, cy_t = -bx0, -by0
+        bcx, bcy = 0.0, 0.0
     # 按边弹性缩放（符号恒定的关键）：超幅只压管线边（直管/弯头/三通摆放
     # 的边 ×s），符号/垫片/点件边刚性跟随长度不变——全局绕中心乘 s 会把
     # 符号端点对一起压近、符号随之画小。rigid_symbols=False 极端兜底时
@@ -2943,12 +3368,19 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         for kk in keys:
             if kk in new_pos:
                 new_pos[kk] = (new_pos[kk][0] + d[0], new_pos[kk][1] + d[1])
+    # 派生接点不在包盒 keys 中，贴附平移后必须再次跟随其映射接点，
+    # 否则同一支架的近重合点会一个吸附到管线、另一个留在原点附近。
+    for k, twin in unmap_twin.items():
+        if k in new_pos and twin in new_pos:
+            new_pos[k] = new_pos[twin]
     out: dict[Vec3, Vec2] = {}
     for k, tgt in new_pos.items():
         base = _page(k)
         d = (tgt[0] - base[0], tgt[1] - base[1])
         if _v2_len(d) > 1e-6:
             out[k] = d
+    if collect is not None:
+        collect["pos"] = dict(new_pos)
     return out, warn, s
 
 
@@ -5204,6 +5636,69 @@ def _offset_box_edges(corners: dict[frozenset, Vec3]) -> list[tuple[Vec3, Vec3]]
             if len(ka ^ kb) == 1]
 
 
+def _gauss_solve(m: list[list[float]], v: list[float]) -> list[float]:
+    n = len(v)
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        m[col], m[piv] = m[piv], m[col]
+        v[col], v[piv] = v[piv], v[col]
+        if abs(m[col][col]) < 1e-12:
+            continue
+        for r in range(col + 1, n):
+            f = m[r][col] / m[col][col]
+            for c in range(col, n):
+                m[r][c] -= f * m[col][c]
+            v[r] -= f * v[col]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        s = v[r] - sum(m[r][c] * x[c] for c in range(r + 1, n))
+        x[r] = s / m[r][r] if abs(m[r][r]) > 1e-12 else 0.0
+    return x
+
+
+def _register_offset_box_pages(proj: Projector, p_from: Vec3, delta: Vec3,
+                               axes: list[int], corners: dict) -> dict:
+    """offset 盒统一角点映射，注册进 point_offsets 并返回旧值供恢复。
+
+    派生角点各自走 offset_nearest 回退时最近点/σ 基准不一，虚线矩形会
+    变梯形（一条边不沿轴测方向）。改为以实际两端页面位置 A/B 为锚，
+    把 B-A 按各轴 raw 投影向量最小二乘分解（2 轴不共线即精确解），
+    角点 = A + 已施轴分量之和——盒边严格沿轴测方向且两端贴实际点。
+    按比例/无变形时分解精确（系数全 1），注册 offset 为 0，行为不变。
+    """
+    p_to = tuple(p_from[k] + delta[k] for k in range(3))
+    a, b = proj.page(p_from), proj.page(p_to)
+    r0 = proj.raw(p_from)
+    basis = []
+    for ax in axes:
+        p1 = list(p_from)
+        p1[ax] += delta[ax]
+        r1 = proj.raw(tuple(p1))
+        basis.append(((r1[0] - r0[0]) * proj.scale,
+                      (r1[1] - r0[1]) * proj.scale))
+    d = _v2_sub(b, a)
+    n = len(axes)
+    ata = [[sum(basis[i][k] * basis[j][k] for k in range(2))
+            for j in range(n)] for i in range(n)]
+    atd = [sum(basis[i][k] * d[k] for k in range(2)) for i in range(n)]
+    for i in range(n):
+        ata[i][i] += 1e-9
+    coeff = _gauss_solve(ata, atd)
+    saved = {}
+    for key, w in corners.items():
+        target = a
+        for i, ax in enumerate(axes):
+            if ax in key:
+                target = _v2_add(target, _v2_scale(basis[i], coeff[i]))
+        rp = proj.raw(w)
+        raw_page = (rp[0] * proj.scale + proj.offset[0],
+                    rp[1] * proj.scale + proj.offset[1])
+        saved[w] = proj.point_offsets.get(w)
+        proj.point_offsets[w] = (target[0] - raw_page[0],
+                                 target[1] - raw_page[1])
+    return saved
+
+
 def _draw_offset_box(canvas: _Canvas, proj: Projector, dim: Dimension,
                      delta: Vec3, axes: list[int], units_coords: str,
                      draw_centre: Vec2, offset_mm: float) -> None:
@@ -5217,37 +5712,45 @@ def _draw_offset_box(canvas: _Canvas, proj: Projector, dim: Dimension,
     no edge here is a hairline.
     """
     corners = _offset_box_corners(dim.p_from, delta, axes)
-    for e3a, e3b in _offset_box_edges(corners):
-        a, b = proj.page(e3a), proj.page(e3b)
-        if _v2_len(_v2_sub(b, a)) > 0.4:
-            canvas.dashed(a, b, width=0.22, dash=1.4, record=True)
+    saved = _register_offset_box_pages(proj, dim.p_from, delta, axes, corners)
+    try:
+        for e3a, e3b in _offset_box_edges(corners):
+            a, b = proj.page(e3a), proj.page(e3b)
+            if _v2_len(_v2_sub(b, a)) > 0.4:
+                canvas.dashed(a, b, width=0.22, dash=1.4, record=True)
 
-    def leg_text(ax: int) -> str:
-        return format_length(abs(delta[ax]), units_coords)
+        def leg_text(ax: int) -> str:
+            return format_length(abs(delta[ax]), units_coords)
 
-    best_order: tuple[int, ...] | None = None
-    best_cost = 0.0
-    for order in permutations(axes):
-        cost, applied, prev = 0.0, frozenset(), dim.p_from
-        for ax in order:
+        best_order: tuple[int, ...] | None = None
+        best_cost = 0.0
+        for order in permutations(axes):
+            cost, applied, prev = 0.0, frozenset(), dim.p_from
+            for ax in order:
+                nxt = corners[applied | {ax}]
+                _, leg_score = _plan_best_dim(canvas, proj, prev, nxt, leg_text(ax),
+                                              offset_mm, [ax], draw_centre)
+                cost += leg_score
+                applied, prev = applied | {ax}, nxt
+            if best_order is None or cost < best_cost:
+                best_order, best_cost = order, cost
+
+        # Draw the winning path leg by leg, re-picking each leg's side so a leg
+        # also avoids the legs already drawn before it.
+        applied, prev = frozenset(), dim.p_from
+        for ax in best_order or ():
             nxt = corners[applied | {ax}]
-            _, leg_score = _plan_best_dim(canvas, proj, prev, nxt, leg_text(ax),
-                                          offset_mm, [ax], draw_centre)
-            cost += leg_score
+            geom, _ = _plan_best_dim(canvas, proj, prev, nxt, leg_text(ax),
+                                     offset_mm, [ax], draw_centre)
+            if geom is not None:
+                _render_dim(canvas, geom)
             applied, prev = applied | {ax}, nxt
-        if best_order is None or cost < best_cost:
-            best_order, best_cost = order, cost
-
-    # Draw the winning path leg by leg, re-picking each leg's side so a leg
-    # also avoids the legs already drawn before it.
-    applied, prev = frozenset(), dim.p_from
-    for ax in best_order or ():
-        nxt = corners[applied | {ax}]
-        geom, _ = _plan_best_dim(canvas, proj, prev, nxt, leg_text(ax),
-                                 offset_mm, [ax], draw_centre)
-        if geom is not None:
-            _render_dim(canvas, geom)
-        applied, prev = applied | {ax}, nxt
+    finally:
+        for w, old in saved.items():
+            if old is None:
+                proj.point_offsets.pop(w, None)
+            else:
+                proj.point_offsets[w] = old
 
 
 def _draw_arrowhead(canvas: _Canvas, tip: Vec2, direction: Vec2) -> None:
@@ -5277,6 +5780,32 @@ def _bom_key(comp: Component) -> tuple:
             (comp.description or "").strip().lower())
 
 
+def _bom_row_key(comp: Component, materials: dict[str, str]) -> tuple | None:
+    """该组件是否进 BOM；进则返回行 key，不进返回 None。
+
+    与 _build_bom 同一过滤（单一来源），分页装箱也用它估每页行数。
+    """
+    cls = _bom_class(comp)
+    if cls in ("CONNECTION", "MESSAGE", "GAP"):
+        return None
+    if comp.material_excluded():
+        return None  # 双写边界段的对侧副本（CONTINUATION 件及其副料）：画但不计料
+    if is_weld_coupling(comp.type, comp.description, comp.skey):
+        return None  # welds are counted in the weld table, not the BOM
+    if cls == "WELD" and not comp.item_code:
+        return None  # 焊缝记录无料号时不进 BOM（避免图面/材料表出现 "?" 气球）
+    _cu = comp.type.upper().replace("_", "-")
+    if _cu.startswith("FLOW-ARROW") or (
+            (comp.skey or "").upper() == "FLOW" and cls == "OTHER"):
+        return None  # 流向箭头是图面符号（SKEY FLOW 曾被 FL 前缀误判为法兰），不进 BOM
+    # Resolved the same way the row's own description is, below: plenty of
+    # exports name the part only in the MATERIALS table.
+    desc = comp.description or materials.get(comp.item_code or "", "")
+    if is_annotation_symbol(comp.type, desc, comp.skey):
+        return None  # a slope arrow is a drawing mark, not material
+    return _bom_key(comp)
+
+
 def _build_bom(doc: PcfDocument, comps: list[tuple[Component, str]]) -> dict:
     inch_factor = coord_to_inch_factor(doc.units_coords)
     materials = doc.materials_descriptions()
@@ -5284,23 +5813,8 @@ def _build_bom(doc: PcfDocument, comps: list[tuple[Component, str]]) -> dict:
     order = 0
     for idx, (comp, _ref) in enumerate(comps):
         cls = _bom_class(comp)
-        if cls in ("CONNECTION", "MESSAGE", "GAP"):
+        if _bom_row_key(comp, materials) is None:
             continue
-        if comp.material_excluded():
-            continue  # 双写边界段的对侧副本（CONTINUATION 件及其副料）：画但不计料
-        if is_weld_coupling(comp.type, comp.description, comp.skey):
-            continue  # welds are counted in the weld table, not the BOM
-        if cls == "WELD" and not comp.item_code:
-            continue  # 焊缝记录无料号时不进 BOM（避免图面/材料表出现 "?" 气球）
-        _cu = comp.type.upper().replace("_", "-")
-        if _cu.startswith("FLOW-ARROW") or (
-                (comp.skey or "").upper() == "FLOW" and cls == "OTHER"):
-            continue  # 流向箭头是图面符号（SKEY FLOW 曾被 FL 前缀误判为法兰），不进 BOM
-        # Resolved the same way the row's own description is, below: plenty of
-        # exports name the part only in the MATERIALS table.
-        desc = comp.description or materials.get(comp.item_code or "", "")
-        if is_annotation_symbol(comp.type, desc, comp.skey):
-            continue  # a slope arrow is a drawing mark, not material
         key = _bom_key(comp)
         row = rows.get(key)
         if row is None:
@@ -5614,6 +6128,21 @@ def _draw_north_arrow(canvas: _Canvas, proj: Projector, at: Vec2) -> None:
     canvas.text((tip[0] + direction[0] * 3, tip[1] + direction[1] * 3 + 1.0), "N", size=8.0)
 
 
+# BOM 面板几何（与 _draw_bom_panel 内的魔数一一对应，装箱容量估算共用）
+_BOM_ROW_MM = 3.0        # BOM/切割表行高
+_BOM_HEAD_MM = 9.4       # 面板头(cursor=y+4,+2.0)+表头(+3.4)
+_BOM_TAIL_MM = 8.0       # 无切割表时行区底部保留
+_CUT_HEAD_MM = 10.2      # CUT LIST 标题(+3.0+4.0)+表头(+3.2)
+_CUT_TAIL_MM = 12.0      # 切割表行区底部保留（含 WELDS 摘要）
+
+
+def _bom_capacity(region_h: float, show_cut_table: bool) -> int:
+    """单页 BOM 行容量估算（分页装箱约束，取整保守）。"""
+    head = _BOM_HEAD_MM + (_CUT_HEAD_MM if show_cut_table else 0.0)
+    tail = _CUT_TAIL_MM if show_cut_table else _BOM_TAIL_MM
+    return max(4, int((region_h - head - tail) / _BOM_ROW_MM))
+
+
 def _draw_bom_panel(canvas: _Canvas, bom_rows: dict, cut_pieces: list[CutPiece],
                     welds: list[Weld], doc: PcfDocument,
                     x: float, y: float, w: float, h: float,
@@ -5731,7 +6260,10 @@ def _fit_text(pdf, text: str, width_mm: float) -> str:
 
 
 def _draw_title_block(canvas: _Canvas, doc: PcfDocument, options: RenderOptions,
-                      x: float, y: float, w: float, h: float) -> None:
+                      x: float, y: float, w: float, h: float,
+                      sheet: tuple[int, int] | None = None) -> None:
+    """sheet=(n, m) 时追加 SHEET n/m 字段（NTS 1:1 多页输出），字段网格
+    按实际字段数自动分行。"""
     pdf = canvas.pdf
     pdf.set_line_width(0.4)
     pdf.line(x, y, x + w, y)
@@ -5762,6 +6294,9 @@ def _draw_title_block(canvas: _Canvas, doc: PcfDocument, options: RenderOptions,
                                                if doc.source_path else "")),
         ("DATE", printed_date), ("REV", options.revision),
     ]
+    if sheet is not None:
+        fields.append(("SHEET", f"{sheet[0]}/{sheet[1]}"))
+    n_field_rows = max(1, math.ceil(len(fields) / 2))
     # Split the width right of the logo between the two field columns and the
     # optional DRAWING PROPERTIES / REQUIREMENTS list columns.
     avail_w = w - logo_w - 4
@@ -5773,7 +6308,7 @@ def _draw_title_block(canvas: _Canvas, doc: PcfDocument, options: RenderOptions,
         col = n % 2
         row = n // 2
         fx = fields_x + col * col_w
-        fy = y + 4 + row * (h - 6) / 3
+        fy = y + 4 + row * (h - 6) / n_field_rows
         pdf.set_font("Helvetica", size=_TITLE_LABEL_FONT)
         pdf.text(fx, fy, label)
         pdf.set_font("Helvetica", size=_SHEET_FONT)

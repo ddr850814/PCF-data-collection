@@ -48,6 +48,9 @@ class Continuation:
     inboard: Vec3 | None = None     # a point up the run, to aim the arrow
     bore: float | None = None
     sheets: list[str] = field(default_factory=list)   # rendered sheets carrying the neighbour
+    # 人工合成的接点（NTS 1:1 自动分页的页间断点）直接写死页号标签；
+    # 声明接点为 None，页号仍从邻图图名提取（_sheet_tag）。
+    sheet_tag: str | None = None
 
     @property
     def resolved(self) -> bool:

@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from . import geometry
-from .model import POINT_KEYS, AttrLine, Component, PcfDocument, Pipeline, Point
+from .model import POINT_KEYS, AttrLine, Component, PcfDocument, Pipeline, Point, parse_point
 from .parser import parse_document, write_document
 
 Vec3 = tuple[float, float, float]
@@ -92,6 +92,8 @@ def _split_pipe(comp: Component, cut: Vec3) -> tuple[Component, Component]:
 
     first = clone_with_ends(end1, cut)
     second = clone_with_ends(cut, end2)
+    # 分页切管：两半继承原组件的文档序标号（split_pages 的 page_of 归格用）
+    first._orig_idx = second._orig_idx = getattr(comp, "_orig_idx", -1)  # type: ignore[attr-defined]
     # The second pipe's first END-POINT template used end1's raw line; rebuild
     # it from the cut point explicitly.
     for attr in second.attributes:
@@ -119,6 +121,84 @@ def _point_on_pipe(comp: Component, point: Vec3, tolerance: float) -> Vec3 | Non
     if geometry.dist(on_axis, point) > tolerance * 4:
         return None
     return on_axis
+
+
+def split_pages(
+    doc: PcfDocument,
+    cuts: list[Vec3],
+    page_of,
+    *,
+    tolerance: float | None = None,
+) -> tuple[list[PcfDocument], list[tuple[int, int]], list[str], list[Vec3]]:
+    """按 NTS 1:1 网格切片计划切页：页归属由 page_of 决定，不走连通集重判。
+
+    cuts: 世界坐标切点（每个必须严格落在某直管内部）。page_of: 组件 → 网格
+    cell；切前按文档序给每个实组件打 _orig_idx 标，被切直管的两半继承同一
+    标号，由 page_of 按各自轴向中点归格。记录件（连接/消息等）按最近实组件
+    跟随，只进入其所在页。返回 (页子文档列表(行优先), 每页 cell, 切割说明,
+    实际落刀切点(子文档端点的精确浮点键，与 cuts 对齐))。
+    """
+    work = _copy_document(doc)
+    tol = tolerance if tolerance is not None else geometry.model_tolerance(work)
+    notes: list[str] = []
+
+    # 文档序标号：与 render._drawable_comps 同序（pipelines 序，跳过记录件）
+    idx = 0
+    for pipeline in work.pipelines:
+        for comp in pipeline.components:
+            if comp.is_connection_record:
+                continue
+            comp._orig_idx = idx  # type: ignore[attr-defined]
+            idx += 1
+
+    placed: list[Vec3] = []
+    for cut in cuts:
+        cut_done = False
+        for pipeline in work.pipelines:
+            for pos, comp in enumerate(pipeline.components):
+                if comp.is_connection_record:
+                    continue
+                on_axis = _point_on_pipe(comp, cut, tol)
+                if on_axis is None:
+                    continue
+                first, second = _split_pipe(comp, on_axis)
+                pipeline.components[pos:pos + 1] = [first, second]
+                notes.append(
+                    f"page-break cut {comp.type} (item {comp.item_code or '?'}) at "
+                    f"({on_axis[0]:.4f}, {on_axis[1]:.4f}, {on_axis[2]:.4f})"
+                )
+                # 实际落刀点：.4f 重写后子文档端点的精确浮点值（delta 键用）
+                for attr in second.attributes:
+                    if attr.key == "END-POINT":
+                        pt = parse_point(attr.raw)
+                        if pt is not None:
+                            placed.append(pt.xyz)
+                        break
+                cut_done = True
+                break
+            if cut_done:
+                break
+        if not cut_done:
+            raise SplitError(
+                f"page-break cut point not inside any straight pipe: {cut}"
+            )
+    if len(placed) != len(cuts):  # 防御：解析失败时退回投影点（键略偏但不丢页）
+        placed = list(cuts)
+
+    comps: list[Component] = []
+    owner: list[tuple[int, int]] = []
+    for p_idx, pipeline in enumerate(work.pipelines):
+        for c_idx, comp in enumerate(pipeline.components):
+            if comp.is_connection_record:
+                continue
+            comps.append(comp)
+            owner.append((p_idx, c_idx))
+    by_cell: dict[tuple[int, int], set[int]] = {}
+    for i, comp in enumerate(comps):
+        by_cell.setdefault(page_of(comp), set()).add(i)
+    cells = sorted(by_cell)
+    groups = [by_cell[c] for c in cells]
+    return _build_parts(work, groups, owner), cells, notes, placed
 
 
 def split_document(

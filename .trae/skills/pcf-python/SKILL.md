@@ -10,6 +10,8 @@ PCF → 单线轴测图（ISO）渲染器：`pcf/` 渲染引擎 + ttkbootstrap G
 ## 模块地图
 
 - `pcf/render.py` — 渲染引擎（符号调度、接图标注、尺寸、BOM/切割表、预览 SceneModel 双后端）
+- `pcf/sheetpack.py` — NTS 1:1 自动分页规划：链式连续区间 DP + 长支路分解 + 均匀分配；网格切片/切管作异常回退（见「NTS 自动分页」节）
+- `pcf/splitmerge.py` — 分页执行：按 page_of 拆文档、短管跨格接续、_orig_idx 打标继承
 - `pcf/continuations.py` — 接图点判定：**纯声明驱动**，每条 END-CONNECTION-PIPELINE = 一个接图点（CO-ORDS=坐标、CONNECTION-REFERENCE=名字），无几何匹配
 - `pcf/asc_symbols.py` + `symbols/ALIAS.asc` — Isogen .ASC 符号库单源（315 符号，先到先得）+ 阀体→阀柄 skey 厂商配对
 - `pcf_renderer.py` — CLI 批量渲染与 GUI 预览适配层（render_set 按目录缓存整套文档）
@@ -22,8 +24,8 @@ PCF → 单线轴测图（ISO）渲染器：`pcf/` 渲染引擎 + ttkbootstrap G
 py -3 -X utf8 pcf_renderer.py "c:\Users\jiazheng\桌面\新建文件夹\HQSH_Iso_Pipeline_PTFE" --out-dir preview
 ```
 
-- 366 张，判定通过 = exit 0 且日志无 Traceback/Error
-- 警告基线（全为既有类别，新增类别须解释）：87 continuation（声明指向本交付集外线号）、19 不连通管段组、5 切割表截断、5 尺寸过小（RED SM/RED LG/BRANCH CL 侧车尺寸）、约 80 chain layout scaled（不按比例模式自适应缩放）
+- 366 张（当前共 502 页：279 张单页、87 张多页），判定通过 = exit 0 且日志无 Traceback/Error
+- 警告基线（全为既有类别，新增类别须解释）：87 continuation（声明指向本交付集外线号）、19 不连通管段组、1 尺寸过小（SHT 4 的 FLG FACE → LINE END 22）；固定 1:1 分页后无切割表截断、无 chain layout scaled
 - 测试语料 `c:\Users\jiazheng\桌面\新建文件夹\HQSH_Iso_Pipeline_PTFE` 为**只读**厂商数据，勿改
 
 ## 符号库同步（vendor 更新 BSF.asc 后）
@@ -76,6 +78,15 @@ py -3 -m PyInstaller "PCF收集器.spec" --noconfirm
 ### 链式布局
 - 直管按真实长度单调分档（基准×1.5 定稿）；按边弹性缩放只压管线边（全局乘 s 会压符号端点对、符号画小），rigid_symbols=False 极端兜底全体弹性
 - 垫片模型厚度 ~1.5mm 示意不可见，warp 固定 0.6mm 间隙；face-to-face≈0 时轴向取最近管段且方向指"远端"；贴附件吸附必须在打包后（rebuild 弹性拉伸会撕掉）
+
+### NTS 自动分页
+- 分页优先级定稿：①每页主管线必须是链上连续的一段；②页联合盒不得超过可用窗口；③在最少可行页数下用 DP 最小化各页零件数方差，尽量均匀。主链取生成树双 BFS 长链，小支路整体跟随主链节点；支路自身超窗时拆成独立连续链，主链两侧分别成段。支架等不与管端共点的独立小件跟随最近管线节点并计入件数，不单独成页
+- 分页规划参数真实来源 = render.py：bom_w=0.24·页宽（show_bom）、title_h=0.16·页高，draw_region 再过 _usable_window（0.82 居中收缩）得可用窗——调试脚本用错窗口会导致归格结果与渲染不一致
+- 网格切片（仅链式整件划分不可行时回退）：组件按图面盒中心归格（一格一页，行优先）；跨格长直管在穿越格线处切开；切点 <18mm 的碎段并入邻段（删分界），整根短管（全长不足 18mm 装箱）不切、走组件接续（outs pipe_idx=-1）
+- 连接簇整体归页（网格回退路径）：实际相接的组件簇（容差桶+3×3×3 邻域聚类，簇=共享一个连接点的组件集合，非传递闭包）联合盒装得进一格时整簇归联合盒中心所在格；装不下的大簇保持盒中心归格由切管+接续处理。一件组件常属多个簇（弯头/直管两端各接一串），多簇争抢按"移动成本"（需改变盒中心归属的成员数）升序归页且归页即锁定，后续簇 target 与锁定成员冲突整簇跳过——无锁定时后处理簇会把已归页成员拉走（BR3R-30001 立管盒中心距行界 0.15mm 落错格；弯头 68 被含长管 70 的簇以 0.13mm 擦边 target 拉回邻页）
+- junction 检测：同簇成员 presence 集不相交的对两侧页各挂接续（pipe_idx=-1），dedupe key=(cell_me, cell_ot, round4 断点)——同点接多件时文字相同，重复挂只叠盒子
+- 幻影对侧断点（_draw_phantom_mate）用 σ 局部压缩比锚定：σ=|page(inboard)-at|/|raw(inboard)-base_raw|，幻影所有点 at+(raw-base_raw)·σ，绕过 offset_nearest 回退——否则接图线歪斜
+- junction tag 无 CONNECTION-REFERENCE 时冠 "SEE ISO"；跨页断开后尺寸链穿过管件延伸到对侧，尺寸值变化属预期（如 1328 变 1433=底到总管中心线，1328 仍在切割表作下料长）
 
 ### welds
 - 联管节 gap 模型空间测量（页空间被 warp 拉大，1/16" 越过 3mm 阈值致本体线压焊点）；焊耦合经焊点派生但中心线须连续

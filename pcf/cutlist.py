@@ -65,6 +65,7 @@ class CutPiece:
     end2_info: EndInfo | None = None
     branches: list[BranchInfo] = field(default_factory=list)
     uci: str | None = None
+    sheet: str = ""      # 分页页号（"p1"；单页输出为空）
     comp_index: int | None = None   # position in doc.real_components(), for
     #                                 matching a pipe back to its drawn symbol
 

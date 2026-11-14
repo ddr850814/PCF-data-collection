@@ -63,7 +63,7 @@ def _write_welds_csv(result, path: Path, encoding: str = "utf-8-sig") -> Path:
         "weld_number", "label", "joint", "nps", "x_mm", "y_mm",
         "page_width_mm", "page_height_mm",
         "world_x", "world_y", "world_z", "pipeline", "description", "uci",
-        "neighbors", "spool", "notes", "map_item_id",
+        "neighbors", "spool", "notes", "sheet", "map_item_id",
     ]
     with open(path, "w", newline="", encoding=encoding, errors="replace") as handle:
         writer = csv.writer(handle)
@@ -75,14 +75,14 @@ def _write_welds_csv(result, path: Path, encoding: str = "utf-8-sig") -> Path:
                 result.page_width_mm, result.page_height_mm,
                 weld.world_x, weld.world_y, weld.world_z,
                 weld.pipeline, weld.description or "", weld.uci,
-                weld.neighbors, weld.spool, weld.notes, "",
+                weld.neighbors, weld.spool, weld.notes, weld.sheet, "",
             ])
     return path
 
 
 def _write_bom_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Path:
     fields = ["item", "code", "description", "nps", "class", "qty", "length_text",
-              "length_in", "weight", "ucis"]
+              "length_in", "weight", "ucis", "sheet"]
     metric = is_metric_units(doc.units_coords)
     with open(path, "w", newline="", encoding=encoding, errors="replace") as handle:
         writer = csv.writer(handle)
@@ -97,7 +97,7 @@ def _write_bom_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Path
                 line.item, getattr(line, "code", ""), line.description, line.nps,
                 line.cls, line.qty,
                 length_text, round(line.length_in, 3), round(line.weight, 3),
-                line.ucis,
+                line.ucis, line.sheet,
             ])
     return path
 
@@ -107,7 +107,7 @@ def _write_cuts_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Pat
     fields = ["cut", "item_code", "description", "spool", "pipeline", "nps",
               "cut_length", "cut_length_text", "raw_length", "length_source",
               "direction", "end1_connection", "end1_joins", "end1_weld_gap",
-              "end2_connection", "end2_joins", "end2_weld_gap", "uci"]
+              "end2_connection", "end2_joins", "end2_weld_gap", "uci", "sheet"]
     with open(path, "w", newline="", encoding=encoding, errors="replace") as handle:
         writer = csv.writer(handle)
         writer.writerow(fields)
@@ -122,7 +122,7 @@ def _write_cuts_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Pat
                 e1.weld_gap if e1 and e1.weld_gap is not None else "",
                 e2.connection if e2 else "", e2.adjacent if e2 else "",
                 e2.weld_gap if e2 and e2.weld_gap is not None else "",
-                piece.uci or "",
+                piece.uci or "", piece.sheet,
             ])
     return path
 
