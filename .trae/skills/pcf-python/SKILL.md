@@ -19,12 +19,12 @@ PCF → 单线轴测图（ISO）渲染器：`pcf/` 渲染引擎 + ttkbootstrap G
 ## 全量渲染回归（改动渲染链后必跑）
 
 ```powershell
-py -3 -X utf8 pcf_renderer.py "c:\新建文件夹\HQSH_Iso_Pipeline_PTFE" --out-dir preview
+py -3 -X utf8 pcf_renderer.py "c:\Users\jiazheng\桌面\新建文件夹\HQSH_Iso_Pipeline_PTFE" --out-dir preview
 ```
 
 - 366 张，判定通过 = exit 0 且日志无 Traceback/Error
 - 警告基线（全为既有类别，新增类别须解释）：87 continuation（声明指向本交付集外线号）、19 不连通管段组、9 切割表截断、2 尺寸过小
-- 测试语料 `c:\新建文件夹\HQSH_Iso_Pipeline_PTFE` 为**只读**厂商数据，勿改
+- 测试语料 `c:\Users\jiazheng\桌面\新建文件夹\HQSH_Iso_Pipeline_PTFE` 为**只读**厂商数据，勿改
 
 ## 符号库同步（vendor 更新 BSF.asc 后）
 

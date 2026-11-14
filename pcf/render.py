@@ -70,8 +70,8 @@ from .cutlist import CutPiece, build_cutlist
 from .dims import (DEFAULT_OFFSET_MM, Dimension, flange_face,
                    infer_dimensions, load_sidecar, merge_with_sidecar)
 from .model import Component, PcfDocument, Point
-from .skeys import (classify, is_annotation_symbol, is_slip_on_flange,
-                    is_weld_coupling, looks_like_flange,
+from .skeys import (classify, connection_from_skey, is_annotation_symbol,
+                    is_slip_on_flange, is_weld_coupling, looks_like_flange,
                     reducer_is_eccentric, type_from_skey, valve_subtype)
 from .units import (coord_to_inch_factor, format_bore, format_feet_inches,
                     format_length, format_mm, is_metric_units)
@@ -118,9 +118,10 @@ class RenderOptions:
     properties: dict[str, str] = field(default_factory=dict)
     show_dimensions: bool = True
     # Page length (mm) of the bar drawn across the gasket face of a flange
-    # (hand-drawn path). Same width as the valve bow-tie base so the two read
-    # as one symbol family on a true-scale sheet.
-    flange_bar_mm: float = 3.8
+    # (hand-drawn path) when the bore is unknown. With a known bore the bar
+    # follows the ASME B16.5 raised-face table instead (see
+    # _flange_face_ratio) and this value is unused.
+    flange_bar_mm: float = 4.8
     show_bom: bool = True
     show_cut_table: bool = True
     detect_ffw: bool = False
@@ -2628,6 +2629,27 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             pts += [p.xyz for p in c.centre_points]
         return pts
 
+    # 垫片两端点隔开的"共点"是假共点：垫片常只有 4.5mm 厚、小于整图
+    # 连接容差 tol，法兰面与阀端会被 tol 判成同点，BFS 于是跨过垫片把阀
+    # 直接放到法兰面上（阀 natural 长度从法兰面起排），随后垫片又把阀
+    # 端点写到 +1mm——符号绘制从阀端点起画 natural 长度，与布局错位
+    # 1mm，恰把另一侧垫片缝整个吃掉。真实走链必须穿过垫片，不能跳过。
+    gasket_ends: list[tuple[Vec3, Vec3]] = []
+    for c in real:
+        if classify(c.type, c.skey) == "GASKET":
+            eps = [p.xyz for p in c.end_points]
+            if len(eps) >= 2:
+                gasket_ends.append((eps[0], eps[1]))
+
+    def _across_gasket(a: Vec3, b: Vec3) -> bool:
+        for ga, gb in gasket_ends:
+            if (geometry.dist(a, ga) <= 1e-6
+                    and geometry.dist(b, gb) <= 1e-6) or (
+                    geometry.dist(a, gb) <= 1e-6
+                    and geometry.dist(b, ga) <= 1e-6):
+                return True
+        return False
+
     # 邻接边 + 共享点（双向都要建：BFS 从任一侧都能走过去，否则图被
     # 砍成单向、走不到的组件会被当成独立组另摆——接头脱开的根因）
     edges: dict[int, list[tuple[int, Vec3]]] = {}
@@ -2637,7 +2659,8 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             if any(k == j for k, _s in edges.get(i, ())):
                 continue
             for cp in pts_i:
-                if any(geometry.dist(cp, q) <= tol for q in _cps(real[j])):
+                if any(geometry.dist(cp, q) <= tol
+                       and not _across_gasket(cp, q) for q in _cps(real[j])):
                     edges.setdefault(i, []).append((j, cp))
                     break
 
@@ -2669,7 +2692,10 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         刚性件（弯头/三通/符号/点件）登记闭合修正，直管直接横跨。
         """
         cls = classify(comp.type, comp.skey)
-        others = [c for c in _cps(comp) if geometry.dist(c, s) > tol]
+        # 垫片常只有 4.5mm 厚，小于整图连接容差；不能用 tol 把另一端
+        # 滤成“同点”，否则阀/法兰直接相邻，垫片的图面空隙被吞掉。
+        point_tol = 1e-6 if cls == "GASKET" else tol
+        others = [c for c in _cps(comp) if geometry.dist(c, s) > point_tol]
         if cls == "PIPE" and others:
             far = max(others, key=lambda c: geometry.dist(s, c))
             d = _pdir(s, far) or din
@@ -3398,6 +3424,19 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     reducer_runs: dict[int, tuple[Vec3, Vec3]] | None = None,
                     ) -> Vec2 | None:
     cls = classify(comp.type, comp.skey)
+    # 法兰杠长度 = 突面(垫片面)直径/管外径之比 × 页面管宽：B16.5 突面表
+    # 里这个比例随管径增大单调收窄（1/2"≈1.64 → 24"≈1.14），按孔径走
+    # _flange_face_ratio 拟合函数，与实物几何同构；缺孔径回退
+    # flange_bar_mm 固定宽。法兰端口的阀领结/仪表方块也乘同一比例——
+    # 与两端法兰杠同宽，整组读作一个法兰连接；变径/普通阀/方块仍走
+    # _bore_half_w 线性映射
+    bore_in = _bore_to_in(comp.bore, doc.units_bore)
+    if bore_in is None:
+        flange_bar = flange_bar_mm
+    else:
+        flange_bar = 2 * _bore_half_w(bore_in) * _flange_face_ratio(bore_in)
+    flange_widen = (_flange_face_ratio(bore_in)
+                    if bore_in is not None and _flanged_ports(comp) else 1.0)
     # 对侧边界件副本（CONTINUATION）：整件画虚线示意（ISOGEN 客侧边界画法）
     cont_copy = comp.is_continuation_copy()
     # 链式布局整图缩放：示意腿长同乘 schematic_scale（位置表已缩放）
@@ -3562,7 +3601,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     if face_pt is not None and len(eps) >= 2:
         face = proj.page(face_pt)
         face_first = _v2_len(_v2_sub(face, eps[0])) <= _v2_len(_v2_sub(face, eps[1]))
-        _draw_flange(canvas, proj, eps[0], eps[1], comp, face_first, flange_bar_mm)
+        _draw_flange(canvas, proj, eps[0], eps[1], comp, face_first, flange_bar)
         return _v2_mid(eps[0], eps[1])
 
     # 流向箭头（SKEY=FLOW）：优先用符号库官方符号，无符号时回退实心小三角；
@@ -3755,23 +3794,24 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     elif cls == "VALVE":
         if len(eps) >= 2:
             mid = cps[0] if cps else _v2_mid(eps[0], eps[1])
-            _draw_valve(canvas, proj, eps, mid, comp)
+            _draw_valve(canvas, proj, eps, mid, comp, bore_in,
+                        widen=flange_widen)
             return mid
 
     elif cls == "FLANGE":
         # Only reached when the face could not be resolved (a single-ended
         # or point-only flange record).
         if len(eps) >= 2:
-            _draw_flange(canvas, proj, eps[0], eps[1], comp, True, flange_bar_mm)
+            _draw_flange(canvas, proj, eps[0], eps[1], comp, True, flange_bar)
             return _v2_mid(eps[0], eps[1])
         if len(eps) == 1:
-            _draw_bar(canvas, eps[0], (1.0, 0.0), flange_bar_mm / 2, width=0.6)
+            _draw_bar(canvas, eps[0], (1.0, 0.0), flange_bar / 2, width=0.6)
             return eps[0]
 
     elif cls == "REDUCER":
         if len(eps) >= 2:
             _draw_reducer(canvas, proj, comp, eps,
-                          (reducer_runs or {}).get(id(comp)))
+                          (reducer_runs or {}).get(id(comp)), doc.units_bore)
             if b1s:
                 canvas.line(_v2_mid(eps[0], eps[1]), b1s[0], width=0.55)
             return _v2_mid(eps[0], eps[1])
@@ -3820,7 +3860,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
 
     elif cls in ("INSTRUMENT", "FILTER", "MULTIPORT"):
         if len(eps) >= 2:
-            _draw_box_on_axis(canvas, proj, eps[0], eps[1])
+            _draw_box_on_axis(canvas, proj, eps[0], eps[1], bore_in,
+                              widen=flange_widen)
             return _v2_mid(eps[0], eps[1])
         if pps and cps:
             for pp in pps:
@@ -4350,11 +4391,53 @@ def _draw_symbol_2pt(canvas: _Canvas, skey: str | None, p0: Vec2, p1: Vec2,
     return True
 
 
+def _bore_to_in(bore: float | None, units_bore: str) -> float | None:
+    """关键点孔径换算成英寸（UNITS-BORE 感知）；缺孔径返回 None。"""
+    if bore is None:
+        return None
+    return bore / 25.4 if units_bore.startswith("MM") else bore
+
+
+def _bore_half_w(bore_in: float | None) -> float:
+    """手绘符号横半宽（页 mm）：随孔径线性、可读性钳制。
+
+    0.9mm + 每英寸孔径 0.1mm，钳到 [1.2, 3.9]：6" 管得 3.0mm 页宽，
+    2" 收窄到 2.2mm、24" 放宽到 6.6mm；缺孔径回退旧固定宽 1.9（3.8mm）。
+    符号长度仍由坐标决定，只有可读页宽随管线尺寸变化——管架不过流、
+    无孔径语义，不参与。
+    """
+    if bore_in is None:
+        return 1.9
+    return min(3.9, max(1.2, 0.9 + 0.1 * bore_in))
+
+
+# 法兰突面(垫片面)直径 ÷ 管外径，随标称管径 D(英寸)变化的平滑函数。
+# 法兰垫片面不是随管径等比放大的：小管径的法兰相对更"肥"（1/2" 的突面
+# 是管外径的 1.64 倍），管径越大比例越瘦（24" 只剩 1.14 倍）。下式对
+# ASME B16.5 Class 150 全表（1/2"~24"，21 档；各压力等级同尺寸突面直径
+# 相同，pipedata.org 与厂商样本互证）做最小二乘拟合，最大偏差 0.05，
+# 折算到垫片面杠 ≤0.15mm——图面上不可辨，但免查表、任意孔径连续取值。
+# 数据锚点：1/2"→1.64、2"→1.53、6"→1.28、12"→1.18、24"→1.14。
+def _flange_face_ratio(bore_in: float) -> float:
+    """突面直径/管外径（B16.5 表拟合曲线）；bore_in 为英寸孔径。"""
+    return 0.962 + 4.30 / (bore_in + 6.30)
+
+
+def _flanged_ports(comp: Component) -> bool:
+    """任一端口为法兰连接：END-POINT 行尾连接码 FL 优先，缺码按 SKEY
+    尾两字符兜底（FL/SO，见 skeys.connection_from_skey）。"""
+    if any(pt.connection_type == "FL" for pt in comp.end_points):
+        return True
+    return connection_from_skey(comp.skey) == "FL"
+
+
 def _draw_valve(canvas: _Canvas, proj: Projector, eps: list[Vec2],
-                mid: Vec2, comp: Component) -> None:
+                mid: Vec2, comp: Component,
+                bore_in: float | None = None,
+                widen: float = 1.0) -> None:
     # 回退：程序化领结 + 子类型装饰（SKEY 符号库命中时不会走到这里，
     # 统一入口见 _draw_component 顶部的 _draw_symbol_2pt）
-    half_w = 1.9
+    half_w = _bore_half_w(bore_in) * widen
     for end in eps[:4]:
         axis = _v2_norm(_v2_sub(mid, end))
         # 底边沿轴测平面横轴（与法兰面杠/变径端面同族），不用页面垂直
@@ -4424,7 +4507,8 @@ def _reducer_flat_offset(comp: Component, big: Point, small: Point,
 
 
 def _draw_reducer(canvas: _Canvas, proj: Projector, comp: Component,
-                  eps: list[Vec2], run: tuple[Vec3, Vec3] | None = None) -> None:
+                  eps: list[Vec2], run: tuple[Vec3, Vec3] | None = None,
+                  units_bore: str = "INCH") -> None:
     """Trapezoid spanning the reducer's own two weld ends, on an iso plane.
 
     **Both ends of the body sit on the reducer's own projected weld points.**
@@ -4462,7 +4546,12 @@ def _draw_reducer(canvas: _Canvas, proj: Projector, comp: Component,
     large_first = (pts[0].bore or 0.0) >= (pts[-1].bore or 0.0)
     big_pt, small_pt = (pts[0], pts[-1]) if large_first else (pts[-1], pts[0])
     big, small = (eps[0], eps[1]) if large_first else (eps[1], eps[0])
-    half_big, half_small = 1.9, 0.9
+    # 两端半高各随自己的孔径（UNITS-BORE 感知）；任一端缺孔径回退上游
+    # 固定值 1.9/0.9，避免缺数据时画成矩形
+    big_in = _bore_to_in(big_pt.bore, units_bore)
+    small_in = _bore_to_in(small_pt.bore, units_bore)
+    half_big = _bore_half_w(big_in) if big_in is not None else 1.9
+    half_small = _bore_half_w(small_in) if small_in is not None else 0.9
 
     axis = (0.0, 0.0)
     if run is not None:
@@ -4533,11 +4622,13 @@ def _draw_cap(canvas: _Canvas, proj: "Projector", end: Vec2,
 
 
 def _draw_box_on_axis(canvas: _Canvas, proj: "Projector", e0: Vec2,
-                      e1: Vec2) -> None:
+                      e1: Vec2, bore_in: float | None = None,
+                      widen: float = 1.0) -> None:
     axis = _v2_norm(_v2_sub(e1, e0))
     # 端面沿轴测平面横轴（与阀领结/法兰杠同族），不用页面垂直
     perp = _iso_cross_dir(proj, axis) if proj is not None else _v2_perp(axis)
-    half = max(_v2_len(_v2_sub(e1, e0)) * 0.35, 1.2)
+    # 横宽随孔径（线性+钳制），不再 0.7×自身长度——长度已是坐标端距
+    half = _bore_half_w(bore_in) * widen
     corners = [
         _v2_add(e0, _v2_scale(perp, half)),
         _v2_add(e1, _v2_scale(perp, half)),
