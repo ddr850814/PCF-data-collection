@@ -86,6 +86,9 @@ def _load_skey_types() -> None:
                 _SKEY_TYPES_EXACT.setdefault(pattern.upper(), resolved)
         _SKEY_TYPES_LOADED = True
         return
+    # 没找到可用的 skeys.json（缺失/损坏）：同样置位缓存空表。否则
+    # type_from_skey 每次调用都重扫磁盘——它被建图循环反复调，二次方 IO。
+    _SKEY_TYPES_LOADED = True
 
 
 def type_from_skey(skey: str | None) -> str | None:

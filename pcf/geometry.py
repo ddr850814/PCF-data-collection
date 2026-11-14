@@ -105,7 +105,9 @@ def model_tolerance(doc: PcfDocument) -> float:
     from .units import coord_to_inch_factor
 
     floor = 0.11 / coord_to_inch_factor(doc.units_coords)
-    pts = [p.xyz for c in doc.all_components() for p in c.all_points()]
+    # 只用实体件算包围盒：接图/信息记录（END-CONNECTION/MESSAGE…）的
+    # CO-ORDS 可远离主体，混入会虚增对角线 → 容差放大 → 误连
+    pts = [p.xyz for c in doc.real_components() for p in c.all_points()]
     box = bounding_box(pts)
     if box is None:
         return floor

@@ -6,6 +6,7 @@ weights; a parser must never assume bore units match coordinate units.
 
 from __future__ import annotations
 
+import sys
 from fractions import Fraction
 
 # Multiply a native coordinate value by this factor to get inches.
@@ -13,6 +14,9 @@ _COORD_TO_INCH = {
     "INCH": 1.0,
     "INCHES": 1.0,
     "MM": 1.0 / 25.4,
+    "MM.": 1.0 / 25.4,           # 部分出口器单位带尾点
+    "MILLIMETRE": 1.0 / 25.4,     # 英式拼写
+    "MILLIMETER": 1.0 / 25.4,     # 美式拼写
     "MM-HUNDREDTHS": 0.01 / 25.4,
     "CM": 1.0 / 2.54,
     "DM": 10.0 / 2.54,
@@ -24,13 +28,32 @@ _COORD_TO_INCH = {
 # Multiply a native coordinate value by this factor to get millimetres.
 _COORD_TO_MM = {key: factor * 25.4 for key, factor in _COORD_TO_INCH.items()}
 
+# 未识别单位只告警一次：这些函数在渲染循环里被高频调用
+_UNKNOWN_UNITS_WARNED: set[str] = set()
+
+
+def _warn_unknown_units(units: str) -> None:
+    u = units.upper()
+    if u not in _UNKNOWN_UNITS_WARNED:
+        _UNKNOWN_UNITS_WARNED.add(u)
+        print(f"警告: 未识别的单位声明 {units!r}，按英寸处理", file=sys.stderr)
+
 
 def coord_to_inch_factor(units_co_ords: str) -> float:
-    return _COORD_TO_INCH.get(units_co_ords.upper(), 1.0)
+    f = _COORD_TO_INCH.get(units_co_ords.upper())
+    if f is None:
+        # 未知单位静默按英寸会把 mm 文件坐标/口径错 25 倍，必须出声
+        _warn_unknown_units(units_co_ords)
+        return 1.0
+    return f
 
 
 def coord_to_mm_factor(units_co_ords: str) -> float:
-    return _COORD_TO_MM.get(units_co_ords.upper(), 25.4)
+    f = _COORD_TO_MM.get(units_co_ords.upper())
+    if f is None:
+        _warn_unknown_units(units_co_ords)
+        return 25.4
+    return f
 
 
 def is_metric_units(units_coords: str) -> bool:
@@ -47,13 +70,14 @@ def format_length(value: float, units_coords: str, *, force_feet: bool = False) 
 
 
 def bore_to_inch(bore: float, units_bore: str) -> float:
-    units = units_bore.upper()
+    units = units_bore.upper().rstrip(".")
     if units in ("INCH", "INCHES"):
         return bore
     if units == "INCH-SIXTEENTH":
         return bore / 16.0
-    if units == "MM":
+    if units in ("MM", "MILLIMETRE", "MILLIMETER"):
         return bore / 25.4
+    _warn_unknown_units(units_bore)
     return bore
 
 

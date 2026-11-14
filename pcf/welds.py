@@ -247,6 +247,12 @@ def derive_welds(
                 # 归属图（那边有显式 WELD 记录），本图不编号不画点
                 continue
             centre = comp.centre_points[0]
+            # 出口器同时写 olet 与其显式 WELD 记录时去重：set-on 焊与
+            # 已登记焊缝同点不双编号（FFW 路径 near_existing 的同款规则）
+            if any(geometry.dist((kw["x"], kw["y"], kw["z"]),
+                                 (centre.x, centre.y, centre.z)) <= tolerance
+                   for _, kw in raw):
+                continue
             branch_bore = comp.branch1_points[0].bore if comp.branch1_points else comp.bore
             raw.append(((idx, 0), dict(
                 label="SW", joint="FW", source="set-on",

@@ -112,32 +112,50 @@ def write_document(doc: PcfDocument) -> str:
     return text
 
 
-def decode_pcf_bytes(raw: bytes, encoding: str = "auto") -> str:
-    """PCF 字节 → 文本，与收集器（pcf_parser._open_file）同一套规则。
-
-    - 指定编码：按该编码解码，错误字符替换，不中断
-    - auto：BOM → UTF-8-SIG；否则 GBK → UTF-8 依次严格试解；latin-1 兜底
-      （中文项目多为 GBK，GBK 优先可避免中文描述被替换符污染）
-    """
+def _decode_pcf(raw: bytes, encoding: str) -> tuple[str, str]:
+    """PCF 字节 → (文本, 实际使用的编码)。auto 的判定规则与收集器
+    （pcf_parser._open_file）同源：BOM → UTF-8-SIG；否则 GBK → UTF-8
+    依次严格试解；latin-1 兜底（中文项目多为 GBK，GBK 优先可避免中文
+    描述被替换符污染）。"""
     if encoding != "auto":
-        return raw.decode(encoding, errors="replace")
+        text = raw.decode(encoding, errors="replace")
+        if text.startswith("\ufeff"):
+            # 显式编码也要剥 BOM：否则首行变 \ufeffISOGEN，UNITS 头
+            # 匹配失败会静默回退英寸单位
+            text = text[1:]
+        return text, encoding
     if raw.startswith(b"\xef\xbb\xbf"):
-        return raw[3:].decode("utf-8", errors="replace")
+        return raw[3:].decode("utf-8", errors="replace"), "utf-8-sig"
     for enc in ("gbk", "utf-8"):
         try:
-            return raw.decode(enc)
+            return raw.decode(enc), enc
         except UnicodeDecodeError:
             continue
-    return raw.decode("latin-1")
+    return raw.decode("latin-1"), "latin-1"
+
+
+def decode_pcf_bytes(raw: bytes, encoding: str = "auto") -> str:
+    """PCF 字节 → 文本，编码规则见 _decode_pcf。"""
+    return _decode_pcf(raw, encoding)[0]
 
 
 def load(path: str | Path, encoding: str = "auto") -> PcfDocument:
     path = Path(path)
-    text = decode_pcf_bytes(path.read_bytes(), encoding)
-    return parse_document(text, source_path=str(path))
+    text, used = _decode_pcf(path.read_bytes(), encoding)
+    doc = parse_document(text, source_path=str(path))
+    # 记住读入编码，save 按原编码写回——GBK 原文件往返不再漂移成 UTF-8
+    doc.source_encoding = used
+    return doc
 
 
 def save(doc: PcfDocument, path: str | Path) -> Path:
     path = Path(path)
-    path.write_text(write_document(doc), encoding="utf-8", newline="")
+    enc = getattr(doc, "source_encoding", None) or "utf-8"
+    text = write_document(doc)
+    try:
+        path.write_text(text, encoding=enc, newline="")
+    except UnicodeEncodeError:
+        # 原编码装不下新内容（如 GBK 原文件被编辑加入 GBK 外字符）：
+        # 退 UTF-8 带 BOM，读端 auto/utf-8-sig 都能正确识别
+        path.write_text(text, encoding="utf-8-sig", newline="")
     return path

@@ -8,6 +8,7 @@
 
 import math
 import os
+import queue
 import re
 import threading
 import traceback
@@ -60,7 +61,12 @@ class PcfApp:
         self.error_log = []
         self._processing = False
 
+        # 跨线程 UI 汇聚队列：工作线程只 _post(fn)，主线程轮询泵统一执行
+        # （Tkinter 非线程安全，工作线程不得直接 root.after / 摸控件）
+        self._ui_queue = queue.Queue()
+
         self._build_ui()
+        self.root.after(50, self._drain_ui_queue)
 
     def _build_ui(self):
         """构建界面"""
@@ -127,7 +133,7 @@ class PcfApp:
             ("GBK", "gbk"),
             ("UTF-8", "utf-8"),
             ("UTF-8-SIG", "utf-8-sig"),
-            ("Latin-1", "latin-1"),
+            ("GB18030", "gb18030"),
         ]
         self.enc_var = tk.StringVar(value="自动（GBK 优先）")
         self.combo_encoding = ttkb.Combobox(
@@ -208,6 +214,25 @@ class PcfApp:
                                 anchor=W, padding=(8, 4))
         status_bar.pack(fill=X, side=BOTTOM)
 
+    # ==================== 跨线程 UI 泵 ====================
+
+    def _post(self, fn):
+        """工作线程投递 UI 操作，由主线程 _drain_ui_queue 执行"""
+        self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self):
+        """主线程轮询泵：批量执行工作线程投递的 UI 操作"""
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                traceback.print_exc()
+        self.root.after(50, self._drain_ui_queue)
+
     # ==================== 事件处理 ====================
 
     def _on_new_database(self):
@@ -242,61 +267,61 @@ class PcfApp:
 
     def _process_files(self, folder, pcf_files):
         """后台处理 PCF 文件（在工作线程中运行）"""
-        total = len(pcf_files)
-        self.success_count = 0
-        self.error_count = 0
-        self.error_log.clear()
-
-        # 初始化数据库
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
-
-        self.db_helper = DatabaseHelper(self.db_path)
-
-        # 创建数据收集器
-        self.data_collector = PcfDataCollector()
-        self.data_collector.db_helper = self.db_helper
-
-        # 创建所有表
-        self.data_collector.create_all_tables()
-
-        # 解析所有 PCF 文件
-        encoding = "auto"
-        selected_label = self.enc_var.get()
-        for label, value in self.encoding_options:
-            if label == selected_label:
-                encoding = value
-                break
-        parser = PcfParser(self.data_collector, encoding=encoding)
-        fid = 0
-        parsed_files = []  # 成功解析的文件（相对路径），供轴测图渲染定位
-        for i, pcf_file in enumerate(pcf_files):
-            try:
-                consumed = parser.process_single_file(pcf_file, fid)
-                fid += consumed
-                self.success_count += 1
-                parsed_files.append(os.path.relpath(pcf_file, folder))
-            except Exception as e:
-                self.error_count += 1
-                error_msg = f"文件 {i + 1}: {os.path.basename(pcf_file)} - {e}"
-                self.error_log.append(error_msg)
-
-            # 更新进度
-            current = i + 1
-            self.root.after(0, lambda c=current, t=total: self.status_var.set(
-                f"{c}/{t} (成功:{self.success_count}, 失败:{self.error_count})"))
-
-        # 记录导入来源，轴测图渲染时直接从数据库定位原始 PCF
-        if parsed_files:
-            self.data_collector.add_import_info("SOURCE-FOLDER", folder)
-            self.data_collector.add_import_info("SOURCE-FILES", "\n".join(parsed_files))
-
-        # 插入数据 & 创建视图
         try:
-            self.root.after(0, lambda: self.status_var.set("插入数据表..."))
+            total = len(pcf_files)
+            self.success_count = 0
+            self.error_count = 0
+            self.error_log.clear()
+
+            # 初始化数据库
+            if os.path.exists(self.db_path):
+                os.remove(self.db_path)
+
+            self.db_helper = DatabaseHelper(self.db_path)
+
+            # 创建数据收集器
+            self.data_collector = PcfDataCollector()
+            self.data_collector.db_helper = self.db_helper
+
+            # 创建所有表
+            self.data_collector.create_all_tables()
+
+            # 解析所有 PCF 文件
+            encoding = "auto"
+            selected_label = self.enc_var.get()
+            for label, value in self.encoding_options:
+                if label == selected_label:
+                    encoding = value
+                    break
+            parser = PcfParser(self.data_collector, encoding=encoding)
+            fid = 0
+            parsed_files = []  # 成功解析的文件（相对路径），供轴测图渲染定位
+            for i, pcf_file in enumerate(pcf_files):
+                try:
+                    consumed = parser.process_single_file(pcf_file, fid)
+                    fid += consumed
+                    self.success_count += 1
+                    parsed_files.append(os.path.relpath(pcf_file, folder))
+                except Exception as e:
+                    self.error_count += 1
+                    error_msg = f"文件 {i + 1}: {os.path.basename(pcf_file)} - {e}"
+                    self.error_log.append(error_msg)
+
+                # 更新进度
+                current = i + 1
+                self._post(lambda c=current, t=total: self.status_var.set(
+                    f"{c}/{t} (成功:{self.success_count}, 失败:{self.error_count})"))
+
+            # 记录导入来源，轴测图渲染时直接从数据库定位原始 PCF
+            if parsed_files:
+                self.data_collector.add_import_info("SOURCE-FOLDER", folder)
+                self.data_collector.add_import_info("SOURCE-FILES", "\n".join(parsed_files))
+
+            # 插入数据 & 创建视图
+            self._post(lambda: self.status_var.set("插入数据表..."))
             self.data_collector.insert_all_data()
 
-            self.root.after(0, lambda: self.status_var.set("插入视图..."))
+            self._post(lambda: self.status_var.set("插入视图..."))
             self.data_collector.create_sqlite_view_all(self.COMPONENT_TYPES)
 
             # COUNT 视图
@@ -316,12 +341,14 @@ class PcfApp:
             # 带属性的组件视图
             self.data_collector.create_component_with_attributes_view()
         except Exception:
+            # 整个线程体兜底（含删旧库/建库/建表等前半段）：走主线程错误回调
+            # 恢复按钮状态，避免 daemon 线程静默死亡
             err_msg = traceback.format_exc()
-            self.root.after(0, lambda: self._on_processing_error(err_msg))
+            self._post(lambda: self._on_processing_error(err_msg))
             return
 
         # 完成
-        self.root.after(0, self._on_processing_done)
+        self._post(self._on_processing_done)
 
     def _create_component_views(self):
         """为每种组件类型创建视图"""
@@ -482,17 +509,39 @@ class PcfApp:
     # ==================== 管线清单与图面预览 ====================
 
     def _refresh_pipeline_list(self):
-        """从数据库导入来源重建管线清单（新建/打开数据库后调用）"""
+        """从数据库导入来源重建管线清单（新建/打开数据库后调用）。
+
+        sources_from_db 的旧库回退分支会全递归 os.walk，放后台线程执行，
+        结果经 UI 队列回主线程填充（同渲染线程回传模式）。"""
         self.pipeline_rows = []
-        folder, files = None, []
-        if self.db_helper is not None and self.db_path:
+        self._redraw_list()
+        db_path = self.db_path
+        if self.db_helper is None or not db_path:
+            self.status_var.set("管线清单：无数据库")
+            return
+        self._pipeline_token = getattr(self, "_pipeline_token", 0) + 1
+        token = self._pipeline_token
+        self.status_var.set("正在定位 PCF 来源...")
+
+        def work():
+            got = None
             try:
                 import pcf_renderer
-                got = pcf_renderer.sources_from_db(self.db_path)
-                if got:
-                    folder, files = got
+                got = pcf_renderer.sources_from_db(db_path)
             except Exception:
-                pass
+                got = None
+
+            def apply():
+                if token != getattr(self, "_pipeline_token", 0):
+                    return   # 已被更新的刷新取代
+                self._apply_pipeline_sources(got)
+            self._post(apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_pipeline_sources(self, got):
+        """主线程：按后台取回的 (源文件夹, 文件列表) 填充管线清单"""
+        folder, files = got if got else (None, [])
         ref_map = {}
         if self.db_helper is not None:
             try:
@@ -565,14 +614,14 @@ class PcfApp:
                     nts_min_mm=s["nts_min"], nts_max_mm=s["nts_max"],
                     skew_deg=s["skew"], encoding=s.get("encoding", "auto"))
                 if token == self._preview_token:
-                    self.root.after(0, lambda: self._show_scene(scene, result, ref))
+                    self._post(lambda: self._show_scene(scene, result, ref))
             except Exception as exc:
                 err = str(exc)
 
                 def fail():
                     self.status_var.set(f"预览失败：{err[:120]}")
                 if token == self._preview_token:
-                    self.root.after(0, fail)
+                    self._post(fail)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1075,8 +1124,8 @@ class PcfApp:
                 spool_key=spool_key, detect_ffw=detect_ffw,
                 nts_min_mm=nts_min, nts_max_mm=nts_max, skew_deg=skew,
                 encoding=encoding,
-                progress_cb=lambda msg, cur, tot: self.root.after(
-                    0, lambda m=msg, c=cur, t=tot: self.status_var.set(f"{m} ({c}/{t})")))
+                progress_cb=lambda msg, cur, tot: self._post(
+                    lambda m=msg, c=cur, t=tot: self.status_var.set(f"{m} ({c}/{t})")))
 
             def done():
                 self.btn_render.state(["!disabled"])
@@ -1101,7 +1150,7 @@ class PcfApp:
                 src = next((s["pcf"] for s in summaries), None)
                 if src:
                     self._start_live_preview(src)
-            self.root.after(0, done)
+            self._post(done)
         except Exception:
             err = traceback.format_exc()
 
@@ -1109,7 +1158,7 @@ class PcfApp:
                 self.btn_render.state(["!disabled"])
                 self.status_var.set("轴测图生成失败")
                 messagebox.showerror("生成轴测图失败", err[-1500:])
-            self.root.after(0, fail)
+            self._post(fail)
 
     # ==================== 导出 Excel ====================
 
@@ -1117,6 +1166,9 @@ class PcfApp:
         """导出数据到 Excel"""
         if not HAS_OPENPYXL:
             messagebox.showerror("错误", "缺少 openpyxl 库，请运行: pip install openpyxl")
+            return
+        if not self.db_path:
+            messagebox.showwarning("提示", "请先打开数据库")
             return
 
         valid_name = re.sub(r'[\x00-\x1F\x7F<>?*:"/\\|]', '', os.path.splitext(os.path.basename(self.db_path))[0])
@@ -1141,6 +1193,13 @@ class PcfApp:
                 "SELECT DISTINCT ATTRIBUTE_NAME FROM COMPONENT_ATTRIBUTES WHERE UCI LIKE 'PIPELINE:%' ORDER BY ATTRIBUTE_NAME")
             attribute_names = [r[0] for r in attr_rows]
 
+            # 属性一次性全部查出，内存按管线分组（替代每管线×每属性一次查询）
+            _ac, attr_all = self.db_helper.fill_data_table(
+                "SELECT UCI, ATTRIBUTE_NAME, ATTRIBUTE_VALUE FROM COMPONENT_ATTRIBUTES WHERE UCI LIKE 'PIPELINE:%'")
+            attrs_by_uci = {}
+            for uci, a_name, a_val in attr_all:
+                attrs_by_uci.setdefault(str(uci), {}).setdefault(str(a_name), a_val)
+
             pipe_cols, pipe_rows = self.db_helper.fill_data_table(
                 "SELECT p.FILENAME, p.REFERENCE, p.PIPINGSPEC, p.INSULATIONSPEC, p.PAINTINGSPEC, p.TRACINGSPEC FROM PIPELINE p")
 
@@ -1159,14 +1218,12 @@ class PcfApp:
                     ws.cell(row=i + 2, column=4, value=self._safe_str(prow[4]))
                     ws.cell(row=i + 2, column=5, value=self._safe_str(prow[5]))
 
-                    # 获取属性
+                    # 从内存分组取属性
                     pipeline_uci = f"PIPELINE:{self._safe_str(prow[1])}"
+                    attrs = attrs_by_uci.get(pipeline_uci, {})
                     for j, attr_name in enumerate(attribute_names):
-                        attr_val_cols, attr_val_rows = self.db_helper.fill_data_table(
-                            "SELECT ATTRIBUTE_VALUE FROM COMPONENT_ATTRIBUTES WHERE UCI=? AND ATTRIBUTE_NAME=?",
-                            (pipeline_uci, attr_name))
-                        val = self._safe_str(attr_val_rows[0][0]) if attr_val_rows else ""
-                        ws.cell(row=i + 2, column=6 + j, value=val)
+                        ws.cell(row=i + 2, column=6 + j,
+                                value=self._safe_str(attrs.get(attr_name)))
 
             # ========== 组件表 ==========
             for comp_type in self.COMPONENT_TYPES:

@@ -50,10 +50,12 @@ def _cuts_csv_path(pdf_path: Path) -> Path:
 def csv_output_encoding(encoding: str) -> str:
     """CSV 写出编码：跟随所选编码；auto（读入时自动识别）→ utf-8-sig。
 
-    utf-8-sig 带 BOM，中文 Excel 双击即可正确显示；显式选了 GBK 等编码
-    时 CSV 也用同一编码写出，保持与收集/读入编码体系一致。
+    utf-8-sig 带 BOM，中文 Excel 双击即可正确显示；显式选了 utf-8 时也
+    统一带 BOM 写出；GBK/GB18030 等编码则原样写出，与读入编码体系一致。
     """
-    return "utf-8-sig" if encoding == "auto" else encoding
+    if encoding in ("auto", "utf-8"):
+        return "utf-8-sig"
+    return encoding
 
 
 def _write_welds_csv(result, path: Path, encoding: str = "utf-8-sig") -> Path:
@@ -319,7 +321,7 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      spool_key=None, detect_ffw=False,
                      nts_min_mm=None, nts_max_mm=None, skew_deg=None,
                      encoding="auto", csv_encoding=None,
-                     progress_cb=None) -> list[dict]:
+                     progress_cb=None, failures=None) -> list[dict]:
     """批量渲染 PCF 为轴测图。
 
     参数:
@@ -333,16 +335,20 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
         spool_key:   分段属性名（如 SPOOL-IDENTIFIER）。设置后按该属性值标注分段，
                      跨段焊缝自动判定为现场焊（F.W.）。仅影响图面，不改数据
         detect_ffw:  检测现场调整焊（端面刚好贴合、无焊缝记录的接头）
-        encoding:    PCF 读入编码（auto/gbk/utf-8/utf-8-sig/latin-1，
+        encoding:    PCF 读入编码（auto/gbk/utf-8/utf-8-sig/gb18030，
                      auto=GBK 优先，同收集器）
-        csv_encoding: CSV 导出编码；默认跟随 encoding（auto → utf-8-sig，
-                     带 BOM，中文 Excel 双击可读）
+        csv_encoding: CSV 导出编码；默认跟随 encoding（auto/utf-8 → utf-8-sig
+                     带 BOM，中文 Excel 双击可读；gbk/gb18030 原样写出）
         progress_cb: 可选回调 cb(msg, current, total)
+        failures:    可选 list，单文件解析/渲染失败的 (文件名, 错误简述)
+                     会追加进来（单文件失败不中止整批，跳过继续）
 
-    返回: 每个文件的摘要列表 [{pcf, pdf, welds, bom, cuts, warnings}, ...]
+    返回: 成功文件的摘要列表 [{pcf, pdf, welds, bom, cuts, warnings}, ...]
     """
     if csv_encoding is None:
         csv_encoding = csv_output_encoding(encoding)
+    if failures is None:
+        failures = []
     files = collect_pcf_files(pcf_paths)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -353,12 +359,15 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
         if progress_cb:
             progress_cb(msg, current, total)
 
-    # 先全部解析（续接标注需要知道整套图纸的信息）
+    # 先全部解析（续接标注需要知道整套图纸的信息）；单文件失败记录后继续
     report("解析 PCF 文件...", 0)
     loaded = []
     for i, path in enumerate(files):
-        report(f"解析 {path.name}", i)
-        loaded.append((path, load(path, encoding=encoding)))
+        try:
+            report(f"解析 {path.name}", i)
+            loaded.append((path, load(path, encoding=encoding)))
+        except Exception as e:
+            failures.append((path.name, f"解析失败: {e}"))
 
     # 渲染前断连预检（只读检查，不改数据）：文件包含多个不连通管段组时给出警告
     split_warnings: dict[str, str] = {}
@@ -391,58 +400,62 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
 
     summaries = []
     for i, (path, doc) in enumerate(loaded):
-        report(f"渲染 {path.name}", i + 1)
-        options = RenderOptions()
-        if north_axis:
-            options.north_axis = north_axis
-        if quadrant:
-            options.quadrant = quadrant
-        if paper:
-            options.paper = paper
-        options.project = project or ""
-        options.job = job or ""
-        if revision is not None:
-            options.revision = revision
-        if notes:
-            options.notes = list(notes)
-        if properties:
-            options.properties = dict(properties)
-        options.not_to_scale = not to_scale
-        # 非比例伸缩与斜管倾斜的可调参数（GUI 出图设置弹窗用）
-        if nts_min_mm is not None:
-            options.nts_min_mm = float(nts_min_mm)
-        if nts_max_mm is not None:
-            options.nts_max_mm = float(nts_max_mm)
-        if skew_deg is not None:
-            options.skew_deg = float(skew_deg)
-        if spool_key:
-            options.spool_key = spool_key.strip().upper()
-        if detect_ffw:
-            options.detect_ffw = True
-        options.drawing_no = path.stem
-        options.continuations = cont_map.get(path.stem, [])
-        options.neighbour_docs = neighbour_docs
+        try:
+            report(f"渲染 {path.name}", i + 1)
+            options = RenderOptions()
+            if north_axis:
+                options.north_axis = north_axis
+            if quadrant:
+                options.quadrant = quadrant
+            if paper:
+                options.paper = paper
+            options.project = project or ""
+            options.job = job or ""
+            if revision is not None:
+                options.revision = revision
+            if notes:
+                options.notes = list(notes)
+            if properties:
+                options.properties = dict(properties)
+            options.not_to_scale = not to_scale
+            # 非比例伸缩与斜管倾斜的可调参数（GUI 出图设置弹窗用）
+            if nts_min_mm is not None:
+                options.nts_min_mm = float(nts_min_mm)
+            if nts_max_mm is not None:
+                options.nts_max_mm = float(nts_max_mm)
+            if skew_deg is not None:
+                options.skew_deg = float(skew_deg)
+            if spool_key:
+                options.spool_key = spool_key.strip().upper()
+            if detect_ffw:
+                options.detect_ffw = True
+            options.drawing_no = path.stem
+            options.continuations = cont_map.get(path.stem, [])
+            options.neighbour_docs = neighbour_docs
 
-        pdf_path = out / (path.stem + ".pdf")
-        dims_file = sidecar_path(pdf_path)
-        if dims_file.is_file():
-            options.dims_sidecar = str(dims_file)  # 已有的人工标注覆写继续生效
+            pdf_path = out / (path.stem + ".pdf")
+            dims_file = sidecar_path(pdf_path)
+            if dims_file.is_file():
+                options.dims_sidecar = str(dims_file)  # 已有的人工标注覆写继续生效
 
-        result = render_pdf(doc, pdf_path, options)
-        _write_welds_csv(result, _welds_csv_path(pdf_path), encoding=csv_encoding)
-        _write_bom_csv(result, doc, _bom_csv_path(pdf_path), encoding=csv_encoding)
-        _write_cuts_csv(result, doc, _cuts_csv_path(pdf_path), encoding=csv_encoding)
-        write_sidecar(dims_file, result.dimensions, doc.units_coords)
+            result = render_pdf(doc, pdf_path, options)
+            _write_welds_csv(result, _welds_csv_path(pdf_path), encoding=csv_encoding)
+            _write_bom_csv(result, doc, _bom_csv_path(pdf_path), encoding=csv_encoding)
+            _write_cuts_csv(result, doc, _cuts_csv_path(pdf_path), encoding=csv_encoding)
+            write_sidecar(dims_file, result.dimensions, doc.units_coords)
 
-        warnings = list(result.warnings)
-        if path.name in split_warnings:
-            warnings.insert(0, split_warnings[path.name])
-        summaries.append({
-            "pcf": str(path), "pdf": str(pdf_path),
-            "welds": len(result.welds), "bom": len(result.bom),
-            "cuts": len(result.cut_pieces),
-            "warnings": warnings,
-        })
+            warnings = list(result.warnings)
+            if path.name in split_warnings:
+                warnings.insert(0, split_warnings[path.name])
+            summaries.append({
+                "pcf": str(path), "pdf": str(pdf_path),
+                "welds": len(result.welds), "bom": len(result.bom),
+                "cuts": len(result.cut_pieces),
+                "warnings": warnings,
+            })
+        except Exception as e:
+            # 单文件失败不中止整批：记录 (文件名, 错误简述) 后继续
+            failures.append((path.name, f"渲染失败: {e}"))
 
     report("完成", total)
     return summaries
@@ -465,25 +478,32 @@ def main(argv=None) -> int:
                         help="分段属性名（如 SPOOL-IDENTIFIER），跨段焊缝自动判定为现场焊 F.W.")
     parser.add_argument("--detect-ffw", action="store_true", help="检测现场调整焊（贴合接头）")
     parser.add_argument("--encoding", default="auto",
-                        choices=["auto", "gbk", "utf-8", "utf-8-sig", "latin-1"],
+                        choices=["auto", "gbk", "utf-8", "utf-8-sig", "gb18030"],
                         help="PCF 读入编码（默认 auto=GBK 优先，同收集器）")
     parser.add_argument("--csv-encoding", default=None,
-                        choices=["utf-8", "utf-8-sig", "gbk", "latin-1"],
-                        help="CSV 导出编码（默认跟随 --encoding，auto → utf-8-sig）")
+                        choices=["utf-8", "utf-8-sig", "gbk", "gb18030"],
+                        help="CSV 导出编码（默认跟随 --encoding，auto/utf-8 → utf-8-sig）")
     args = parser.parse_args(argv)
 
+    failures = []
     summaries = render_pcf_files(
         args.paths, args.out_dir,
         north_axis=args.north_axis, quadrant=args.quadrant, paper=args.paper,
         project=args.project, job=args.job, to_scale=args.to_scale,
         spool_key=args.spool_key, detect_ffw=args.detect_ffw,
         encoding=args.encoding, csv_encoding=args.csv_encoding,
-        progress_cb=lambda msg, cur, tot: print(f"[{cur}/{tot}] {msg}"))
+        progress_cb=lambda msg, cur, tot: print(f"[{cur}/{tot}] {msg}"),
+        failures=failures)
 
     for s in summaries:
         print(f"{Path(s['pcf']).name}: 焊缝{s['welds']} BOM{s['bom']} 切割{s['cuts']} -> {s['pdf']}")
         for w in s["warnings"]:
             print(f"  警告: {w}")
+    if failures:
+        print(f"失败 {len(failures)} 个文件:")
+        for name, err in failures:
+            print(f"  {name}: {err}")
+        return 1
     return 0
 
 

@@ -78,6 +78,9 @@ def parse_point(raw: str) -> Point | None:
         x, y, z = float(tokens[1]), float(tokens[2]), float(tokens[3])
     except ValueError:
         return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+        # NAN/INF 脏数据：静默入模型会让容差桶的 round(nan) 直接崩
+        return None
     bore: float | None = None
     flags: list[str] = []
     for tok in tokens[4:]:
@@ -88,6 +91,8 @@ def parse_point(raw: str) -> Point | None:
             except ValueError:
                 pass
         flags.append(tok)
+    if bore is not None and not math.isfinite(bore):
+        bore = None
     return Point(key=key, x=x, y=y, z=z, bore=bore, flags=tuple(flags))
 
 
