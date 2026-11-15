@@ -283,7 +283,8 @@ def render_preview_bytes(pcf_path, north_axis=None, quadrant=None, paper=None,
 
 def render_preview_scene(pcf_path, north_axis=None, quadrant=None, paper=None,
                          to_scale=False, nts_min_mm=None, nts_max_mm=None,
-                         skew_deg=None, encoding="auto"):
+                         skew_deg=None, encoding="auto",
+                         weld_number_overrides=None):
     """实时预览（全矢量）：渲染单条管线的纯图面，返回 (SceneModel, RenderResult)。
 
     与 render_preview_bytes 同参数体系，但走矢量场景后端——不经临时
@@ -306,6 +307,8 @@ def render_preview_scene(pcf_path, north_axis=None, quadrant=None, paper=None,
         options.nts_max_mm = float(nts_max_mm)
     if skew_deg is not None:
         options.skew_deg = float(skew_deg)
+    # 焊点编号覆盖（预览点击改号/导入 JSON）：空表/None = 纯自动编号
+    options.weld_number_overrides = weld_number_overrides or None
 
     docs, cont_map = render_set(pcf_path, encoding=encoding)
     stem = Path(pcf_path).stem

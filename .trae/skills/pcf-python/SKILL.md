@@ -15,7 +15,7 @@ PCF → 单线轴测图（ISO）渲染器：`pcf/` 渲染引擎 + ttkbootstrap G
 - `pcf/continuations.py` — 接图点判定：**纯声明驱动**，每条 END-CONNECTION-PIPELINE = 一个接图点（CO-ORDS=坐标、CONNECTION-REFERENCE=名字），无几何匹配
 - `pcf/asc_symbols.py` + `symbols/ALIAS.asc` — Isogen .ASC 符号库单源（315 符号，先到先得）+ 阀体→阀柄 skey 厂商配对
 - `pcf_renderer.py` — CLI 批量渲染与 GUI 预览适配层（render_set 按目录缓存整套文档）
-- `pcf_app.py` — GUI（管线清单勾选出图、矢量预览）
+- `pcf_app.py` — GUI（管线清单勾选出图、矢量预览、单击焊点改号 + 编号 JSON 导入导出）
 - `PCF收集器.spec` + `version_info.py` — PyInstaller 打包配置与版本信息
 
 ## 全量渲染回归（改动渲染链后必跑）
@@ -97,9 +97,13 @@ py -3 -m PyInstaller "PCF收集器.spec" --noconfirm
 ### welds
 - 联管节 gap 模型空间测量（页空间被 warp 拉大，1/16" 越过 3mm 阈值致本体线压焊点）；焊耦合经焊点派生但中心线须连续
 - socket weld 画方括号朝插入件（旧版统一圆点不可辨）；boss 站开根部 0.9mm 焊点；tie band 用 1e-3 容差（1e-6 时螺栓法兰对两半因投影噪声选不同轴、两面杠 60° 成 X）
+- 焊点编号覆盖（welds.weld_key / apply_number_overrides）：稳定键 = `uci:{uci}` 优先、缺 UCI 回退 `pt:{x:.3f},{y:.3f},{z:.3f}`（布局/分页无关，跨图稳定）；覆盖表就地替换编号、**允许重复号**、只动覆盖点、空表=纯自动 1..N；编号**不落库**（无 sidecar），经 RenderOptions.weld_number_overrides / render_preview_scene 透传
+- 预览场景 weld 标签为三元组 `("weld", 编号, weld_key)`（重复号也能各自定位；PDF 后端忽略标签，出图无影响）；GUI 单击焊点改号，清空输入=删覆盖恢复自动号
+- 编号 JSON 批量导入导出：平铺 `{weld_key: 编号}`，文件名 `{stem}-焊点编号.json`，导出 utf-8、导入 utf-8-sig（容忍 Excel 转存 BOM）；GUI 覆盖表按 pcf 路径分桶 `self._weld_overrides`
 
 ### 球标与 GUI
 - callout 单一风格，裸标签靠邻近推断在繁忙图纸/NTS 拉近时失效；leader foot 与邻件锚/焊点留白；切割件标注点中点优先、四分点逃生；垫片/螺栓并入任一端法兰，无法兰单独球标；标题栏标签比值低一级（原有层级），仅值用 _SHEET_FONT 8.0
+- 预览模式跳过球标：`if options.show_bom and not options.preview`——预览不出 BOM 表，项号球标无对照意义（管材切名/材料项号一并跳过）
 - 预览旋转文字须与出图同向：场景 rotation 矩阵按 y-down 页面视觉合成 `(cos, -sin, sin, cos)`（fpdf2 自身的 y-up 内容空间矩阵数值直接搬进场景会视觉镜像——变径就地标签/F.W. 预览曾反向即此因）；iso_text 自建矩阵本就是 y-down 约定不受影响
 - revision join 容差——未动焊点世界坐标相同（distance 0），容差只消化模型微调；pull-back 容差——地图项自放置，未动 marker 与行差 <1px
 

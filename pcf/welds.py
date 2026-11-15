@@ -314,3 +314,23 @@ def derive_welds(
             else:
                 weld.spool = next(iter(touching), "") or ""
     return welds
+
+
+def weld_key(weld: Weld) -> str:
+    """焊点稳定键：UCI 优先（跨图/跨版本稳定），缺 UCI 用世界坐标兜底
+    （与布局/分页无关）。预览点击改号与编号 JSON 导入导出均以此为索引。"""
+    if weld.uci:
+        return f"uci:{weld.uci}"
+    return f"pt:{weld.x:.3f},{weld.y:.3f},{weld.z:.3f}"
+
+
+def apply_number_overrides(welds: list[Weld], overrides: dict[str, int] | None) -> None:
+    """按 {weld_key: 编号} 就地替换焊点编号：允许与别的焊点重复，只动
+    覆盖过的点，其余保持 derive_welds 的派生自动号 1..N。空表/None =
+    纯自动编号。编号不落库（无 sidecar），仅渲染时生效。"""
+    if not overrides:
+        return
+    for weld in welds:
+        n = overrides.get(weld_key(weld))
+        if n is not None:
+            weld.number = n

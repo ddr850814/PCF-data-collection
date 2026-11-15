@@ -34,8 +34,8 @@ from .skeys import (classify, connection_from_skey, is_annotation_symbol,
 from .splitmerge import split_pages
 from .units import (coord_to_inch_factor, format_bore, format_feet_inches,
                     format_length, format_mm, is_metric_units)
-from .welds import (GAP_COUPLING_MAX_INCHES, Weld, component_spools,
-                    derive_welds)
+from .welds import (GAP_COUPLING_MAX_INCHES, Weld, apply_number_overrides,
+                    component_spools, derive_welds, weld_key)
 
 Vec2 = tuple[float, float]
 Vec3 = tuple[float, float, float]
@@ -109,6 +109,9 @@ class RenderOptions:
     # 图名 → PcfDocument（批量渲染传入）：分图幻影件需邻图文档画断点对侧虚线幻影；
     # 单图渲染为空时幻影退化为只画接续标记。
     neighbour_docs: dict[str, PcfDocument] | None = None
+    # 预览点击改号的编号覆盖表：{weld_key: 编号}，允许重复号，只动覆盖点；
+    # 编号不落库（无 sidecar），GUI 经 render_preview_scene 传入。
+    weld_number_overrides: dict[str, int] | None = None
 
 
 @dataclass
@@ -1772,6 +1775,9 @@ def _render_document(
     # weld's page position is still captured here so the weld-map upload has an anchor.
     welds = derive_welds(doc, detect_ffw=options.detect_ffw,
                          spool_key=options.spool_key)
+    # 编号覆盖（预览点击改号/导入 JSON）：就地替换编号，允许重复；
+    # 未覆盖的焊点保持派生自动号 1..N
+    apply_number_overrides(welds, options.weld_number_overrides)
     weld_positions: list[WeldPosition] = []
     weld_dots: list[Vec2] = []
     for weld in welds:
@@ -1793,7 +1799,8 @@ def _render_document(
                     dot = w
                     break
         weld_dots.append(dot)
-        with canvas.tagged("weld", weld.number):
+        # 标签附 weld_key：预览单击焊点改号按键定位，重复编号也能区分
+        with canvas.tagged("weld", weld.number, weld_key(weld)):
             _draw_weld_symbol(canvas, projector, weld, dot)
         nps = format_bore(weld.bore, doc.units_bore) if weld.bore else "?"
         weld_positions.append(WeldPosition(

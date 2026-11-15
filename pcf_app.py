@@ -6,6 +6,7 @@
 3. 右键导出数据到 Excel
 """
 
+import json
 import math
 import os
 import queue
@@ -14,7 +15,7 @@ import threading
 import traceback
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import ttkbootstrap as ttkb
 from ttkbootstrap.constants import *
@@ -89,15 +90,27 @@ class PcfApp:
         left_frame = ttkb.Frame(main_paned)
         main_paned.add(left_frame, weight=3)
 
-        ttkb.Label(left_frame, text="图面预览（Ctrl+滚轮缩放 / 拖动平移 / 双击复位）",
+        ttkb.Label(left_frame, text="图面预览（Ctrl+滚轮缩放 / 拖动平移 / 双击复位 / 单击焊点改号）",
                    font=("-size", 11, "-weight", "bold"),
                    bootstyle=INVERSE).pack(fill=X, pady=(0, 4))
+
+        # 焊点编号 JSON 批量导入/导出：编号不落库，{weld_key: 编号} 平铺文件
+        weld_btns = ttkb.Frame(left_frame)
+        weld_btns.pack(fill=X, pady=(0, 4))
+        ttkb.Button(weld_btns, text="导出编号 JSON", width=14,
+                    command=self._on_export_weld_numbers,
+                    bootstyle=(INFO, OUTLINE)).pack(side=LEFT)
+        ttkb.Button(weld_btns, text="导入编号 JSON", width=14,
+                    command=self._on_import_weld_numbers,
+                    bootstyle=(INFO, OUTLINE)).pack(side=LEFT, padx=(6, 0))
 
         self.preview_canvas = tk.Canvas(left_frame, bg="white", highlightthickness=0)
         self.preview_canvas.pack(fill=BOTH, expand=YES)
         # 预览状态：矢量场景（后台线程产出）+ 视图状态机，见 _show_scene/_draw_scene
         self._preview_scene = None
         self._preview_result = None
+        # 焊点编号覆盖（不落库）：{pcf 路径: {weld_key: 编号}}，允许重复号
+        self._weld_overrides = {}
         self._font_cache = {}           # (bold, px) -> (tkfont.Font, ascent)
         self.preview_canvas.bind("<Configure>", lambda e: self._on_preview_resize())
         # Ctrl+滚轮缩放 / 左键拖动平移 / 双击复位 fit / 单击命中元素打印标签
@@ -602,6 +615,8 @@ class PcfApp:
         """后台实时渲染该管线的纯图面（不出文件、无图框/材料表）"""
         self._preview_token = getattr(self, "_preview_token", 0) + 1
         token = self._preview_token
+        self._preview_path = pcf_path
+        self._preview_ref = ref
         s = self.render_settings
         self.status_var.set(f"预览渲染中：{ref or pcf_path} ...")
 
@@ -612,7 +627,8 @@ class PcfApp:
                     pcf_path, north_axis=s["north"], quadrant=s["quadrant"],
                     paper=s["paper"], to_scale=s["to_scale"],
                     nts_min_mm=s["nts_min"], nts_max_mm=s["nts_max"],
-                    skew_deg=s["skew"], encoding=s.get("encoding", "auto"))
+                    skew_deg=s["skew"], encoding=s.get("encoding", "auto"),
+                    weld_number_overrides=self._weld_overrides.get(pcf_path))
                 if token == self._preview_token:
                     self._post(lambda: self._show_scene(scene, result, ref))
             except Exception as exc:
@@ -938,6 +954,9 @@ class PcfApp:
         if idx is None:
             return
         item = scene.items[idx]
+        if item.tags and item.tags[0] == "weld":
+            self._edit_weld_number(item.tags)      # 单击焊点：改号对话框
+            return
         print(f"[预览] kind={item.kind} tags={item.tags} text={item.text!r}")
         if item.tags:
             self.status_var.set(f"选中：{item.tags[0]} {item.tags[1]}")
@@ -951,6 +970,81 @@ class PcfApp:
         self._preview_resize_job = self.root.after(
             120, lambda: (setattr(self, "_preview_resize_job", None),
                           self._draw_scene()))
+
+    # ==================== 焊点编号覆盖 ====================
+
+    def _edit_weld_number(self, tags):
+        """单击焊点改号：允许与别的焊点重复；清空输入=删除覆盖恢复自动编号。
+        tags = ("weld", 当前编号, weld_key)，键由渲染端按 UCI/世界坐标生成，
+        重复编号也能各自定位。"""
+        number, key = str(tags[1]), tags[2]
+        path = getattr(self, "_preview_path", None)
+        if not path:
+            return
+        cur = self._weld_overrides.setdefault(path, {})
+        value = simpledialog.askstring(
+            "焊点编号",
+            f"焊点当前编号 {number}\n"
+            f"输入新编号（允许重复）；留空恢复自动编号：",
+            initialvalue=number, parent=self.root)
+        if value is None:                       # 取消：不动
+            return
+        value = value.strip()
+        if not value:
+            cur.pop(key, None)
+            self.status_var.set(f"焊点 {number} 已恢复自动编号")
+        else:
+            try:
+                cur[key] = int(value)
+            except ValueError:
+                self.status_var.set(f"编号 {value!r} 不是整数，已忽略")
+                return
+            self.status_var.set(f"焊点 {number} → {value}")
+        self._start_live_preview(path, getattr(self, "_preview_ref", ""))
+
+    def _on_export_weld_numbers(self):
+        """当前预览图的编号覆盖表导出 JSON（只含改过的点，不含自动编号）"""
+        path = getattr(self, "_preview_path", None)
+        if not path:
+            messagebox.showinfo("导出编号", "请先在管线清单点选一条管线出预览",
+                                parent=self.root)
+            return
+        cur = self._weld_overrides.get(path, {})
+        stem = os.path.splitext(os.path.basename(path))[0]
+        target = filedialog.asksaveasfilename(
+            title="导出焊点编号", defaultextension=".json",
+            initialfile=f"{stem}-焊点编号.json",
+            filetypes=[("JSON", "*.json")], parent=self.root)
+        if not target:
+            return
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=1, sort_keys=True)
+        self.status_var.set(
+            f"导出 {len(cur)} 条焊点编号 → {os.path.basename(target)}")
+
+    def _on_import_weld_numbers(self):
+        """导入编号覆盖 JSON 作用于当前预览图并即时重渲染"""
+        path = getattr(self, "_preview_path", None)
+        if not path:
+            messagebox.showinfo("导入编号", "请先在管线清单点选一条管线出预览",
+                                parent=self.root)
+            return
+        source = filedialog.askopenfilename(
+            title="导入焊点编号", filetypes=[("JSON", "*.json")],
+            parent=self.root)
+        if not source:
+            return
+        try:
+            with open(source, encoding="utf-8-sig") as f:
+                data = json.load(f)
+            overrides = {str(k): int(v) for k, v in data.items()}
+        except Exception as exc:
+            messagebox.showerror("导入编号", f"JSON 无效：{exc}",
+                                 parent=self.root)
+            return
+        self._weld_overrides[path] = overrides
+        self.status_var.set(f"导入 {len(overrides)} 条焊点编号，重新渲染中...")
+        self._start_live_preview(path, getattr(self, "_preview_ref", ""))
 
     # ==================== 轴测图渲染 ====================
 
