@@ -2993,7 +2993,12 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
             if not others:
                 return
             far = max(others, key=lambda c: geometry.dist(s, c))
-            d = _sym_dir(s, far) or din
+            if cls in ("FLANGE", "GASKET"):
+                # 法兰/垫片自身不带偏心偏移：方向随邻管弦线（真斜管主轴占比
+                # 可 >0.9，主轴吸附会把符号拧到 30° 族轴测轴上、与邻管折线脱节）
+                d = _pdir(s, far) or din
+            else:
+                d = _sym_dir(s, far) or din
             req = _v2_add(p_in, _v2_scale(d, natural))
             if _write(idx, far, req, s):
                 if comp.centre_points:
