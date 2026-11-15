@@ -2507,7 +2507,7 @@ def _olet_header_points(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
     """
     comps = doc.real_components()
     tol = geometry.model_tolerance(doc)
-    out: dict[int, tuple[Vec3, Vec3]] = {}
+    out: dict[int, tuple[Vec3, Vec3, float]] = {}
     for comp in comps:
         if classify(comp.type, comp.skey) != "OLET" or not comp.centre_points:
             continue
@@ -2528,7 +2528,9 @@ def _olet_header_points(doc: PcfDocument) -> dict[int, tuple[Vec3, Vec3]]:
             foot = tuple(a[i] + t * axis[i] for i in range(3))
             if geometry.dist(centre, foot) > tol * 4:
                 continue
-            out[id(comp)] = (a, b)
+            # 第三个元素带上宿主管口径：变径就地标签（'大X小'）需要母管
+            # 口径——OLET 自身记录只写支管 bore（CENTRE/BRANCH 两点）
+            out[id(comp)] = (a, b, other.bore or 0.0)
             break
     return out
 
@@ -3705,7 +3707,7 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     doc: PcfDocument,
                     flange_face_pts: dict[int, Vec3] | None = None,
                     flange_bar_mm: float = 2 * DEFAULT_OFFSET_MM,
-                    olet_header_pts: dict[int, Vec3] | None = None,
+                    olet_header_pts: dict[int, tuple[Vec3, Vec3, float]] | None = None,
                     olet_branch_connected: set[int] | None = None,
                     reducer_runs: dict[int, tuple[Vec3, Vec3]] | None = None,
                     ) -> Vec2 | None:
@@ -3879,6 +3881,14 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                             width=0.3 if cont_copy else 0.4,
                             width_mm=sym_w,
                             ecc_dir=ecc_dir, **op_kw, **prop_kw):
+            if cls == "REDUCER" and len(eps) >= 2 and not cont_copy \
+                    and not proj.proportional:
+                tag = _bore_tag_text((comp.end_points[0].bore,
+                                      comp.end_points[-1].bore))
+                if tag:
+                    _draw_bore_tag(canvas, proj, _v2_mid(eps[0], eps[1]),
+                                   axis_override or _v2_sub(eps[1], eps[0]),
+                                   tag)
             return cps[0] if cps else _v2_mid(eps[0], eps[1])
 
     face_pt = (flange_face_pts or {}).get(id(comp))
@@ -4036,14 +4046,27 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                        width=0.55)
             anchor = c0
         if centre is not None:
-            for branch in (*b1s, *b2s):
+            # 变径三通就地标签：支管端旁标 '大X小'（主管口径取端点 bore）
+            br_bores = ([p.bore for p in comp.branch1_points]
+                        + [p.bore for p in comp.branch2_points])
+            for leg_i, (branch, bb) in enumerate(zip((*b1s, *b2s), br_bores)):
                 if proj.proportional:
                     stroke(centre, branch, width=0.55)
-                else:
-                    stroke(centre, _grown_leg_end(branch, centre,
-                                                  natural=leg_mm,
-                                                  own_id=id(comp)),
-                           width=0.55)
+                    continue
+                tip = _grown_leg_end(branch, centre, natural=leg_mm,
+                                     own_id=id(comp))
+                stroke(centre, tip, width=0.55)
+                if not cont_copy:
+                    run_bore = max((p.bore for p in comp.end_points),
+                                   default=None)
+                    tag = _bore_tag_text((run_bore, bb))
+                    if tag:
+                        # 标在三通中心点旁、文字顺主管向（run 轴）；
+                        # 多支腿（CROSS）逐腿抬 gap 防叠字
+                        u = _v2_sub(eps[1], eps[0]) if len(eps) >= 2 \
+                            else _v2_sub(tip, centre)
+                        _draw_bore_tag(canvas, proj, centre, u, tag,
+                                       gap=3.0 + 2.5 * leg_i)
             anchor = centre
         return anchor
 
@@ -4056,6 +4079,19 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                       if run else None)
             connected = (olet_branch_connected is None
                          or id(comp) in olet_branch_connected)
+            # 变径就地标签：支管端旁 '大X小'。支管 bore 在自身记录，
+            # 母管口径由 _olet_header_points 几何匹配宿主管时带回
+            if not cont_copy and not proj.proportional:
+                host_bore = run[2] if run and len(run) > 2 else None
+                tag = _bore_tag_text((host_bore,
+                                      comp.branch1_points[0].bore
+                                      if comp.branch1_points else None))
+                if tag:
+                    # 文字顺着宿主管向（几何匹配的 run 向），锚仍在支管端外
+                    u = header or _v2_sub(branch, centre)
+                    _draw_bore_tag(canvas, proj,
+                                   _v2_add(branch, _v2_scale(_v2_norm(_v2_sub(branch, centre)), 1.2)),
+                                   u, tag)
             # SKEY 符号库优先（WT 支管台等）：主管中心→支管端两接点对齐，
             # 跨向取世界轴投影；支管未连接或按比例模式保持 _draw_olet 原行为
             if connected and not proj.proportional:
@@ -4097,6 +4133,12 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                           (reducer_runs or {}).get(id(comp)), doc.units_bore)
             if b1s:
                 canvas.line(_v2_mid(eps[0], eps[1]), b1s[0], width=0.55)
+            if not cont_copy and not proj.proportional:
+                tag = _bore_tag_text((comp.end_points[0].bore,
+                                      comp.end_points[-1].bore))
+                if tag:
+                    _draw_bore_tag(canvas, proj, _v2_mid(eps[0], eps[1]),
+                                   _v2_sub(eps[1], eps[0]), tag)
             return _v2_mid(eps[0], eps[1])
 
     elif cls == "GASKET":
@@ -4852,6 +4894,42 @@ def _step_across(chord: Vec2, axis: Vec2, across: Vec2) -> float | None:
     if abs(det) < 1e-6:
         return None
     return (axis[0] * chord[1] - axis[1] * chord[0]) / det
+
+
+def _bore_tag_text(bores) -> str | None:
+    """变径就地标签文本：'大X小'（降序）；等径、缺径或不足两口征返回 None。
+
+    口径取 PCF 记录的原始数值（本语料为 mm/DN），整数省略小数位。
+    """
+    vals = [float(b) for b in bores if b]
+    if len(vals) < 2:
+        return None
+    big, small = max(vals), min(vals)
+    if big - small < 1e-9:
+        return None
+
+    def fmt(b: float) -> str:
+        return str(int(round(b))) if abs(b - round(b)) < 1e-9 else f"{b:.1f}"
+
+    return f"{fmt(big)}X{fmt(small)}"
+
+
+def _draw_bore_tag(canvas: _Canvas, proj: "Projector", anchor: Vec2,
+                   along: Vec2, text: str, gap: float = 3.0) -> None:
+    """变径件旁的 '大X小' 就地标签：沿管向倾斜、跨向抬 gap 避开本体线。
+
+    anchor 为标签参考点（变径本体中点、三通中心点或支管端），along 为主管向。
+    页面 y 向下，text 旋转角取 atan2(-u.y, u.x)（同 F.W. 标签约定）。
+    """
+    u = _v2_norm(along)
+    if u == (0.0, 0.0):
+        return
+    if u[0] < 0 or (u[0] == 0.0 and u[1] < 0):
+        u = (-u[0], -u[1])   # 翻转方向保持文字正立可读
+    across = _iso_cross_dir(proj, u)
+    at = _v2_add(anchor, _v2_scale(across, gap))
+    canvas.text(at, text, size=5.0,
+                angle=math.degrees(math.atan2(-u[1], u[0])))
 
 
 def _draw_cap(canvas: _Canvas, proj: "Projector", end: Vec2,

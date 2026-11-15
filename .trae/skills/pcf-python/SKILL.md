@@ -71,6 +71,11 @@ py -3 -m PyInstaller "PCF收集器.spec" --noconfirm
 - 符号体两端落自身焊点（旧法沿邻轴伸出致楔尖悬空），run 只定方正（弦定方出菱形）；跨向用投影世界轴（屏幕垂线不在等轴测面）
 - 平侧示意画（真实 1" 偏心仅 1/3mm 读作同心），平侧朝向取模型；尺寸以大端为锚、小端投影回原管轴；体深≥页空间中心线偏移否则领结交叉
 
+### 变径就地标签
+- 实际造成管径变化的元件就地标 "大X小"（降序，如 200X50），覆盖三类：REDUCER（自身两 END-POINT bore）、变径三通（END-POINT 主管 + BRANCH1/2 支管，逐腿标）、OLET/TEE-STUB（支管 bore + 宿主管口径——宿主管经几何匹配在 _olet_header_points 带回，找不到宿主管跳过）
+- 端口 bore 全相等、缺径或不足两口征不标；按比例模式（proj.proportional）与 cont_copy 幻影虚线件不标
+- _draw_bore_tag：文字方向顺主管（REDUCER 沿自身轴；TEE/OLET 沿主管向——OLET 用几何匹配 run 的页面向 header，找不到宿主管回退支管向），翻向保持正立、跨向 _iso_cross_dir 抬 3mm 避开本体线、字号 5.0；**旋转角 atan2(-u.y, u.x)**（页面 y 向下，同 F.W. 标签约定，取正 y 会镜像斜率）；锚：REDUCER 取本体中点，TEE 标在中心点（多支腿 CROSS 逐腿抬 2.5mm 防叠字），OLET 在支管端外 1.2mm；三处绘制入口（REDUCER 符号优先路径/TEE 腿循环/OLET 符号前 + REDUCER 手绘回退）各自接入
+
 ### 尺寸
 - 尺寸线沿投影世界轴；≥4 箭头长才双箭头内置；offset leg 的 spanned 按页空间判定（模型对角线判定使 3" roll 在 40' 线中 offset 盒消失）
 - 兜底尺寸按连通组独立跑（旧版整页无尺寸才触发+多组拒绝）；垫片只存于法兰连接侧，此结构证据优先 rank 表判焊端
