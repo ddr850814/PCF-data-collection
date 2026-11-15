@@ -100,6 +100,7 @@ py -3 -m PyInstaller "PCF收集器.spec" --noconfirm
 
 ### 球标与 GUI
 - callout 单一风格，裸标签靠邻近推断在繁忙图纸/NTS 拉近时失效；leader foot 与邻件锚/焊点留白；切割件标注点中点优先、四分点逃生；垫片/螺栓并入任一端法兰，无法兰单独球标；标题栏标签比值低一级（原有层级），仅值用 _SHEET_FONT 8.0
+- 预览旋转文字须与出图同向：场景 rotation 矩阵按 y-down 页面视觉合成 `(cos, -sin, sin, cos)`（fpdf2 自身的 y-up 内容空间矩阵数值直接搬进场景会视觉镜像——变径就地标签/F.W. 预览曾反向即此因）；iso_text 自建矩阵本就是 y-down 约定不受影响
 - revision join 容差——未动焊点世界坐标相同（distance 0），容差只消化模型微调；pull-back 容差——地图项自放置，未动 marker 与行差 <1px
 
 ### __init__ 本地修改

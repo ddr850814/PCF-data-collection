@@ -947,10 +947,15 @@ class _SceneBackend:
 
 
 def _rot_matrix(angle_deg: float, cx: float, cy: float):
-    """绕 (cx, cy) 旋转 angle_deg 度（逆时针为正，同 fpdf.rotation）。"""
+    """绕 (cx, cy) 旋转 angle_deg 度，+角度视觉逆时针（与 fpdf2 出图一致）。
+
+    场景/页面坐标 y 向下，视觉逆时针须取 (cos, -sin, sin, cos)；fpdf2 自己的
+    (cos, sin, -sin, cos) 定义在 y 向上的内容空间，数值直接搬进 y 向下场景
+    会视觉镜像——此前预览旋转文字（变径就地标签、F.W.）曾与出图反向即此因。
+    """
     rad = math.radians(angle_deg)
     cos_a, sin_a = math.cos(rad), math.sin(rad)
-    rot = (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0)
+    rot = (cos_a, -sin_a, sin_a, cos_a, 0.0, 0.0)
     t1 = (1.0, 0.0, 0.0, 1.0, cx, cy)
     t2 = (1.0, 0.0, 0.0, 1.0, -cx, -cy)
     return _mat_mul(t1, _mat_mul(rot, t2))
