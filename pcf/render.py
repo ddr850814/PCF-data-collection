@@ -1876,7 +1876,8 @@ def _render_document(
     pipe_labels = {c.comp_index: c.label
                    for c in cut_pieces if c.comp_index is not None}
     callouts: list[Callout] = []
-    if options.show_bom:
+    if options.show_bom and not options.preview:
+        # 预览不出 BOM 表，项号球标无对照意义（管材切名/材料项号一并跳过）
         callouts = _draw_callouts(canvas, projector, comps, anchors,
                                   bom_rows, pipe_labels, draw_centre,
                                   every_instance=options.balloon_every_instance,
