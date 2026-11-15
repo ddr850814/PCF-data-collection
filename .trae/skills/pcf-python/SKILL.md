@@ -97,7 +97,7 @@ py -3 -m PyInstaller "PCF收集器.spec" --noconfirm
 ### welds
 - 联管节 gap 模型空间测量（页空间被 warp 拉大，1/16" 越过 3mm 阈值致本体线压焊点）；焊耦合经焊点派生但中心线须连续
 - socket weld 画方括号朝插入件（旧版统一圆点不可辨）；boss 站开根部 0.9mm 焊点；tie band 用 1e-3 容差（1e-6 时螺栓法兰对两半因投影噪声选不同轴、两面杠 60° 成 X）
-- 焊点编号覆盖（welds.weld_key / apply_number_overrides）：稳定键 = `uci:{uci}` 优先、缺 UCI 回退 `pt:{x:.3f},{y:.3f},{z:.3f}`（布局/分页无关，跨图稳定）；覆盖表就地替换编号、**允许重复号**、只动覆盖点、空表=纯自动 1..N；编号**不落库**（无 sidecar），经 RenderOptions.weld_number_overrides / render_preview_scene 透传
+- 焊点编号覆盖（welds.weld_key / apply_number_overrides）：稳定键 = `uci:{uci}` 优先、缺 UCI 回退 `pt:{x:.3f},{y:.3f},{z:.3f}`（布局/分页无关，跨图稳定）；覆盖表就地替换编号、**允许重复号**、只动覆盖点、空表=纯自动 1..N；编号**不落库**（无 sidecar），经 RenderOptions.weld_number_overrides 透传；预览 render_preview_scene 与出图 render_pcf_files（按 pcf 路径分桶取值）均已接入，PDF 焊点表与 welds CSV 同源 result.welds 同步生效
 - 预览场景 weld 标签为三元组 `("weld", 编号, weld_key)`（重复号也能各自定位；PDF 后端忽略标签，出图无影响）；GUI 单击焊点改号，清空输入=删覆盖恢复自动号
 - 编号 JSON 批量导入导出：平铺 `{weld_key: 编号}`，文件名 `{stem}-焊点编号.json`，导出 utf-8、导入 utf-8-sig（容忍 Excel 转存 BOM）；GUI 覆盖表按 pcf 路径分桶 `self._weld_overrides`
 

@@ -324,6 +324,7 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      spool_key=None, detect_ffw=False,
                      nts_min_mm=None, nts_max_mm=None, skew_deg=None,
                      encoding="auto", csv_encoding=None,
+                     weld_number_overrides=None,
                      progress_cb=None, failures=None) -> list[dict]:
     """批量渲染 PCF 为轴测图。
 
@@ -342,6 +343,9 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      auto=GBK 优先，同收集器）
         csv_encoding: CSV 导出编码；默认跟随 encoding（auto/utf-8 → utf-8-sig
                      带 BOM，中文 Excel 双击可读；gbk/gb18030 原样写出）
+        weld_number_overrides: 焊点编号覆盖 {pcf 路径字符串: {weld_key: 编号}}，
+                     与 GUI 预览改号/编号 JSON 同一份数据；PDF 焊点表与
+                     _welds.csv 同步生效，缺省/空表 = 纯自动编号
         progress_cb: 可选回调 cb(msg, current, total)
         failures:    可选 list，单文件解析/渲染失败的 (文件名, 错误简述)
                      会追加进来（单文件失败不中止整批，跳过继续）
@@ -435,6 +439,9 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
             options.drawing_no = path.stem
             options.continuations = cont_map.get(path.stem, [])
             options.neighbour_docs = neighbour_docs
+            # 焊点编号覆盖随出图生效（PDF 焊点表 + welds CSV 同源 result.welds）
+            if weld_number_overrides:
+                options.weld_number_overrides = weld_number_overrides.get(str(path)) or None
 
             pdf_path = out / (path.stem + ".pdf")
             dims_file = sidecar_path(pdf_path)

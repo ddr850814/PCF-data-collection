@@ -1218,6 +1218,7 @@ class PcfApp:
                 spool_key=spool_key, detect_ffw=detect_ffw,
                 nts_min_mm=nts_min, nts_max_mm=nts_max, skew_deg=skew,
                 encoding=encoding,
+                weld_number_overrides=self._weld_overrides,
                 progress_cb=lambda msg, cur, tot: self._post(
                     lambda m=msg, c=cur, t=tot: self.status_var.set(f"{m} ({c}/{t})")))
 
