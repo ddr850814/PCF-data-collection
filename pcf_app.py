@@ -708,6 +708,8 @@ class PcfApp:
             for i, item in enumerate(scene.items):
                 if item.kind == "text":
                     continue
+                if item.tags and "furniture" in item.tags:
+                    continue   # 家具固定角落画，不随场景变换（见 _draw_preview_furniture）
                 tag = ("elem", str(i), item.kind)
                 col = self._scene_color(item.color)
                 fill = self._scene_color(item.fill) if item.fill else ""
@@ -736,8 +738,40 @@ class PcfApp:
         # 文字层两路共用：Tk 系统字体本就抗锯齿，且带矩阵的能整串旋转
         for i, item in enumerate(scene.items):
             if item.kind == "text":
+                if item.tags and "furniture" in item.tags:
+                    continue
                 self._draw_scene_text(c, item, PX, PY, k,
                                       ("elem", str(i), "text"))
+        self._draw_preview_furniture(c, scene, cw, ch)
+
+    def _draw_preview_furniture(self, c, scene, cw, ch):
+        """指北针/NTS 戳固定在预览画布角落，不随 fit/缩放/平移。
+
+        它们与管线内容无几何关联：若按场景页坐标画，内容居中后小图的
+        家具会跑出画布；fit 墨迹范围已在场景端剔除它们（render._ink）。
+        """
+        north = None
+        nts = False
+        for item in scene.items:
+            if not (item.tags and "furniture" in item.tags):
+                continue
+            if item.kind == "line" and north is None:
+                (x1, y1), (x2, y2) = item.pts
+                north = math.atan2(y2 - y1, x2 - x1)   # 页/画布同为 y 向下
+            elif item.kind == "text" and "NOT TO SCALE" in item.text:
+                nts = True
+        if north is not None:
+            cx, cy = 34.0, 48.0
+            dx, dy = math.cos(north), math.sin(north)
+            tipx, tipy = cx + dx * 22, cy + dy * 22
+            c.create_line(cx - dx * 6, cy - dy * 6, tipx, tipy,
+                          width=2, arrow=tk.LAST, fill="#333333")
+            c.create_text(tipx + dx * 11, tipy + dy * 11, text="N",
+                          font=("Helvetica", 11, "bold"), fill="#333333")
+        if nts:
+            c.create_text(12, ch - 10, text="NOT TO SCALE",
+                          font=("Helvetica", 9, "bold"), anchor="sw",
+                          fill="#666666")
 
     def _draw_scene_text(self, c, item, PX, PY, k, tag):
         """文字回放。普通文字整串画；带矩阵的（尺寸标注 iso_text、F.W.
@@ -804,6 +838,10 @@ class PcfApp:
         img = Image.new("RGB", (max(1, cw * ss), max(1, ch * ss)), (255, 255, 255))
         d = ImageDraw.Draw(img)
         for item in items:
+            if item.kind == "text":
+                continue   # 文字层由 Tk 绘制
+            if item.tags and "furniture" in item.tags:
+                continue   # 家具固定角落画，不随场景变换
             col = tuple(item.color)
             fill = tuple(item.fill) if item.fill else None
             w = max(1, round(item.width * k * ss))

@@ -867,6 +867,12 @@ class _SceneBackend:
             self._ctm = prev
 
     # ---- 图元 ------------------------------------------------------------
+    def _ink(self, *args) -> None:
+        # 图纸家具（指北针/NTS 戳）位置固定在页面角落、与管线内容无关，不计入
+        # 墨迹范围——否则小图的 fit 居中基准被它们拉偏（管线主体偏右）。
+        if "furniture" not in self._tags:
+            self.scene._grow_ink(*args)
+
     def line(self, x1, y1, x2, y2):
         p, q = (x1, y1), (x2, y2)
         if self._ctm is not None:
@@ -874,7 +880,7 @@ class _SceneBackend:
         self.scene.items.append(SceneItem(
             "line", pts=(p, q), color=self._stroke,
             width=self._width, dash=self._dash, tags=self._tags))
-        self.scene._grow_ink(min(p[0], q[0]), min(p[1], q[1]),
+        self._ink(min(p[0], q[0]), min(p[1], q[1]),
                              max(p[0], q[0]), max(p[1], q[1]))
 
     def ellipse(self, x, y, w, h, style="D", **_):
@@ -892,7 +898,7 @@ class _SceneBackend:
         self.scene.items.append(SceneItem(
             "ellipse", box=(x, y, w, h), color=self._stroke,
             fill=fill, stroke=stroke, width=self._width, tags=self._tags))
-        self.scene._grow_ink(x, y, x + w, y + h)
+        self._ink(x, y, x + w, y + h)
 
     def rect(self, x, y, w, h, style="D", **_):
         fill = self._fill if "F" in style else None
@@ -906,12 +912,12 @@ class _SceneBackend:
                 fill=fill, stroke=stroke, width=self._width, tags=self._tags))
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            self.scene._grow_ink(min(xs), min(ys), max(xs), max(ys))
+            self._ink(min(xs), min(ys), max(xs), max(ys))
             return
         self.scene.items.append(SceneItem(
             "rect", box=(x, y, w, h), color=self._stroke,
             fill=fill, stroke=stroke, width=self._width, tags=self._tags))
-        self.scene._grow_ink(x, y, x + w, y + h)
+        self._ink(x, y, x + w, y + h)
 
     def polygon(self, points, style="D", **_):
         pts = tuple((p[0], p[1]) for p in points)
@@ -924,12 +930,12 @@ class _SceneBackend:
             stroke=stroke, width=self._width, tags=self._tags))
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
-        self.scene._grow_ink(min(xs), min(ys), max(xs), max(ys))
+        self._ink(min(xs), min(ys), max(xs), max(ys))
 
     def image(self, name, x=None, y=None, w=0.0, h=0.0, **_):
         # 预览场景不渲染位图（logo 等图纸家具）；只登记范围供 fit 使用。
         if x is not None and y is not None and w and h:
-            self.scene._grow_ink(x, y, x + w, y + h)
+            self._ink(x, y, x + w, y + h)
 
     def text(self, x, y, txt):
         txt = _metric_safe_text(txt)
@@ -946,7 +952,7 @@ class _SceneBackend:
             corners = [_mat_apply(self._ctm, c) for c in corners]
         xs = [c[0] for c in corners]
         ys = [c[1] for c in corners]
-        self.scene._grow_ink(min(xs), min(ys), max(xs), max(ys))
+        self._ink(min(xs), min(ys), max(xs), max(ys))
 
 
 def _rot_matrix(angle_deg: float, cx: float, cy: float):
@@ -1830,7 +1836,8 @@ def _render_document(
 
     # ---- NOT TO SCALE stamp (registered early so callouts route around) ----
     if options.not_to_scale:
-        _draw_nts_stamp(canvas, draw_region)
+        with canvas.tagged("furniture"):
+            _draw_nts_stamp(canvas, draw_region)
 
     # ---- continuations (before dims/callouts: they are the bigger blocks) ---
     # 分图（同管线断开）→ 邻图紧邻零件虚线幻影 + SEE ISO/SHT/坐标标注；跨管线
@@ -1910,7 +1917,8 @@ def _render_document(
     # ---- furniture ----------------------------------------------------------
     # 预览模式仍画北向标/注释/NTS 戳（图面内容），只跳过图框/BOM/切割表/标题栏
     # 等图纸家具。
-    _draw_north_arrow(canvas, projector, (draw_region[0] + 8, draw_region[1] + 10))
+    with canvas.tagged("furniture"):
+        _draw_north_arrow(canvas, projector, (draw_region[0] + 8, draw_region[1] + 10))
     bom_truncated = cut_truncated = False
     if not options.preview:
         _draw_border(canvas, page_w, page_h, border)
@@ -2667,8 +2675,8 @@ def _eccentric_small_end_exit(
     # 链式通道必须基于摆放后的位置正算出口
     p0 = proj.page(first.xyz)
     p1 = proj.page(last.xyz)
-    a = proj.page(run[0])
-    b = proj.page(run[1])
+    a = proj.page(run[0], apply_offset=False)
+    b = proj.page(run[1], apply_offset=False)
     axis = _v2_sub(b, a)
     ln = _v2_len(axis)
     if ln <= 1e-9:
@@ -2682,8 +2690,9 @@ def _eccentric_small_end_exit(
     # 与符号分支相同的定向镜像：小端偏侧由模型实测偏心方向决定，
     # 否则管线平移与符号出口各偏一侧（30001 曾因此顶平/底平画反）
     flat3 = _reducer_flat_offset(comp, first, last, run)
-    ea = proj.page(first.xyz)
-    eb = proj.page(tuple(first.xyz[i] + flat3[i] for i in range(3)))
+    ea = proj.page(first.xyz, apply_offset=False)
+    eb = proj.page(tuple(first.xyz[i] + flat3[i] for i in range(3)),
+                   apply_offset=False)
     e2 = _v2_sub(eb, ea)
     if _v2_len(e2) > 1e-9 and (e2[0] * v[0] + e2[1] * v[1]) * centre < 0:
         v = (-v[0], -v[1])
@@ -2736,9 +2745,15 @@ def _eccentric_small_side_offsets(
                 if nxt != idx and nxt not in seen:
                     seen.add(nxt)
                     stack.append(nxt)
+        seen_points = set()
         for j in seen:
             for pt in real[j].all_points():
-                offsets[pt.xyz] = delta
+                # 同一连接点会被管端、焊点、变径等多件共享；每级变径对
+                # 每个唯一坐标只累加一次，避免重复引用造成多倍偏移。
+                if pt.xyz in seen_points:
+                    continue
+                seen_points.add(pt.xyz)
+                offsets[pt.xyz] = _v2_add(offsets.get(pt.xyz, (0.0, 0.0)), delta)
     return offsets
 
 
@@ -2935,9 +2950,9 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         刚性件（弯头/三通/符号/点件）登记闭合修正，直管直接横跨。
         """
         cls = classify(comp.type, comp.skey)
-        # 垫片厚小于整图连接容差：不能用 tol 把另一端滤成“同点”，否则垫片图面空隙
-        # 被吞。1e-6 只给垫片——通用化会让 BFS 穿过短管/点件产生闭合差级联。
-        point_tol = 1e-6 if cls == "GASKET" else tol
+        # 短法兰/垫片的长度可能小于整图连接容差：不能用 tol 把另一端滤成
+        # “同点”，否则焊端进入后配合面消失，走链还会越过中间法兰。
+        point_tol = 1e-6 if cls in ("FLANGE", "GASKET") else tol
         others = [c for c in _cps(comp) if geometry.dist(c, s) > point_tol]
         if cls == "PIPE" and not others:
             # 短管拯救：两端距在 tol 内的短管也要占住图面档位长度，否则远端被吸回
@@ -3203,21 +3218,40 @@ def _chain_layout(proj: "Projector", doc: PcfDocument,
         while pending or deferred:
             if pending:
                 owner, pt, d = pending.popleft()
+                candidates = []
                 for j, shared in edges.get(owner, ()):
                     if j in placed or geometry.dist(shared, pt) > tol:
                         continue
-                    if classify(real[j].type, real[j].skey) == "PIPE":
-                        deferred.append((owner, pt, d, j, shared))
+                    cls = classify(real[j].type, real[j].skey)
+                    entry = shared
+                    if cls in ("FLANGE", "GASKET"):
+                        # shared 属于上游件；短法兰/垫片必须从自己的真实端点进入，
+                        # 不能把容差内的邻点当成它自身的连接点。
+                        entry = min(_cps(real[j]),
+                                    key=lambda q: geometry.dist(q, shared))
+                    candidates.append((j, shared, entry, cls))
+                # 同一接头存在精确相接的法兰/垫片时，容差内的其他法兰不得抄近路
+                # 越过它（盲法兰—垫片—承插焊法兰的间距可能全部小于 tol）。
+                exact_flange = any(
+                    cls in ("FLANGE", "GASKET")
+                    and geometry.dist(shared, entry) <= 1e-6
+                    for _j, shared, entry, cls in candidates)
+                for j, shared, entry, cls in candidates:
+                    if (exact_flange and cls in ("FLANGE", "GASKET")
+                            and geometry.dist(shared, entry) > 1e-6):
+                        continue
+                    if cls == "PIPE":
+                        deferred.append((owner, pt, d, j, entry))
                         _chain_debug.append(
-                            f"defer PIPE: j={j} owner={owner} shared={shared}")
+                            f"defer PIPE: j={j} owner={owner} shared={entry}")
                         continue
                     placed.add(j)
-                    if not _write(j, shared, pos[pt], pt) and \
-                            _v2_len(_v2_sub(pos[shared], pos[pt])) > 0.4:
+                    if not _write(j, entry, pos[pt], pt) and \
+                            _v2_len(_v2_sub(pos[entry], pos[pt])) > 0.4:
                         # 共点已被他组占用且位置不一致：登记闭合修正
-                        closures.append((shared, pt, (0.0, 0.0)))
+                        closures.append((entry, pt, (0.0, 0.0)))
                     nb_front: list[tuple[Vec3, Vec2]] = []
-                    _place(j, real[j], shared, pos[shared], d, nb_front)
+                    _place(j, real[j], entry, pos[entry], d, nb_front)
                     pending.extend((j, p2, d2) for p2, d2 in nb_front)
             else:
                 _o, pt, d, j, shared = deferred.popleft()
@@ -3758,11 +3792,9 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
     cont_copy = comp.is_continuation_copy()
     # 链式布局整图缩放：示意腿长同乘 schematic_scale（位置表已缩放）
     leg_mm = _SCHEMATIC_LEG_MM * getattr(proj, "schematic_scale", 1.0)
-    eccentric = cls == "REDUCER" and reducer_is_eccentric(comp.type, comp.skey)
-    # 链式布局下所有点都有平移表项，偏心变径也必须带偏移绘制；
-    # apply_offset=False 只在 warp 通道（变径自身不偏移）有意义
-    off_ok = (not eccentric) or getattr(proj, "offset_nearest", False)
-    eps = [proj.page(p.xyz, apply_offset=off_ok) for p in comp.end_points]
+    # 偏心变径也使用统一点偏移：上游变径会带动整个下游变径；
+    # 符号 START 随上游平移，EXIT 仍由自身偏心量正算，避免管端与符号脱节。
+    eps = [proj.page(p.xyz) for p in comp.end_points]
     cps = [proj.page(p.xyz) for p in comp.centre_points]
     b1s = [proj.page(p.xyz) for p in comp.branch1_points]
     b2s = [proj.page(p.xyz) for p in comp.branch2_points]
@@ -3840,8 +3872,8 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             # 符号 X→管轴、偏心量按符号 Y 保留——沿 p0→p1 对角线对齐会扭斜端面
             run = (reducer_runs or {}).get(id(comp))
             if run is not None:
-                a3 = proj.page(run[0])
-                b3 = proj.page(run[1])
+                a3 = proj.page(run[0], apply_offset=False)
+                b3 = proj.page(run[1], apply_offset=False)
                 ln = _v2_len(_v2_sub(b3, a3))
                 if ln > 1e-9:
                     ax = ((b3[0] - a3[0]) / ln, (b3[1] - a3[1]) / ln)

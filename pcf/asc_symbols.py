@@ -42,7 +42,7 @@ def _parse_asc(text: str) -> dict[str, tuple]:
 
     画笔语义（经 01HG/ANCH/HANG/SPRG 等符号几何反推验证）：
       - 记录之间笔位连续；第一条 502 记录冷启动于其首点（= 符号连接点，无到达线）
-      - 后续记录首点的 pen 作用于"到达"段：pen 1/2/6 均画线
+      - 后续记录首点的 pen 作用于"到达"段：pen 1/6 画线；pen 2 仅在上一笔不是 pen 0 时画线
       - 其余点的 pen 作用于"离开"段：pen 2 画线；pen 1 = 空移；pen 6 = 不画（只画到达）；
         pen 0 = 停止
     """
@@ -78,6 +78,7 @@ def _parse_asc(text: str) -> dict[str, tuple]:
             stop_pt = None
             segs = []
             rec_idx = 0
+            prev_pen = 0
         elif rec == "502" and segs is not None:
             vals = t[2:]
             trips = []
@@ -96,11 +97,21 @@ def _parse_asc(text: str) -> dict[str, tuple]:
                 stop_pt = (trips[-1][0], trips[-1][1])
             rec_idx += 1
             for idx, (x, y, pen) in enumerate(trips):
+                arrival_pen = prev_pen
+                prev_pen = pen
                 if idx == 0:
                     if first_pt is None:
                         first_pt = (x, y)   # 符号连接点（画笔起始位置）
-                    # 首点到达段：pen 1/2/6 均画线（第一条记录冷启动，无到达段）
-                    if rec_idx > 1 and pen in (1, 2, 6):
+                    # pen 1/6 的到达段始终绘制（FLOW 闭合边、01HG 第二条线）。
+                    # FLBL/FLSW 在 pen 0 后仍有一条正交跨记录段闭合外框；
+                    # 其余 pen 2 停笔到达段不画，避免补出 FLSW 的内部斜线。
+                    stopped_closure = (
+                        pen == 2 and arrival_pen == 0
+                        and any(k in ("FLBL", "FLSW") for k in skeys)
+                        and (pos[0] == x or pos[1] == y))
+                    if rec_idx > 1 and (pen in (1, 6)
+                                        or (pen == 2 and arrival_pen != 0)
+                                        or stopped_closure):
                         segs.append((pos[0], pos[1], x, y))
                     pos = (x, y)
                     # 首点离开段：pen 2 画向下一点（pen 6 只画到达，pen 1 空移）

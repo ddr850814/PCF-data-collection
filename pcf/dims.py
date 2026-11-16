@@ -381,17 +381,20 @@ def _welded_end_index(eps, comps: list[Component],
     # 垫片只存在于法兰（螺栓）连接侧：一端贴着垫片时另一端必为焊端。这条
     # 结构证据优先于 rank 表——否则隔着垫片 1.5mm 的邻件（如 TEE，rank-0）
     # 会抢先认领垫片侧端点，把焊端判反（法兰面杠画向管道）。
-    gasket_ends: set[int] = set()
+    gasket_distances: list[list[float]] = [[], []]
     for other_idx in graph.neighbours(idx):
         other = comps[other_idx]
         if classify(other.type, other.skey) != "GASKET":
             continue
-        for pt in other.connection_points():
-            for n, ep in enumerate(eps[:2]):
-                if ep.distance_to(pt) <= tol:
-                    gasket_ends.add(n)
-    if len(gasket_ends) == 1:
-        return 1 - next(iter(gasket_ends))
+        for n, ep in enumerate(eps[:2]):
+            gasket_distances[n].extend(
+                ep.distance_to(pt) for pt in other.connection_points())
+    nearest_gasket = [min(ds) if ds else float("inf")
+                      for ds in gasket_distances]
+    # 整组法兰+垫片可能都落在连接容差内，不能把“两端均在容差内”当成
+    # 证据失效：比较各端到垫片的最近距离，近端才是配合面。
+    if min(nearest_gasket) <= tol and nearest_gasket[0] != nearest_gasket[1]:
+        return 0 if nearest_gasket[0] > nearest_gasket[1] else 1
     for other_idx in graph.neighbours(idx):
         other = comps[other_idx]
         if looks_like_flange(other.type, other.description, other.skey):
