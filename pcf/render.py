@@ -1775,6 +1775,8 @@ def _render_document(
     # weld's page position is still captured here so the weld-map upload has an anchor.
     welds = derive_welds(doc, detect_ffw=options.detect_ffw,
                          spool_key=options.spool_key)
+    # 自动号快照：GUI 改号/导入后就地刷 tags 时，用它还原未覆盖点
+    auto_numbers = {weld_key(w): w.number for w in welds}
     # 编号覆盖（预览点击改号/导入 JSON）：就地替换编号，允许重复；
     # 未覆盖的焊点保持派生自动号 1..N
     apply_number_overrides(welds, options.weld_number_overrides)
@@ -1799,8 +1801,11 @@ def _render_document(
                     dot = w
                     break
         weld_dots.append(dot)
-        # 标签附 weld_key：预览单击焊点改号按键定位，重复编号也能区分
-        with canvas.tagged("weld", weld.number, weld_key(weld)):
+        wkey = weld_key(weld)
+        # 标签附 weld_key：预览单击焊点改号按键定位，重复编号也能区分；
+        # 尾附自动号——改号后 GUI 免重渲染即可还原/再改
+        with canvas.tagged("weld", weld.number, wkey,
+                           auto_numbers.get(wkey, weld.number)):
             _draw_weld_symbol(canvas, projector, weld, dot)
         nps = format_bore(weld.bore, doc.units_bore) if weld.bore else "?"
         weld_positions.append(WeldPosition(
@@ -1880,13 +1885,19 @@ def _render_document(
                     f"-- it is in the sidecar but not on the sheet")
 
     # ---- callouts -----------------------------------------------------------
-    bom_rows = _build_bom(doc, comps)
-    cut_pieces = build_cutlist(doc)
-    if sheet_no:
-        for piece in cut_pieces:
-            piece.sheet = f"p{sheet_no}"
-    pipe_labels = {c.comp_index: c.label
-                   for c in cut_pieces if c.comp_index is not None}
+    # 预览不出 BOM 表/切割表/球标，构建它们是纯浪费：整段短路
+    if options.preview:
+        bom_rows: dict = {}
+        cut_pieces: list[CutPiece] = []
+        pipe_labels: dict[int, str] = {}
+    else:
+        bom_rows = _build_bom(doc, comps)
+        cut_pieces = build_cutlist(doc)
+        if sheet_no:
+            for piece in cut_pieces:
+                piece.sheet = f"p{sheet_no}"
+        pipe_labels = {c.comp_index: c.label
+                       for c in cut_pieces if c.comp_index is not None}
     callouts: list[Callout] = []
     if options.show_bom and not options.preview:
         # 预览不出 BOM 表，项号球标无对照意义（管材切名/材料项号一并跳过）

@@ -130,8 +130,24 @@ class Component:
     attributes: list[AttrLine] = field(default_factory=list)
 
     # -- typed accessors -------------------------------------------------
+    # 坐标解析结果缓存：渲染链一次出图要反复取同一批点（ConnectivityGraph
+    # 每文档重建多次），逐次重解析属性字符串是纯浪费；set/remove 时失效。
+
+    def _cached_points(self, kind: str, compute) -> list[Point]:
+        cache = getattr(self, "_pcache", None)
+        if cache is None:
+            cache = {}
+            self._pcache = cache
+        pts = cache.get(kind)
+        if pts is None:
+            pts = compute()
+            cache[kind] = pts
+        return pts
 
     def _points(self, key: str) -> list[Point]:
+        return list(self._cached_points(key, lambda: self._parse_points(key)))
+
+    def _parse_points(self, key: str) -> list[Point]:
         out = []
         for attr in self.attributes:
             if attr.key == key:
@@ -162,19 +178,18 @@ class Component:
 
     @property
     def port_points(self) -> list[Point]:
-        out = []
-        for attr in self.attributes:
-            if _PORT_POINT_RE.match(attr.key):
-                pt = parse_point(attr.raw)
-                if pt is not None:
-                    out.append(pt)
-        return out
+        return list(self._cached_points(
+            "_PORT_", lambda: self._filter_points(_PORT_POINT_RE.match)))
 
     def all_points(self) -> list[Point]:
         """Every coordinate this component carries, in file order."""
+        return list(self._cached_points("_ALL_", lambda: self._filter_points(
+            lambda k: k in POINT_KEYS or _PORT_POINT_RE.match(k))))
+
+    def _filter_points(self, want) -> list[Point]:
         out = []
         for attr in self.attributes:
-            if attr.key in POINT_KEYS or _PORT_POINT_RE.match(attr.key):
+            if want(attr.key):
                 pt = parse_point(attr.raw)
                 if pt is not None:
                     out.append(pt)
@@ -182,6 +197,9 @@ class Component:
 
     def connection_points(self) -> list[Point]:
         """External keypoints: where this component joins its neighbours."""
+        return list(self._cached_points("_CONN_", lambda: self._compute_conn_points()))
+
+    def _compute_conn_points(self) -> list[Point]:
         out = []
         for attr in self.attributes:
             if attr.key in ("END-POINT", "BRANCH1-POINT", "BRANCH2-POINT") or _PORT_POINT_RE.match(
@@ -191,7 +209,7 @@ class Component:
                 if pt is not None:
                     out.append(pt)
         if not out:
-            out = self._points("CO-ORDS")
+            out = self._parse_points("CO-ORDS")
         return out
 
     # -- scalar attribute helpers ----------------------------------------
@@ -229,13 +247,16 @@ class Component:
         for attr in self.attributes:
             if attr.key == key_u:
                 attr.set_value(value)
+                self._pcache = None  # 坐标缓存失效
                 return
         self.attributes.append(AttrLine(f"{INDENT}{key.upper()}  {value}"))
+        self._pcache = None
 
     def remove(self, key: str) -> int:
         key_u = key.upper()
         before = len(self.attributes)
         self.attributes = [a for a in self.attributes if a.key != key_u]
+        self._pcache = None
         return before - len(self.attributes)
 
     @property

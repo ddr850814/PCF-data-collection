@@ -1000,7 +1000,25 @@ class PcfApp:
                 self.status_var.set(f"编号 {value!r} 不是整数，已忽略")
                 return
             self.status_var.set(f"焊点 {number} → {value}")
-        self._start_live_preview(path, getattr(self, "_preview_ref", ""))
+        self._refresh_weld_tags()
+
+    def _refresh_weld_tags(self):
+        """改号/导入后就地更新预览场景的焊点 tags，免整图重渲染。
+
+        编号只是点击拾取的元数据（画布不画号），布局与几何完全不受
+        覆盖表影响——渲染端 tags=(编号, weld_key, 自动号)，这里按最新
+        覆盖表换算生效号写回，清空的点还原自动号。"""
+        scene = getattr(self, "_preview_scene", None)
+        path = getattr(self, "_preview_path", None)
+        if scene is None or not path:
+            return
+        ov = self._weld_overrides.get(path, {})
+        for item in scene.items:
+            if item.tags and item.tags[0] == "weld":
+                key = item.tags[2]
+                auto = item.tags[3] if len(item.tags) > 3 else item.tags[1]
+                # 覆盖表值与自动号均为 int，与渲染端 tags 类型契约一致
+                item.tags = ("weld", ov.get(key, auto), key, auto)
 
     def _on_export_weld_numbers(self):
         """当前预览图的编号覆盖表导出 JSON（只含改过的点，不含自动编号）"""
@@ -1043,8 +1061,8 @@ class PcfApp:
                                  parent=self.root)
             return
         self._weld_overrides[path] = overrides
-        self.status_var.set(f"导入 {len(overrides)} 条焊点编号，重新渲染中...")
-        self._start_live_preview(path, getattr(self, "_preview_ref", ""))
+        self.status_var.set(f"导入 {len(overrides)} 条焊点编号")
+        self._refresh_weld_tags()
 
     # ==================== 轴测图渲染 ====================
 
@@ -1365,4 +1383,8 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    # PyInstaller 冻结 exe 的多进程渲染（spawn）必需：子进程引导要经过这里
+    multiprocessing.freeze_support()
     main()

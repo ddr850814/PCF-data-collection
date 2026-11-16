@@ -325,7 +325,8 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
                      nts_min_mm=None, nts_max_mm=None, skew_deg=None,
                      encoding="auto", csv_encoding=None,
                      weld_number_overrides=None,
-                     progress_cb=None, failures=None) -> list[dict]:
+                     progress_cb=None, failures=None,
+                     workers=None) -> list[dict]:
     """批量渲染 PCF 为轴测图。
 
     参数:
@@ -349,6 +350,10 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
         progress_cb: 可选回调 cb(msg, current, total)
         failures:    可选 list，单文件解析/渲染失败的 (文件名, 错误简述)
                      会追加进来（单文件失败不中止整批，跳过继续）
+        workers:     并行渲染进程数。None=自动（CPU 核数，封顶 8）；
+                     1=单进程串行（逐文件解析→渲染）。并行时每个 worker
+                     进程独立解析整套文档——接图标注需要全邻图，与串行
+                     输出逐字节一致，仅排版进度消息顺序可能交错
 
     返回: 成功文件的摘要列表 [{pcf, pdf, welds, bom, cuts, warnings}, ...]
     """
@@ -357,6 +362,18 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     if failures is None:
         failures = []
     files = collect_pcf_files(pcf_paths)
+    # 图纸号=文件名 stem 是续接表/邻图表/输出文件名的唯一标识：不同目录的
+    # 同名文件会使文档表互相覆盖、PDF/CSV 同名互写（并行时主文档都会错配），
+    # 属于歧义输入，直接拒绝并列出冲突，提示重命名
+    by_stem: dict[str, list[str]] = {}
+    for p in files:
+        by_stem.setdefault(p.stem, []).append(str(p))
+    clashes = {k: v for k, v in by_stem.items() if len(v) > 1}
+    if clashes:
+        detail = "; ".join(f"{k}: {', '.join(v)}" for k, v in clashes.items())
+        raise ValueError(
+            f"存在同名 PCF 文件（图纸号冲突，续接标注与输出文件无法区分），"
+            f"请重命名后再出图: {detail}")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -365,6 +382,24 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     def report(msg, current):
         if progress_cb:
             progress_cb(msg, current, total)
+
+    # 出图设置装成一份数据：串行循环与并行 worker 共用同一套参数装配，
+    # 防止两条路径参数漂移；全部是可 pickle 的标量/容器，可直接发给子进程
+    common = dict(
+        out_dir=str(out.resolve()), csv_encoding=csv_encoding,
+        encoding=encoding,
+        north_axis=north_axis, quadrant=quadrant, paper=paper,
+        project=project, job=job, revision=revision, notes=notes,
+        properties=properties, to_scale=to_scale, spool_key=spool_key,
+        detect_ffw=detect_ffw, nts_min_mm=nts_min_mm,
+        nts_max_mm=nts_max_mm, skew_deg=skew_deg,
+    )
+
+    if workers is None:
+        workers = _auto_workers(total)
+    if workers > 1 and total > 1:
+        return _render_parallel(files, common, weld_number_overrides,
+                                report, failures, total, workers)
 
     # 先全部解析（续接标注需要知道整套图纸的信息）；单文件失败记录后继续
     report("解析 PCF 文件...", 0)
@@ -380,17 +415,9 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     split_warnings: dict[str, str] = {}
     try:
         for path, doc in loaded:
-            if is_sheet_pcf(path):
-                continue
-            comps = doc.real_components()
-            if not comps:
-                continue
-            distance = default_split_distance(doc.units_coords)
-            groups = ConnectivityGraph(comps, distance).connected_sets()
-            if len(groups) > 1:
-                split_warnings[path.name] = (
-                    f"包含 {len(groups)} 个不连通管段组（间距阈值 {distance:g} "
-                    f"{doc.units_coords}），建议先拆分再出图，否则多段会挤在同一张图上")
+            warn = _split_warning(path, doc)
+            if warn:
+                split_warnings[path.name] = warn
     except Exception:
         pass
 
@@ -409,36 +436,9 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     for i, (path, doc) in enumerate(loaded):
         try:
             report(f"渲染 {path.name}", i + 1)
-            options = RenderOptions()
-            if north_axis:
-                options.north_axis = north_axis
-            if quadrant:
-                options.quadrant = quadrant
-            if paper:
-                options.paper = paper
-            options.project = project or ""
-            options.job = job or ""
-            if revision is not None:
-                options.revision = revision
-            if notes:
-                options.notes = list(notes)
-            if properties:
-                options.properties = dict(properties)
-            options.not_to_scale = not to_scale
-            # 非比例伸缩与斜管倾斜的可调参数（GUI 出图设置弹窗用）
-            if nts_min_mm is not None:
-                options.nts_min_mm = float(nts_min_mm)
-            if nts_max_mm is not None:
-                options.nts_max_mm = float(nts_max_mm)
-            if skew_deg is not None:
-                options.skew_deg = float(skew_deg)
-            if spool_key:
-                options.spool_key = spool_key.strip().upper()
-            if detect_ffw:
-                options.detect_ffw = True
-            options.drawing_no = path.stem
-            options.continuations = cont_map.get(path.stem, [])
-            options.neighbour_docs = neighbour_docs
+            options = _prepare_options(path, common,
+                                       cont_map.get(path.stem, []),
+                                       neighbour_docs)
             # 焊点编号覆盖随出图生效（PDF 焊点表 + welds CSV 同源 result.welds）
             if weld_number_overrides:
                 options.weld_number_overrides = weld_number_overrides.get(str(path)) or None
@@ -471,6 +471,172 @@ def render_pcf_files(pcf_paths, out_dir, north_axis=None, quadrant=None,
     return summaries
 
 
+def _auto_workers(n_files: int) -> int:
+    """默认并行度：CPU 核数封顶 8（每个 worker 要驻留整套文档，核多内存也
+    翻倍）；文件数少于进程数时降到文件数，一两张图不值得起进程池。"""
+    if n_files < 2:
+        return 1
+    cpu = os.cpu_count() or 4
+    return max(1, min(cpu, 8, n_files))
+
+
+def _prepare_options(path: Path, common: dict, continuations,
+                     neighbour_docs) -> "RenderOptions":
+    """单文件 RenderOptions 装配（串行循环与并行 worker 共用）。"""
+    options = RenderOptions()
+    if common.get("north_axis"):
+        options.north_axis = common["north_axis"]
+    if common.get("quadrant"):
+        options.quadrant = common["quadrant"]
+    if common.get("paper"):
+        options.paper = common["paper"]
+    options.project = common.get("project") or ""
+    options.job = common.get("job") or ""
+    if common.get("revision") is not None:
+        options.revision = common["revision"]
+    if common.get("notes"):
+        options.notes = list(common["notes"])
+    if common.get("properties"):
+        options.properties = dict(common["properties"])
+    options.not_to_scale = not common.get("to_scale", False)
+    # 非比例伸缩与斜管倾斜的可调参数（GUI 出图设置弹窗用）
+    if common.get("nts_min_mm") is not None:
+        options.nts_min_mm = float(common["nts_min_mm"])
+    if common.get("nts_max_mm") is not None:
+        options.nts_max_mm = float(common["nts_max_mm"])
+    if common.get("skew_deg") is not None:
+        options.skew_deg = float(common["skew_deg"])
+    if common.get("spool_key"):
+        options.spool_key = common["spool_key"].strip().upper()
+    if common.get("detect_ffw"):
+        options.detect_ffw = True
+    options.drawing_no = path.stem
+    options.continuations = continuations
+    options.neighbour_docs = neighbour_docs
+    return options
+
+
+def _split_warning(path: Path, doc) -> str | None:
+    """断连预检（只读）：文件含多个不连通管段组时的警告文案，无则 None。"""
+    try:
+        if is_sheet_pcf(path):
+            return None
+        comps = doc.real_components()
+        if not comps:
+            return None
+        distance = default_split_distance(doc.units_coords)
+        groups = ConnectivityGraph(comps, distance).connected_sets()
+        if len(groups) > 1:
+            return (f"包含 {len(groups)} 个不连通管段组（间距阈值 {distance:g} "
+                    f"{doc.units_coords}），建议先拆分再出图，否则多段会挤在同一张图上")
+    except Exception:
+        return None
+    return None
+
+
+# ========== 多进程并行渲染（Windows spawn：worker 必须模块级可 pickle） ==========
+
+_PAR_CTX: dict = {}
+
+
+def _par_init(file_paths, encoding):
+    """worker 进程初始化：整套文档解析 + 续接表。
+
+    接图标注/幻影件需要全邻图（与串行同语义），所以每个进程独立解析
+    整套文档一次，之后任务只领走单文件的渲染。"""
+    docs = {}
+    parse_errors = {}
+    for p in file_paths:
+        try:
+            docs[Path(p).stem] = load(p, encoding=encoding)
+        except Exception as e:
+            parse_errors[p] = f"解析失败: {e}"
+    try:
+        cont_map = build_continuation_map(list(docs.items()))
+    except Exception:
+        cont_map = {}  # 续接解析失败不阻塞出图
+    _PAR_CTX.update(docs=docs, cont_map=cont_map, parse_errors=parse_errors)
+
+
+def _par_render_one(path_str: str, common: dict, weld_override) -> dict:
+    """并行 worker 任务：渲染单文件 + 写 CSV/sidecar，返回摘要或错误。"""
+    path = Path(path_str)
+    try:
+        doc = _PAR_CTX["docs"].get(path.stem)
+        if doc is None:
+            raise RuntimeError(_PAR_CTX["parse_errors"].get(path_str, "解析失败"))
+        options = _prepare_options(path, common,
+                                   _PAR_CTX["cont_map"].get(path.stem, []),
+                                   _PAR_CTX["docs"])
+        if weld_override:
+            options.weld_number_overrides = weld_override
+
+        out = Path(common["out_dir"])
+        pdf_path = out / (path.stem + ".pdf")
+        dims_file = sidecar_path(pdf_path)
+        if dims_file.is_file():
+            options.dims_sidecar = str(dims_file)
+
+        result = render_pdf(doc, pdf_path, options)
+        csv_encoding = common["csv_encoding"]
+        _write_welds_csv(result, _welds_csv_path(pdf_path), encoding=csv_encoding)
+        _write_bom_csv(result, doc, _bom_csv_path(pdf_path), encoding=csv_encoding)
+        _write_cuts_csv(result, doc, _cuts_csv_path(pdf_path), encoding=csv_encoding)
+        write_sidecar(dims_file, result.dimensions, doc.units_coords)
+
+        split_warning = _split_warning(path, doc)
+        warnings = list(result.warnings)
+        if split_warning:
+            warnings.insert(0, split_warning)
+        return {
+            "pcf": str(path), "pdf": str(pdf_path),
+            "welds": len(result.welds), "bom": len(result.bom),
+            "cuts": len(result.cut_pieces), "warnings": warnings,
+        }
+    except Exception as e:
+        # 单文件失败不中止整批：错误随结果带回主进程
+        return {"pcf": str(path), "error": f"渲染失败: {e}"}
+
+
+def _render_parallel(files, common, weld_number_overrides, report,
+                     failures, total, workers) -> list[dict]:
+    """进程池批量渲染：worker 各自解析整套文档后按文件分派任务。
+
+    进度按完成顺序上报（先完成的先显示）；摘要与失败清单最终按输入
+    文件顺序排列，与串行输出一致。"""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    path_strs = [str(p) for p in files]
+    report(f"启动 {workers} 个渲染进程，解析整套文档...", 0)
+    overrides_by_path = {}
+    if weld_number_overrides:
+        overrides_by_path = {s: weld_number_overrides.get(s) or None
+                             for s in path_strs}
+
+    by_pcf: dict[str, dict] = {}
+    with ProcessPoolExecutor(max_workers=workers,
+                             initializer=_par_init,
+                             initargs=(path_strs, common.get("encoding", "auto"))
+                             ) as pool:
+        futures = [pool.submit(_par_render_one, s, common, overrides_by_path.get(s))
+                   for s in path_strs]
+        done = 0
+        for fut in as_completed(futures):
+            res = fut.result()
+            by_pcf[res["pcf"]] = res
+            done += 1
+            report(res.get("error") or f"渲染 {Path(res['pcf']).name}", done)
+
+    # failures 与 summaries 一样按输入文件顺序排列（完成顺序仅用于进度显示）
+    for s in path_strs:
+        res = by_pcf.get(s)
+        if res and "error" in res:
+            failures.append((Path(s).name, res["error"]))
+    summaries = [by_pcf[s] for s in path_strs if "error" not in by_pcf.get(s, {})]
+    report("完成", total)
+    return summaries
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="PCF 轴测图批量渲染")
     parser.add_argument("paths", nargs="+", help=".pcf 文件或目录")
@@ -493,6 +659,8 @@ def main(argv=None) -> int:
     parser.add_argument("--csv-encoding", default=None,
                         choices=["utf-8", "utf-8-sig", "gbk", "gb18030"],
                         help="CSV 导出编码（默认跟随 --encoding，auto/utf-8 → utf-8-sig）")
+    parser.add_argument("--workers", type=int, default=None, metavar="N",
+                        help="并行渲染进程数（默认=CPU 核数封顶 8；1=串行）")
     args = parser.parse_args(argv)
 
     failures = []
@@ -503,7 +671,7 @@ def main(argv=None) -> int:
         spool_key=args.spool_key, detect_ffw=args.detect_ffw,
         encoding=args.encoding, csv_encoding=args.csv_encoding,
         progress_cb=lambda msg, cur, tot: print(f"[{cur}/{tot}] {msg}"),
-        failures=failures)
+        failures=failures, workers=args.workers)
 
     for s in summaries:
         print(f"{Path(s['pcf']).name}: 焊缝{s['welds']} BOM{s['bom']} 切割{s['cuts']} -> {s['pdf']}")
