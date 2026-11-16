@@ -3950,7 +3950,11 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
                     _draw_bore_tag(canvas, proj, _v2_mid(eps[0], eps[1]),
                                    axis_override or _v2_sub(eps[1], eps[0]),
                                    tag)
-            return cps[0] if cps else _v2_mid(eps[0], eps[1])
+            anchor = cps[0] if cps else _v2_mid(eps[0], eps[1])
+            # 仪表位号圈与手绘分支同一保证：符号库路径也要标
+            if cls == "INSTRUMENT" and not cont_copy:
+                _draw_instrument_tag(canvas, anchor, comp)
+            return anchor
 
     face_pt = (flange_face_pts or {}).get(id(comp))
     if face_pt is not None and len(eps) >= 2:
@@ -4239,19 +4243,25 @@ def _draw_component(canvas: _Canvas, proj: Projector, comp: Component,
             return at
 
     elif cls in ("INSTRUMENT", "FILTER", "MULTIPORT"):
+        anchor = None
         if len(eps) >= 2:
             _draw_box_on_axis(canvas, proj, eps[0], eps[1], bore_in,
                               widen=flange_widen)
-            return _v2_mid(eps[0], eps[1])
-        if pps and cps:
+            anchor = _v2_mid(eps[0], eps[1])
+        elif pps and cps:
             for pp in pps:
                 canvas.line(cps[0], pp, width=0.4)
             canvas.circle(cps[0], 1.0, width=0.3)
-            return cps[0]
-        if eps and cos:
+            anchor = cps[0]
+        elif eps and cos:
             canvas.dashed(eps[0], cos[0])
             canvas.circle(cos[0], 1.6, width=0.3)
-            return cos[0]
+            anchor = cos[0]
+        # 仪表位号圆圈：圈内写 TAG 文本（$ 拆行），幻影对侧副本不标
+        # （那是邻图实体的虚线示意）
+        if cls == "INSTRUMENT" and anchor is not None and not cont_copy:
+            _draw_instrument_tag(canvas, anchor, comp)
+        return anchor
 
     elif cls == "BOLT":
         return None
@@ -5028,6 +5038,47 @@ def _draw_box_on_axis(canvas: _Canvas, proj: "Projector", e0: Vec2,
         _v2_add(e0, _v2_scale(perp, -half)),
     ]
     canvas.polyline(corners, width=0.35, close=True)
+
+
+_INSTR_FONT = 5.0   # 仪表位号圈字号（与变径就地标签同级）；圈径随文本自适应 ~8mm
+
+
+def _draw_instrument_tag(canvas: _Canvas, anchor: Vec2, comp: Component) -> None:
+    """仪表位号圆圈：圈内横排写 TAG 文本（$ 换行拆行，两行竖排居中），
+    无 TAG 回退 ITEM-CODE 单行。圈作球标放置（避让已画几何与标签），
+    引线从符号锚点拉到圈边；白底圈盖住线头，引线只露圈外一段。"""
+    lines = comp.tag_lines or (
+        [comp.item_code] if comp.item_code else [])
+    if not lines:
+        return
+    canvas.pdf.set_font("Helvetica", size=_INSTR_FONT)
+    text_w = max(canvas.pdf.get_string_width(s) for s in lines)
+    cap = _cap_height_mm(_INSTR_FONT)
+    r = text_w / 2 + 1.1
+    b = canvas.bounds
+    if b is not None:
+        # 优先放符号上方（图纸惯例）：away_from 取锚点正下方虚拟点，
+        # 自然方向即正上方；上方拥挤时放置器自动换斜向/侧向
+        centre = canvas.place_label(anchor, 2 * r, 2 * r,
+                                    _v2_add(anchor, (0.0, 20.0)),
+                                    min_leader=_CALLOUT_LEADER_MM,
+                                    avoid_geometry=True,
+                                    clearance=_CALLOUT_CLEARANCE_MM)
+    else:
+        # 无窗口信息（极少）：退回符号正上方固定偏移
+        centre = _v2_add(anchor, (0.0, -(r + _CALLOUT_LEADER_MM)))
+    d = _v2_sub(centre, anchor)
+    ln = _v2_len(d)
+    edge = (_v2_add(anchor, _v2_scale(d, (ln - r) / ln))
+            if ln > r else centre)
+    canvas.line(anchor, edge, width=0.15)
+    with canvas.pdf.local_context():
+        canvas.pdf.set_fill_color(255, 255, 255)
+        canvas.circle(centre, r, width=0.35, fill=True)
+    line_h = cap + 0.5
+    for i, s in enumerate(lines):
+        y = centre[1] + (i - (len(lines) - 1) / 2) * line_h + cap / 2
+        canvas.text((centre[0], y), s, size=_INSTR_FONT)
 
 
 # ---------------------------------------------------------------------------

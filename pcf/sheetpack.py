@@ -301,7 +301,30 @@ def _chain_plan(info: SheetInfo, usable: tuple[float, float, float, float],
                                for r in riders for w in info.pts[r]
                                for v in info.pts[i])
                 candidates.append((distance, ci, i))
-        ordered = sorted(candidates)
+        # 管内独立点（流向箭头/支架）优先跟随宿主直管：管中点到两端
+        # 等距时，单按最近节点会被页号较小的邻件抢去邻页。
+        host_nodes: set[tuple[int, int]] = set()
+        if len(riders) == 1 and len(info.pts[next(iter(riders))]) == 1:
+            p = info.pts[next(iter(riders))][0]
+            for ci, members in enumerate(main_components):
+                for i in members:
+                    if info.pipe_axes[i] is None or len(info.pts[i]) < 2:
+                        continue
+                    a, b = info.pts[i][0], info.pts[i][-1]
+                    axis = tuple(b[k] - a[k] for k in range(3))
+                    lab2 = sum(v * v for v in axis)
+                    if lab2 <= 1e-12:
+                        continue
+                    lab = math.sqrt(lab2)
+                    t = sum((p[k] - a[k]) * axis[k]
+                            for k in range(3)) / lab2
+                    projected = tuple(a[k] + t * axis[k] for k in range(3))
+                    if (conn_tol / lab < t < 1 - conn_tol / lab
+                            and math.dist(p, projected) <= conn_tol):
+                        host_nodes.add((ci, i))
+        ordered = sorted(candidates,
+                         key=lambda c: ((c[1], c[2]) not in host_nodes,
+                                        c[0], c[1], c[2]))
         target = None
         for _distance, ci, i in ordered:
             gi = node_group[(ci, i)]

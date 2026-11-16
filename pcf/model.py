@@ -272,6 +272,15 @@ class Component:
         return self.get("ITEM-DESCRIPTION")
 
     @property
+    def tag_lines(self) -> list[str]:
+        """TAG 文本按 $ 拆行（ISOGEN 约定 $ = 换行），如 'PDI$39002'
+        → ['PDI', '39002']；无 TAG 返回空表。"""
+        raw = self.get("TAG")
+        if not raw:
+            return []
+        return [seg.strip() for seg in raw.split("$") if seg.strip()]
+
+    @property
     def uci(self) -> str | None:
         return self.get("UNIQUE-COMPONENT-IDENTIFIER") or self.get("UCI")
 
