@@ -1,9 +1,7 @@
 """PCF 收集器 - 主 GUI 应用程序（Python 版本）
 
-功能等同于 VB.NET 版 PCF 收集器：
-1. 选择文件夹，批量解析 PCF 文件并存入 SQLite 数据库
-2. 打开已有数据库，浏览组件数据
-3. 右键导出数据到 Excel
+打开 PCF 文件夹直接列出管线清单，单线轴测图出图/预览、焊点编号、
+导出 Excel 全部直接读取 PCF 文件，不依赖数据库。
 """
 
 import json
@@ -19,10 +17,6 @@ from tkinter import filedialog, messagebox, simpledialog
 
 import ttkbootstrap as ttkb
 from ttkbootstrap.constants import *
-
-from database_helper import DatabaseHelper
-from pcf_data_collector import PcfDataCollector
-from pcf_parser import PcfParser
 
 try:
     from openpyxl import Workbook
@@ -41,10 +35,25 @@ except ImportError:
 _SS = 3   # 超采样倍数：按 3× 分辨率画矢量层后 LANCZOS 降采样，得到抗锯齿边缘
 
 
+def _read_pipeline_reference(path):
+    """快速读取 PCF 的管线号（只扫文件开头的 PIPELINE-REFERENCE 行）"""
+    with open(path, "rb") as fh:
+        raw = fh.read(65536)
+    text = None
+    for enc in ("gbk", "utf-8-sig", "utf-8"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("latin-1", errors="replace")
+    m = re.search(r"(?m)^PIPELINE-REFERENCE[ \t]+(\S+)", text)
+    return m.group(1) if m else ""
+
+
 class PcfApp:
     """PCF 收集器主应用程序"""
-
-    COMPONENT_TYPES = PcfDataCollector.COMPONENT_TYPES
 
     def __init__(self, root):
         self.root = root
@@ -52,15 +61,9 @@ class PcfApp:
         self.root.geometry("1000x650")
 
         # 状态变量
-        self.db_helper = None
-        self.data_collector = None
-        self.db_path = None
         self.current_columns = []
         self.current_rows = []
-        self.success_count = 0
-        self.error_count = 0
-        self.error_log = []
-        self._processing = False
+        self._exporting = False
 
         # 跨线程 UI 汇聚队列：工作线程只 _post(fn)，主线程轮询泵统一执行
         # （Tkinter 非线程安全，工作线程不得直接 root.after / 摸控件）
@@ -131,15 +134,11 @@ class PcfApp:
         btn_frame = ttkb.Labelframe(right_frame, text="操作", padding=8)
         btn_frame.pack(fill=X, padx=4, pady=4)
 
-        self.btn_new = ttkb.Button(btn_frame, text="新建数据库", command=self._on_new_database,
+        self.btn_new = ttkb.Button(btn_frame, text="打开PCF文件夹", command=self._on_open_pcf_folder,
                                    bootstyle=(SUCCESS, OUTLINE))
         self.btn_new.pack(side=LEFT, padx=4)
 
-        self.btn_open = ttkb.Button(btn_frame, text="打开数据库", command=self._on_open_database,
-                                    bootstyle=(INFO, OUTLINE))
-        self.btn_open.pack(side=LEFT, padx=4)
-
-        # 编码选择（紧跟在打开数据库按钮右侧）
+        # 编码选择（紧跟在打开 PCF 文件夹按钮右侧）
         ttkb.Label(btn_frame, text="编码:", bootstyle=PRIMARY).pack(side=LEFT, padx=(8, 4))
         self.encoding_options = [
             ("自动（GBK 优先）", "auto"),
@@ -248,337 +247,58 @@ class PcfApp:
 
     # ==================== 事件处理 ====================
 
-    def _on_new_database(self):
-        """新建数据库 - 选择文件夹并处理 PCF 文件"""
+    def _on_open_pcf_folder(self):
+        """打开 PCF 文件夹：不建数据库，直接列管线清单；出图/预览/导出均读 PCF"""
         folder = filedialog.askdirectory(title="选择包含 PCF 文件的文件夹")
         if not folder:
             return
-
-        pcf_files = []
-        for root_dir, dirs, files in os.walk(folder):
-            for f in files:
-                if f.lower().endswith(".pcf"):
-                    pcf_files.append(os.path.join(root_dir, f))
-
-        if not pcf_files:
-            messagebox.showwarning("提示", "木有发现pcf")
-            return
-
-        self.db_path = os.path.join(folder, "pcf.db")
-        self._processing = True
         self.btn_new.config(state=tk.DISABLED)
-        self.btn_open.config(state=tk.DISABLED)
-
-        # 关闭当前数据库连接（避免覆写时文件被占用）
-        if self.db_helper is not None:
-            self.db_helper.close()
-            self.db_helper = None
-
-        # 后台线程处理
-        thread = threading.Thread(target=self._process_files, args=(folder, pcf_files), daemon=True)
+        self.status_var.set("正在扫描 PCF 文件...")
+        thread = threading.Thread(target=self._scan_pcf_folder, args=(folder,), daemon=True)
         thread.start()
 
-    def _process_files(self, folder, pcf_files):
-        """后台处理 PCF 文件（在工作线程中运行）"""
+    def _scan_pcf_folder(self, folder):
+        """后台扫描：递归收集 .pcf 并读取各文件的管线号（PIPELINE-REFERENCE）"""
         try:
-            total = len(pcf_files)
-            self.success_count = 0
-            self.error_count = 0
-            self.error_log.clear()
-
-            # 初始化数据库
-            if os.path.exists(self.db_path):
-                os.remove(self.db_path)
-
-            self.db_helper = DatabaseHelper(self.db_path)
-
-            # 创建数据收集器
-            self.data_collector = PcfDataCollector()
-            self.data_collector.db_helper = self.db_helper
-
-            # 创建所有表
-            self.data_collector.create_all_tables()
-
-            # 解析所有 PCF 文件
-            encoding = "auto"
-            selected_label = self.enc_var.get()
-            for label, value in self.encoding_options:
-                if label == selected_label:
-                    encoding = value
-                    break
-            parser = PcfParser(self.data_collector, encoding=encoding)
-            fid = 0
-            parsed_files = []  # 成功解析的文件（相对路径），供轴测图渲染定位
-            for i, pcf_file in enumerate(pcf_files):
+            files = sorted(os.path.join(r, f)
+                           for r, _, fs in os.walk(folder)
+                           for f in fs if f.lower().endswith(".pcf"))
+            if not files:
+                raise FileNotFoundError("文件夹中没有 .pcf 文件")
+            rows = []
+            for i, f in enumerate(files):
+                ref = ""
                 try:
-                    consumed = parser.process_single_file(pcf_file, fid)
-                    fid += consumed
-                    self.success_count += 1
-                    parsed_files.append(os.path.relpath(pcf_file, folder))
-                except Exception as e:
-                    self.error_count += 1
-                    error_msg = f"文件 {i + 1}: {os.path.basename(pcf_file)} - {e}"
-                    self.error_log.append(error_msg)
+                    ref = _read_pipeline_reference(f)
+                except OSError:
+                    pass
+                rows.append((f, ref))
+                self._post(lambda c=i + 1, t=len(files): self.status_var.set(
+                    f"扫描管线 {c}/{t}"))
 
-                # 更新进度
-                current = i + 1
-                self._post(lambda c=current, t=total: self.status_var.set(
-                    f"{c}/{t} (成功:{self.success_count}, 失败:{self.error_count})"))
-
-            # 记录导入来源，轴测图渲染时直接从数据库定位原始 PCF
-            if parsed_files:
-                self.data_collector.add_import_info("SOURCE-FOLDER", folder)
-                self.data_collector.add_import_info("SOURCE-FILES", "\n".join(parsed_files))
-
-            # 插入数据 & 创建视图
-            self._post(lambda: self.status_var.set("插入数据表..."))
-            self.data_collector.insert_all_data()
-
-            self._post(lambda: self.status_var.set("插入视图..."))
-            self.data_collector.create_sqlite_view_all(self.COMPONENT_TYPES)
-
-            # COUNT 视图
-            self.db_helper.execute_non_query("""
-                DROP VIEW IF EXISTS COUNT;
-                CREATE VIEW IF NOT EXISTS COUNT AS
-                SELECT PIPELINE.FILENAME, REFERENCE, TOTAL.ITEMCODE, ITEMDESCRIPTION, COUNT(*) As COUNT
-                FROM (SELECT * FROM TOTAL GROUP BY UCI,FILENAME) AS TOTAL
-                Join PIPELINE ON PIPELINE.FILENAME = TOTAL.FILENAME
-                Group BY REFERENCE, TOTAL.ITEMCODE, ITEMDESCRIPTION
-                ORDER BY REFERENCE
-            """)
-
-            # 各组件类型视图
-            self._create_component_views()
-
-            # 带属性的组件视图
-            self.data_collector.create_component_with_attributes_view()
+            def done():
+                self.btn_new.config(state=tk.NORMAL)
+                self.pipeline_rows.clear()
+                for f, ref in rows:
+                    stem = os.path.splitext(os.path.basename(f))[0]
+                    pdf = os.path.join(folder, "drawings", stem + ".pdf")
+                    self.pipeline_rows.append({
+                        "path": f, "name": stem, "ref": ref or stem, "folder": folder,
+                        "checked": True,
+                        "pdf": pdf if os.path.isfile(pdf) else None,
+                        "missing": False,
+                    })
+                self._redraw_list()
+                self.status_var.set(f"管线清单：{len(rows)} 条（来源 {folder}）")
+            self._post(done)
         except Exception:
-            # 整个线程体兜底（含删旧库/建库/建表等前半段）：走主线程错误回调
-            # 恢复按钮状态，避免 daemon 线程静默死亡
-            err_msg = traceback.format_exc()
-            self._post(lambda: self._on_processing_error(err_msg))
-            return
+            err = traceback.format_exc()
 
-        # 完成
-        self._post(self._on_processing_done)
-
-    def _create_component_views(self):
-        """为每种组件类型创建视图"""
-        for comp_type in self.COMPONENT_TYPES:
-            sql = self._get_view_sql(comp_type)
-            if sql:
-                self.db_helper.execute_non_query(sql)
-
-    def _get_view_sql(self, comp_type):
-        """获取组件视图 SQL"""
-        xname = f"X{comp_type}"
-        if comp_type == "PIPE":
-            return f"""DROP VIEW IF EXISTS {xname};
-                CREATE VIEW IF NOT EXISTS {xname} AS
-                SELECT PIPELINE.FILENAME,UCI, REFERENCE, ITEMCODE, ITEMDESCRIPTION, CUTPIECELENGTH
-                FROM (SELECT * FROM {comp_type} GROUP BY UCI,FILENAME) AS {comp_type}
-                JOIN PIPELINE ON PIPELINE.FILENAME = {comp_type}.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "BEND":
-            return """DROP VIEW IF EXISTS XBEND;
-                CREATE VIEW IF NOT EXISTS XBEND AS
-                SELECT PIPELINE.FILENAME,UCI, REFERENCE,ITEMCODE, ITEMDESCRIPTION,CUTPIECELENGTH,ANGLE
-                FROM (SELECT * FROM BEND GROUP BY UCI,FILENAME) AS BEND
-                JOIN PIPELINE ON PIPELINE.FILENAME = BEND.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type in ("INSTRUMENT", "INSTRUMENT_ANGLE"):
-            return f"""DROP VIEW IF EXISTS {xname};
-                CREATE VIEW IF NOT EXISTS {xname} AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,ITEMCODE, TAG
-                FROM (SELECT * FROM {comp_type} GROUP BY UCI,FILENAME) AS {comp_type}
-                JOIN PIPELINE ON PIPELINE.FILENAME = {comp_type}.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "INSTRUMENT_RETURN":
-            return """DROP VIEW IF EXISTS XINSTRUMENT_RETURN;
-                CREATE VIEW IF NOT EXISTS XINSTRUMENT_RETURN AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,ITEMCODE, TAG, ITEMDESCRIPTION
-                FROM (SELECT * FROM INSTRUMENT_RETURN GROUP BY UCI,FILENAME) AS INSTRUMENT_RETURN
-                JOIN PIPELINE ON PIPELINE.FILENAME = INSTRUMENT_RETURN.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "TRAP_OFFSET":
-            return """DROP VIEW IF EXISTS XTRAP_OFFSET;
-                CREATE VIEW IF NOT EXISTS XTRAP_OFFSET AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,ITEMCODE, TAG, ITEMDESCRIPTION
-                FROM (SELECT * FROM TRAP_OFFSET GROUP BY UCI,FILENAME) AS TRAP_OFFSET
-                JOIN PIPELINE ON PIPELINE.FILENAME = TRAP_OFFSET.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "SUPPORT":
-            return """DROP VIEW IF EXISTS XSUPPORT;
-                CREATE VIEW IF NOT EXISTS XSUPPORT AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,NAME, ITEMDESCRIPTION,SUPPORTDIRECTION,SUPPORTTYPE
-                FROM (SELECT * FROM SUPPORT GROUP BY UCI,FILENAME) AS SUPPORT
-                JOIN PIPELINE ON PIPELINE.FILENAME = SUPPORT.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "GASKET":
-            return """DROP VIEW IF EXISTS XGASKET;
-                CREATE VIEW IF NOT EXISTS XGASKET AS
-                SELECT PIPELINE.FILENAME,GASKET.UCI,REFERENCE,GASKET.ITEMCODE, GASKET.ITEMDESCRIPTION,
-                       TOTAL.ITEMCODE,TOTAL.ITEMDESCRIPTION
-                FROM (SELECT * FROM GASKET GROUP BY UCI,FILENAME) AS GASKET
-                JOIN PIPELINE ON PIPELINE.FILENAME = GASKET.FILENAME
-                JOIN TOTAL ON TOTAL.FILENAME = GASKET.FILENAME AND TOTAL.COMPONENTIDENTIFIER=GASKET.MASTERCOMPONENTIDENTIFIER
-                ORDER BY REFERENCE"""
-        elif comp_type == "BOLT":
-            return """DROP VIEW IF EXISTS XBOLT;
-                CREATE VIEW IF NOT EXISTS XBOLT AS
-                SELECT PIPELINE.FILENAME,BOLT.UCI,REFERENCE,BOLTITEMCODE,BOLTITEMDESCRIPTION,
-                       BOLTDIA, BOLTQUANTITY, BOLTLENGTH, ITEMCODE,ITEMDESCRIPTION
-                FROM (SELECT * FROM BOLT GROUP BY UCI,FILENAME) AS BOLT
-                JOIN PIPELINE ON PIPELINE.FILENAME = BOLT.FILENAME
-                JOIN TOTAL ON TOTAL.FILENAME = BOLT.FILENAME AND TOTAL.COMPONENTIDENTIFIER=BOLT.MASTERCOMPONENTIDENTIFIER
-                ORDER BY REFERENCE"""
-        elif comp_type == "WELD":
-            return """DROP VIEW IF EXISTS XWELD;
-                CREATE VIEW IF NOT EXISTS XWELD AS
-                SELECT PIPELINE.FILENAME, WELD.UCI, REFERENCE, Q.NPD,
-                       TOTAL.ITEMCODE, TOTAL.ITEMDESCRIPTION
-                FROM (SELECT * FROM WELD GROUP BY UCI, FILENAME) AS WELD
-                JOIN PIPELINE ON PIPELINE.FILENAME = WELD.FILENAME
-                JOIN TOTAL ON TOTAL.FILENAME = WELD.FILENAME AND TOTAL.COMPONENTIDENTIFIER = WELD.MASTERCOMPONENTIDENTIFIER
-                JOIN (SELECT * FROM END_POINT GROUP BY FILENAME, UCI) AS Q ON Q.FILENAME = WELD.FILENAME AND Q.UCI = WELD.UCI
-                ORDER BY REFERENCE"""
-        elif comp_type == "TEE_STUB":
-            return """DROP VIEW IF EXISTS XTEE_STUB;
-                CREATE VIEW IF NOT EXISTS XTEE_STUB AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE
-                FROM (SELECT * FROM TEE_STUB GROUP BY UCI,FILENAME) AS TEE_STUB
-                JOIN PIPELINE ON PIPELINE.FILENAME = TEE_STUB.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "_UNION":
-            return """DROP VIEW IF EXISTS X_UNION;
-                CREATE VIEW IF NOT EXISTS X_UNION AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,ITEMCODE, ITEMDESCRIPTION
-                FROM (SELECT * FROM _UNION GROUP BY UCI,FILENAME) AS _UNION
-                JOIN PIPELINE ON PIPELINE.FILENAME = _UNION.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "MESSAGE":
-            return """DROP VIEW IF EXISTS XMESSAGE;
-                CREATE VIEW IF NOT EXISTS XMESSAGE AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,TEXT
-                FROM (SELECT * FROM MESSAGE GROUP BY UCI,FILENAME) AS MESSAGE
-                JOIN PIPELINE ON PIPELINE.FILENAME = MESSAGE.FILENAME
-                ORDER BY REFERENCE"""
-        elif comp_type == "VALVE":
-            return """DROP VIEW IF EXISTS XVALVE;
-                CREATE VIEW IF NOT EXISTS XVALVE AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,ITEMCODE, ITEMDESCRIPTION,SPINDLEDIRECTION,DIRECTION
-                FROM (SELECT * FROM VALVE GROUP BY UCI,FILENAME) AS VALVE
-                JOIN PIPELINE ON PIPELINE.FILENAME = VALVE.FILENAME
-                ORDER BY REFERENCE"""
-        else:
-            return f"""DROP VIEW IF EXISTS {xname};
-                CREATE VIEW IF NOT EXISTS {xname} AS
-                SELECT PIPELINE.FILENAME,UCI,REFERENCE,ITEMCODE, ITEMDESCRIPTION
-                FROM (SELECT * FROM {comp_type} GROUP BY UCI,FILENAME) AS {comp_type}
-                JOIN PIPELINE ON PIPELINE.FILENAME = {comp_type}.FILENAME
-                ORDER BY REFERENCE"""
-
-    def _on_processing_done(self):
-        """文件处理完成回调"""
-        self._processing = False
-        self.btn_new.config(state=tk.NORMAL)
-        self.btn_open.config(state=tk.NORMAL)
-        self.status_var.set("写入数据库")
-
-        # 显示处理结果
-        if self.error_count > 0:
-            error_summary = f"处理完成。成功: {self.success_count}, 失败: {self.error_count}\n\n"
-            error_summary += "错误详情 (前10条):\n"
-            error_summary += "\n".join(self.error_log[:10])
-            if len(self.error_log) > 10:
-                error_summary += f"\n... 还有 {len(self.error_log) - 10} 个错误"
-            messagebox.showwarning("PCF处理结果", error_summary)
-        elif self.success_count > 0:
-            messagebox.showinfo("PCF处理完成", f"所有 {self.success_count} 个文件处理成功！")
-
-        self._refresh_pipeline_list()
-
-    def _on_processing_error(self, err_msg):
-        """处理过程中出错回调（显示真实异常，避免线程静默退出）"""
-        self._processing = False
-        self.btn_new.config(state=tk.NORMAL)
-        self.btn_open.config(state=tk.NORMAL)
-        self.status_var.set("处理出错")
-        messagebox.showerror("处理出错", err_msg[-2000:])
-
-    def _on_open_database(self):
-        """打开已有数据库"""
-        db_file = filedialog.askopenfilename(title="选择数据库文件", filetypes=[("SQLite", "*.db")])
-        if not db_file:
-            return
-
-        self.db_path = db_file
-        self.db_helper = DatabaseHelper(db_file)
-        self._refresh_pipeline_list()
-
-    # ==================== 数据加载 ====================
-
-    # ==================== 管线清单与图面预览 ====================
-
-    def _refresh_pipeline_list(self):
-        """从数据库导入来源重建管线清单（新建/打开数据库后调用）。
-
-        sources_from_db 的旧库回退分支会全递归 os.walk，放后台线程执行，
-        结果经 UI 队列回主线程填充（同渲染线程回传模式）。"""
-        self.pipeline_rows = []
-        self._redraw_list()
-        db_path = self.db_path
-        if self.db_helper is None or not db_path:
-            self.status_var.set("管线清单：无数据库")
-            return
-        self._pipeline_token = getattr(self, "_pipeline_token", 0) + 1
-        token = self._pipeline_token
-        self.status_var.set("正在定位 PCF 来源...")
-
-        def work():
-            got = None
-            try:
-                import pcf_renderer
-                got = pcf_renderer.sources_from_db(db_path)
-            except Exception:
-                got = None
-
-            def apply():
-                if token != getattr(self, "_pipeline_token", 0):
-                    return   # 已被更新的刷新取代
-                self._apply_pipeline_sources(got)
-            self._post(apply)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _apply_pipeline_sources(self, got):
-        """主线程：按后台取回的 (源文件夹, 文件列表) 填充管线清单"""
-        folder, files = got if got else (None, [])
-        ref_map = {}
-        if self.db_helper is not None:
-            try:
-                _cols, rows = self.db_helper.fill_data_table(
-                    "SELECT FILENAME, REFERENCE FROM PIPELINE")
-                for r in rows:
-                    if r[0] is not None:
-                        ref_map[str(r[0])] = "" if r[1] is None else str(r[1])
-            except Exception:
-                pass
-        for f in files:
-            base = os.path.basename(f)
-            stem = os.path.splitext(base)[0]
-            ref = next((v for k, v in ref_map.items()
-                        if k == base or k.endswith(base) or base.endswith(k)), "")
-            pdf = os.path.join(folder, "drawings", stem + ".pdf") if folder else None
-            self.pipeline_rows.append({
-                "path": f, "name": stem, "ref": ref or stem, "folder": folder,
-                "checked": True,
-                "pdf": pdf if (pdf and os.path.isfile(pdf)) else None,
-            })
-        self._redraw_list()
-        self.status_var.set(
-            f"管线清单：{len(self.pipeline_rows)} 条（来源 {folder or '—'}）")
+            def fail():
+                self.btn_new.config(state=tk.NORMAL)
+                self.status_var.set("打开文件夹失败")
+                messagebox.showerror("打开PCF文件夹失败", err[-1500:])
+            self._post(fail)
 
     def _redraw_list(self):
         self.pipe_tree.delete(*self.pipe_tree.get_children())
@@ -613,6 +333,9 @@ class PcfApp:
 
     def _start_live_preview(self, pcf_path, ref=""):
         """后台实时渲染该管线的纯图面（不出文件、无图框/材料表）"""
+        if not pcf_path or not os.path.isfile(pcf_path):
+            self.status_var.set("原始 PCF 文件缺失，无法预览，请重新打开 PCF 文件夹")
+            return
         self._preview_token = getattr(self, "_preview_token", 0) + 1
         token = self._preview_token
         self._preview_path = pcf_path
@@ -1212,42 +935,22 @@ class PcfApp:
         dlg.wait_window()
 
     def _on_render_iso(self):
-        """生成轴测图：按管线清单勾选项出图；无清单时回退数据库来源/选文件夹"""
-        import pcf_renderer
-
+        """生成轴测图：按管线清单勾选项出图；无清单时提示先打开 PCF 文件夹"""
         folder = None
         pcf_files = []
-        # 1) 管线清单勾选项优先
         checked = [r for r in self.pipeline_rows if r["checked"]]
+        missing = [r["name"] for r in checked if r.get("missing")]
+        if missing:
+            messagebox.showwarning(
+                "生成轴测图", "以下管线的原始 PCF 文件已缺失，请先重新打开 PCF 文件夹：\n"
+                + "\n".join(missing[:10]), parent=self.root)
+            return
         if checked:
             folder = checked[0].get("folder") or os.path.dirname(checked[0]["path"])
             pcf_files = [r["path"] for r in checked]
         else:
-            sources = None
-            # 2) 当前已打开的数据库
-            if self.db_helper is not None and self.db_path:
-                sources = pcf_renderer.sources_from_db(self.db_path)
-
-            # 3) 让用户选一个数据库文件（读取其导入来源）
-            if sources is None:
-                db_file = filedialog.askopenfilename(
-                    title="选择收集数据库（定位其导入的 PCF 文件）",
-                    filetypes=[("SQLite 数据库", "*.db"), ("所有文件", "*.*")])
-                if not db_file:
-                    return
-                sources = pcf_renderer.sources_from_db(db_file)
-
-            # 4) 数据库也定位不到来源（旧库/PCF 已移动）→ 回退选 PCF 文件夹
-            if sources is None:
-                sel = filedialog.askdirectory(title="数据库中无来源记录，请直接选择 PCF 文件夹")
-                if not sel:
-                    return
-                sources = pcf_renderer.collect_pcf_files([sel])
-                sources = (sel, [str(p) for p in sources])
-                if not sources[1]:
-                    messagebox.showwarning("提示", "所选文件夹中没有 .pcf 文件")
-                    return
-            folder, pcf_files = sources
+            messagebox.showinfo("生成轴测图", "请先打开 PCF 文件夹并勾选管线", parent=self.root)
+            return
 
         s = self.render_settings
 
@@ -1314,17 +1017,18 @@ class PcfApp:
     # ==================== 导出 Excel ====================
 
     def _on_export(self):
-        """导出数据到 Excel"""
+        """导出数据到 Excel：直接解析 PCF 文件，不依赖数据库"""
         if not HAS_OPENPYXL:
             messagebox.showerror("错误", "缺少 openpyxl 库，请运行: pip install openpyxl")
             return
-        if not self.db_path:
-            messagebox.showwarning("提示", "请先打开数据库")
+        rows = [r for r in self.pipeline_rows if not r.get("missing")]
+        if not rows:
+            messagebox.showwarning("提示", "请先打开 PCF 文件夹")
             return
-
-        valid_name = re.sub(r'[\x00-\x1F\x7F<>?*:"/\\|]', '', os.path.splitext(os.path.basename(self.db_path))[0])
-        valid_name = valid_name.rstrip(' .-').lstrip('.')
-        default_file = f"{valid_name}.xlsx"
+        if getattr(self, "_exporting", False):
+            return
+        folder = rows[0].get("folder") or os.path.dirname(rows[0]["path"])
+        default_file = os.path.basename(folder.rstrip("\\/")) + ".xlsx"
         output_path = filedialog.asksaveasfilename(
             title="导出到 Excel",
             defaultextension=".xlsx",
@@ -1332,78 +1036,108 @@ class PcfApp:
             initialfile=default_file)
         if not output_path:
             return
+        encoding = "auto"
+        selected_label = self.enc_var.get()
+        for label, value in self.encoding_options:
+            if label == selected_label:
+                encoding = value
+                break
+        self._exporting = True
+        threading.Thread(target=self._export_worker,
+                         args=(rows, output_path, encoding), daemon=True).start()
 
+    def _export_worker(self, rows, output_path, encoding):
+        """后台导出：PIPELINE 一表 + 每元件类型一表（全字段+点坐标）。
+
+        与原数据库导出同语义：同管线同 UCI 的元件归并为一行（同 spool
+        多段直管只保留下料管一行）；无 UCI 的元件不去重。"""
         try:
+            from pcf.parser import load
             wb = Workbook()
-            # 删除默认 sheet
             wb.remove(wb.active)
+            pipe_keys: list[str] = []
+            pipe_rows: list[dict] = []
+            comp_data: dict[str, dict] = {}
+            seen = set()
 
-            # ========== PIPELINE 表 ==========
-            # 获取所有属性名
-            attr_cols, attr_rows = self.db_helper.fill_data_table(
-                "SELECT DISTINCT ATTRIBUTE_NAME FROM COMPONENT_ATTRIBUTES WHERE UCI LIKE 'PIPELINE:%' ORDER BY ATTRIBUTE_NAME")
-            attribute_names = [r[0] for r in attr_rows]
+            def _cell(line):
+                parts = line.raw.strip().split(None, 1)
+                return parts[1].strip() if len(parts) > 1 else ""
 
-            # 属性一次性全部查出，内存按管线分组（替代每管线×每属性一次查询）
-            _ac, attr_all = self.db_helper.fill_data_table(
-                "SELECT UCI, ATTRIBUTE_NAME, ATTRIBUTE_VALUE FROM COMPONENT_ATTRIBUTES WHERE UCI LIKE 'PIPELINE:%'")
-            attrs_by_uci = {}
-            for uci, a_name, a_val in attr_all:
-                attrs_by_uci.setdefault(str(uci), {}).setdefault(str(a_name), a_val)
-
-            pipe_cols, pipe_rows = self.db_helper.fill_data_table(
-                "SELECT p.FILENAME, p.REFERENCE, p.PIPINGSPEC, p.INSULATIONSPEC, p.PAINTINGSPEC, p.TRACINGSPEC FROM PIPELINE p")
+            for i, r in enumerate(rows):
+                doc = load(r["path"], encoding=encoding)
+                ref = r.get("ref") or r["name"]
+                for pl in doc.pipelines:
+                    values = {}
+                    for a in pl.header_lines:
+                        if a.key == "PIPELINE-REFERENCE":
+                            continue
+                        if a.key not in values and a.key not in pipe_keys:
+                            pipe_keys.append(a.key)
+                        values[a.key] = _cell(a)
+                    pipe_rows.append({"REFERENCE": pl.reference, "FILE": r["name"],
+                                      "values": values})
+                for c in doc.real_components():
+                    uci = c.get("UCI") or ""
+                    if uci:
+                        key = (ref, c.type, uci)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                    data = comp_data.setdefault(c.type, {"keys": [], "rows": []})
+                    fields, points = {}, {}
+                    for a in c.attributes:
+                        val = _cell(a)
+                        if a.key.endswith("-POINT") or a.key == "CO-ORDS":
+                            n = sum(1 for k in points if k.startswith(a.key + "#")) + 1
+                            k = f"{a.key}#{n}"
+                            points[k] = val
+                        else:
+                            k = a.key
+                            fields[k] = val
+                        if k not in data["keys"]:
+                            data["keys"].append(k)
+                    data["rows"].append((ref, fields, points))
+                self._post(lambda c=i + 1, t=len(rows): self.status_var.set(
+                    f"导出解析 {c}/{t}"))
 
             if pipe_rows:
                 ws = wb.create_sheet("PIPELINE")
-                # 列标题（移除 FILENAME）
-                headers = ["REFERENCE", "PIPINGSPEC", "INSULATIONSPEC", "PAINTINGSPEC", "TRACINGSPEC"]
-                headers.extend(attribute_names)
+                headers = ["REFERENCE", "FILE"] + pipe_keys
                 for j, h in enumerate(headers):
                     ws.cell(row=1, column=j + 1, value=h)
+                for i, pr in enumerate(pipe_rows):
+                    ws.cell(row=i + 2, column=1, value=pr["REFERENCE"])
+                    ws.cell(row=i + 2, column=2, value=pr["FILE"])
+                    for j, k in enumerate(pipe_keys):
+                        ws.cell(row=i + 2, column=3 + j,
+                                value=self._safe_str(pr["values"].get(k)))
+            for comp_type, data in comp_data.items():
+                ws = wb.create_sheet(comp_type[:31])
+                headers = ["REFERENCE"] + data["keys"]
+                for j, h in enumerate(headers):
+                    ws.cell(row=1, column=j + 1, value=h)
+                for i, (ref, fields, points) in enumerate(data["rows"]):
+                    ws.cell(row=i + 2, column=1, value=ref)
+                    for j, k in enumerate(data["keys"]):
+                        v = fields.get(k, points.get(k))
+                        ws.cell(row=i + 2, column=2 + j, value=self._safe_str(v))
 
-                for i, prow in enumerate(pipe_rows):
-                    ws.cell(row=i + 2, column=1, value=self._safe_str(prow[1]))
-                    ws.cell(row=i + 2, column=2, value=self._safe_str(prow[2]))
-                    ws.cell(row=i + 2, column=3, value=self._safe_str(prow[3]))
-                    ws.cell(row=i + 2, column=4, value=self._safe_str(prow[4]))
-                    ws.cell(row=i + 2, column=5, value=self._safe_str(prow[5]))
-
-                    # 从内存分组取属性
-                    pipeline_uci = f"PIPELINE:{self._safe_str(prow[1])}"
-                    attrs = attrs_by_uci.get(pipeline_uci, {})
-                    for j, attr_name in enumerate(attribute_names):
-                        ws.cell(row=i + 2, column=6 + j,
-                                value=self._safe_str(attrs.get(attr_name)))
-
-            # ========== 组件表 ==========
-            for comp_type in self.COMPONENT_TYPES:
-                view_name = "X_UNION" if comp_type == "_UNION" else f"X{comp_type}"
-                cols, rows = self.db_helper.fill_data_table(f"SELECT * FROM {view_name}")
-                if rows and "FILENAME" in cols:
-                    ws = wb.create_sheet(comp_type)
-                    # 移除 FILENAME 列
-                    file_idx = cols.index("FILENAME")
-                    display_cols = [c for i, c in enumerate(cols) if i != file_idx]
-
-                    # 列标题
-                    for j, h in enumerate(display_cols):
-                        ws.cell(row=1, column=j + 1, value=h)
-
-                    # 数据行
-                    for i, drow in enumerate(rows):
-                        for j, val in enumerate(drow):
-                            if j == file_idx:
-                                continue
-                            col_idx = j if j < file_idx else j - 1
-                            ws.cell(row=i + 2, column=col_idx + 1, value=self._safe_str(val))
-
-            # 保存文件
             wb.save(output_path)
-            messagebox.showinfo("成功", "成功输出文本到Excel！")
 
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
+            def done():
+                self._exporting = False
+                self.status_var.set("导出完成")
+                messagebox.showinfo("成功", "成功输出文本到Excel！")
+            self._post(done)
+        except Exception:
+            err = traceback.format_exc()
+
+            def fail():
+                self._exporting = False
+                self.status_var.set("导出失败")
+                messagebox.showerror("错误", err[-1500:])
+            self._post(fail)
 
     # ==================== 辅助方法 ====================
 

@@ -129,50 +129,6 @@ def _write_cuts_csv(result, doc, path: Path, encoding: str = "utf-8-sig") -> Pat
 
 # ========== 渲染入口 ==========
 
-def sources_from_db(db_path):
-    """从收集数据库读取导入来源，返回 (源文件夹, [PCF 绝对路径...])，无法定位时返回 None。
-
-    优先读 IMPORT_INFO 表（SOURCE-FOLDER / SOURCE-FILES，新版导入时写入）；
-    旧库没有该表时回退：数据库所在目录即源文件夹，递归收集其中的 .pcf。
-    """
-    import sqlite3
-
-    if not db_path or not os.path.isfile(db_path):
-        return None
-
-    folder = None
-    rel_files = []
-    try:
-        conn = sqlite3.connect(db_path)
-        try:
-            rows = dict(conn.execute("SELECT KEY, VALUE FROM IMPORT_INFO").fetchall())
-            folder = rows.get("SOURCE-FOLDER")
-            rel_files = [n.strip() for n in (rows.get("SOURCE-FILES") or "").splitlines() if n.strip()]
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        folder = None
-
-    if not folder or not os.path.isdir(folder):
-        # 旧库回退：收集器默认把数据库建在源文件夹里
-        folder = os.path.dirname(os.path.abspath(db_path))
-        if not any(folder and os.path.isfile(os.path.join(r, f))
-                   for r, _, fs in os.walk(folder) for f in fs if f.lower().endswith(".pcf")):
-            return None
-        rel_files = []
-
-    if rel_files:
-        files = [os.path.join(folder, rel) for rel in rel_files]
-        files = [f for f in files if os.path.isfile(f) and f.lower().endswith(".pcf")]
-    else:
-        files = sorted(os.path.join(r, f)
-                       for r, _, fs in os.walk(folder)
-                       for f in fs if f.lower().endswith(".pcf"))
-    if not files:
-        return None
-    return folder, files
-
-
 def collect_pcf_files(paths) -> list[Path]:
     """展开文件/目录参数为排序后的 .pcf 文件列表"""
     out = []
