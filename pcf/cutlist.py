@@ -20,7 +20,8 @@ bore, direction) so a fitter can lay out the piece without the drawing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 
 from . import geometry
 from .model import Component, PcfDocument, Point
@@ -57,7 +58,7 @@ class CutPiece:
     bore: float | None
     end1: Point
     end2: Point
-    raw_length: float               # native units, |EP1-EP2|
+    raw_length: float               # native units; 弯制合并件 = 直段长 + 弯段弧长
     cut_length: float               # native units, after overrides/allowances
     length_source: str              # geometry | cut-piece-length | allowance
     direction: str
@@ -155,6 +156,184 @@ def _branches_on(
     return out
 
 
+def bend_arc_len(comp: Component) -> float:
+    """弯段弧长（原生单位）：R·θ。END-POINT=切点、CENTRE-POINT=圆心、
+    ANGLE 属性=角度×100（"9000"→90°）。缺角度回退弦长反解圆心角，
+    缺圆心/半径回退弦长。"""
+    eps = comp.end_points
+    if len(eps) < 2:
+        return 0.0
+    ctr = comp.centre_points
+    radius = ctr[0].distance_to(eps[0]) if ctr else None
+    try:
+        angle = float((comp.get("ANGLE") or "").split()[0]) / 100.0
+    except (ValueError, IndexError, AttributeError):
+        angle = None
+    if radius and radius > 1e-9:
+        if angle:
+            return radius * math.radians(angle)
+        chord = eps[0].distance_to(eps[1])
+        if chord <= 2 * radius:
+            return radius * 2.0 * math.asin(chord / (2.0 * radius))
+    return eps[0].distance_to(eps[1])
+
+
+class _UnionFind:
+    def __init__(self, n: int) -> None:
+        self.parent = list(range(n))
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def _merge_bent_piece(
+    members: list[int],
+    bends: list[int],
+    comps: list[Component],
+    pipeline: str,
+    graph: geometry.ConnectivityGraph,
+    doc: PcfDocument,
+    tolerance: float,
+    inch_factor: float,
+) -> CutPiece | None:
+    """把同一根弯制整管的直段与弯段合成一件下料（CutPiece）。
+
+    从一个自由端（不与组内弯段相接的管端）沿"直段→弯段→直段"走链到另一
+    自由端，raw_length = Σ直段弦长 + Σ弯段弧长；CUT-PIECE-LENGTH 整根值
+    优先（各记录共享同一值，取一次即可，逐记录累加会重复计料）。走链失败
+    返回 None，调用方回退逐记录出件。
+    """
+    pipe_eps = {i: comps[i].end_points for i in members}
+    bend_eps = {i: comps[i].end_points for i in bends}
+    if any(len(eps) < 2 for eps in pipe_eps.values()) \
+            or any(len(eps) < 2 for eps in bend_eps.values()):
+        return None
+
+    def near(p: Point, q: Point) -> bool:
+        return p.distance_to(q) <= tolerance
+
+    # 自由端：不与组内任何弯段端点相接的管端
+    free = [(i, ep) for i in members for ep in pipe_eps[i]
+            if not any(near(ep, bep) for b in bends for bep in bend_eps[b])]
+    if len(free) != 2:
+        return None
+
+    cur_i, start_pt = free[0]
+    used_pipes = {cur_i}
+    used_bends: set[int] = set()
+    chain: list[tuple[str, int, Point, Point]] = []
+    while True:
+        eps = pipe_eps[cur_i]
+        if near(eps[0], start_pt if not chain else chain[-1][3]):
+            seg_from, seg_to = eps[0], eps[1]
+        elif near(eps[1], start_pt if not chain else chain[-1][3]):
+            seg_from, seg_to = eps[1], eps[0]
+        else:
+            return None  # 走链脱节
+        chain.append(("pipe", cur_i, seg_from, seg_to))
+        # 接在这条直段远端的组内弯段
+        nxt_bend = next((b for b in bends if b not in used_bends
+                         and (near(bend_eps[b][0], seg_to)
+                              or near(bend_eps[b][1], seg_to))), None)
+        if nxt_bend is None:
+            end_pt = seg_to  # 到达整管另一自由端
+            break
+        used_bends.add(nxt_bend)
+        beps = bend_eps[nxt_bend]
+        bend_to = beps[1] if near(beps[0], seg_to) else beps[0]
+        chain.append(("bend", nxt_bend, seg_to, bend_to))
+        # 弯段另一端接下一直段
+        nxt_pipe = next((i for i in members if i not in used_pipes
+                         and (near(pipe_eps[i][0], bend_to)
+                              or near(pipe_eps[i][1], bend_to))), None)
+        if nxt_pipe is None:
+            return None
+        cur_i = nxt_pipe
+        used_pipes.add(cur_i)
+    if used_pipes != set(members) or used_bends != set(bends):
+        return None  # 组内有成员没走到（分叉/悬空）：不硬并
+
+    raw_length = 0.0
+    branches: list[BranchInfo] = []
+    for kind, i, frm, to in chain:
+        if kind == "pipe":
+            # 分支位置从链方向上的近端量起，换算到整管自由端 1
+            base = frm.distance_to(comps[i].end_points[0])
+            for br in _branches_on(comps[i], comps, doc.units_bore, tolerance):
+                branches.append(replace(
+                    br, distance_from_end1=raw_length + base + br.distance_from_end1))
+            raw_length += frm.distance_to(to)
+        else:
+            raw_length += bend_arc_len(comps[i])
+    branches.sort(key=lambda br: br.distance_from_end1)
+
+    length_source = "geometry"
+    cut_length = raw_length
+    # 整根下料长：任一记录的 CUT-PIECE-LENGTH（同 UCI 各记录共享同一值）
+    for i in (*members, *bends):
+        override = comps[i].get("CUT-PIECE-LENGTH")
+        if override is not None:
+            try:
+                cut_length = float(override.split()[0])
+                length_source = "cut-piece-length"
+                break
+            except (ValueError, IndexError):
+                pass
+    if length_source == "geometry":
+        added = False
+        for i in members:
+            for allowance in comps[i].get_all("CUT-PIECE-ALLOWANCE"):
+                tokens = allowance.split()
+                if len(tokens) >= 2:
+                    try:
+                        cut_length += float(tokens[1])
+                        added = True
+                    except ValueError:
+                        pass
+        if added:
+            length_source = "allowance"
+
+    first_i, last_i = chain[0][1], chain[-1][1]
+    info1 = _end_info(comps[first_i], chain[0][2], comps, graph, first_i,
+                      tolerance, inch_factor)
+    info2 = _end_info(comps[last_i], chain[-1][3], comps, graph, last_i,
+                      tolerance, inch_factor)
+
+    # 方向/锚定记录取最长直段（弯制件整体方向无意义，锚在图上最长一段）
+    longest = max(members, key=lambda i: pipe_eps[i][0].distance_to(pipe_eps[i][1]))
+    lcomp = comps[longest]
+    bore = chain[0][2].bore if chain[0][2].bore is not None else lcomp.bore
+    return CutPiece(
+        label="",
+        item_code=lcomp.item_code,
+        description=lcomp.description,
+        pipeline=pipeline,
+        spool=lcomp.get("SPOOL-IDENTIFIER"),
+        nps=format_bore(bore, doc.units_bore) if bore is not None else "?",
+        bore=bore,
+        end1=chain[0][2],
+        end2=end_pt,
+        raw_length=raw_length,
+        cut_length=cut_length,
+        length_source=length_source,
+        direction=geometry.direction_name(geometry.sub(
+            pipe_eps[longest][1].xyz, pipe_eps[longest][0].xyz)),
+        end1_info=info1,
+        end2_info=info2,
+        branches=branches,
+        uci=next((comps[i].uci for i in (*members, *bends) if comps[i].uci), None),
+        comp_index=longest,
+    )
+
+
 def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]:
     """Compute cut pieces for every PIPE-class fabrication component.
 
@@ -174,15 +353,53 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
 
     graph = geometry.ConnectivityGraph(comps, tolerance)
 
-    pieces: list[CutPiece] = []
+    # 弯制整管合并：SP3D 把一根整料弯管按弯拆成多条 PIPE/BEND 记录，共享
+    # 同一 UCI 与同一 CUT-PIECE-LENGTH（整根下料长、含弧段），段间无焊缝
+    # （弯制非焊接）。同料号、同 SPOOL、经弯段相连的直管并成一件下料
+    # （直段长 + 弯段弧长）；独立弯头（料号不属管材）照旧单列。
+    pipe_codes = {c.item_code for c in comps
+                  if classify(c.type, c.skey) == "PIPE" and c.item_code}
+    uf = _UnionFind(len(comps))
     for idx, comp in enumerate(comps):
-        if classify(comp.type, comp.skey) != "PIPE":
+        if classify(comp.type, comp.skey) != "ELBOW":
+            continue
+        if comp.material_excluded() or not comp.item_code \
+                or comp.item_code not in pipe_codes:
+            continue  # 真弯头或边界副本：不并
+        spool = comp.get("SPOOL-IDENTIFIER")
+        for nidx in graph.neighbours(idx):
+            other = comps[nidx]
+            if classify(other.type, other.skey) != "PIPE" \
+                    or other.material_excluded() \
+                    or other.item_code != comp.item_code \
+                    or other.get("SPOOL-IDENTIFIER") != spool:
+                continue
+            uf.union(idx, nidx)
+    groups: dict[int, list[int]] = {}
+    for i in range(len(comps)):
+        groups.setdefault(uf.find(i), []).append(i)
+
+    pieces: list[CutPiece] = []
+    emitted: set[int] = set()
+    for idx, comp in enumerate(comps):
+        if classify(comp.type, comp.skey) != "PIPE" or idx in emitted:
             continue
         if comp.material_excluded():
             continue  # 对侧边界直管副本（CONTINUATION/EXCLUDE），不进本图切割表
         eps = comp.end_points
         if len(eps) < 2:
             continue
+        group = groups[uf.find(idx)]
+        if len(group) > 1:
+            cls_of = lambda i: classify(comps[i].type, comps[i].skey)
+            merged = _merge_bent_piece(
+                [i for i in group if cls_of(i) == "PIPE"],
+                [i for i in group if cls_of(i) == "ELBOW"],
+                comps, pipeline_of[idx], graph, doc, tolerance, inch_factor)
+            if merged is not None:
+                pieces.append(merged)
+                emitted.update(group)
+                continue
         end1, end2 = eps[0], eps[1]
         raw_length = end1.distance_to(end2)
 

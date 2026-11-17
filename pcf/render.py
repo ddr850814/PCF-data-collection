@@ -23,7 +23,7 @@ from pathlib import Path
 
 from . import geometry
 from .continuations import Continuation, reference_names
-from .cutlist import CutPiece, build_cutlist
+from .cutlist import CutPiece, bend_arc_len, build_cutlist
 from .dims import (DEFAULT_OFFSET_MM, Dimension, flange_face,
                    infer_dimensions, load_sidecar, merge_with_sidecar)
 from .model import Component, PcfDocument, Point
@@ -1283,6 +1283,9 @@ def _measure_chain(doc: PcfDocument, comps: list[tuple[Component, str]],
     delta = chain[0]
     pos = info["pos"]
     materials = doc.materials_descriptions()
+    # 与 _build_bom 同一弯段合并口径（单一来源契约）
+    pipe_codes = {c.item_code for c, _ in comps
+                  if c.item_code and _bom_class(c) == "PIPE"}
     boxes: list = []
     pts_list: list = []
     pipes: list[bool] = []
@@ -1319,7 +1322,7 @@ def _measure_chain(doc: PcfDocument, comps: list[tuple[Component, str]],
             boxes.append((x0, y0, x1, y1))
         else:
             boxes.append(None)
-        bom_keys.append(_bom_row_key(comp, materials))
+        bom_keys.append(_bom_row_key(comp, materials, pipe_codes))
     sheet_info = SheetInfo(boxes=boxes, pts=pts_list, pipes=pipes,
                            pipe_axes=pipe_axes, bom_keys=bom_keys, pos=pos)
     return delta, sheet_info
@@ -5971,15 +5974,20 @@ def _bom_class(comp: Component) -> str:
     return classify(comp.type, comp.skey)
 
 
-def _bom_key(comp: Component) -> tuple:
-    return (_bom_class(comp), comp.item_code or "?",
+def _bom_key(comp: Component, cls: str | None = None) -> tuple:
+    if cls is None:
+        cls = _bom_class(comp)
+    return (cls, comp.item_code or "?",
             (comp.description or "").strip().lower())
 
 
-def _bom_row_key(comp: Component, materials: dict[str, str]) -> tuple | None:
+def _bom_row_key(comp: Component, materials: dict[str, str],
+                 pipe_codes: set[str] | None = None) -> tuple | None:
     """该组件是否进 BOM；进则返回行 key，不进返回 None。
 
     与 _build_bom 同一过滤（单一来源），分页装箱也用它估每页行数。
+    pipe_codes：本文档作管道计的 ITEM-CODE 集——弯制整管的弯段记录
+    （ELBOW 类、料号属管材）按 PIPE 重分类并入管材行。
     """
     cls = _bom_class(comp)
     if cls in ("CONNECTION", "MESSAGE", "GAP"):
@@ -5999,19 +6007,27 @@ def _bom_row_key(comp: Component, materials: dict[str, str]) -> tuple | None:
     desc = comp.description or materials.get(comp.item_code or "", "")
     if is_annotation_symbol(comp.type, desc, comp.skey):
         return None  # a slope arrow is a drawing mark, not material
-    return _bom_key(comp)
+    if cls == "ELBOW" and pipe_codes and comp.item_code in pipe_codes:
+        cls = "PIPE"  # 弯制整管的弯段：并入同料号管材行，不单列弯头
+    return _bom_key(comp, cls)
 
 
 def _build_bom(doc: PcfDocument, comps: list[tuple[Component, str]]) -> dict:
     inch_factor = coord_to_inch_factor(doc.units_coords)
     materials = doc.materials_descriptions()
+    # 弯制整管：弯段记录（ELBOW 类）的料号与直管相同 → 并入管材行
+    pipe_codes = {c.item_code for c, _ in comps
+                  if c.item_code and _bom_class(c) == "PIPE"}
     rows: dict[tuple, dict] = {}
     order = 0
     for idx, (comp, _ref) in enumerate(comps):
         cls = _bom_class(comp)
-        if _bom_row_key(comp, materials) is None:
+        merged_bend = cls == "ELBOW" and comp.item_code in pipe_codes
+        if merged_bend:
+            cls = "PIPE"
+        if _bom_row_key(comp, materials, pipe_codes) is None:
             continue
-        key = _bom_key(comp)
+        key = _bom_key(comp, cls)
         row = rows.get(key)
         if row is None:
             bore = comp.bore
@@ -6026,16 +6042,21 @@ def _build_bom(doc: PcfDocument, comps: list[tuple[Component, str]]) -> dict:
                 "_callout_ids": set(), "_ucis": set(),
             }
             order += 1
-        row["qty"] += 1
+        if not merged_bend:
+            row["qty"] += 1  # 弯段是整管的弧段不是独立件：不增数量
         row["_callout_ids"].add(idx)
         if comp.uci:
             row["_ucis"].add(comp.uci)
         if comp.weight:
             row["weight"] += comp.weight
         if cls == "PIPE":
-            eps = comp.end_points
-            if len(eps) >= 2:
-                row["length_in"] += eps[0].distance_to(eps[1]) * inch_factor
+            if merged_bend:
+                # 弯段按弧长入账（R·θ），端点弦距会低估材料
+                row["length_in"] += bend_arc_len(comp) * inch_factor
+            else:
+                eps = comp.end_points
+                if len(eps) >= 2:
+                    row["length_in"] += eps[0].distance_to(eps[1]) * inch_factor
     return rows
 
 
