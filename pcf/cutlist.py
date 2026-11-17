@@ -206,65 +206,56 @@ def _merge_bent_piece(
 ) -> CutPiece | None:
     """把同一根弯制整管的直段与弯段合成一件下料（CutPiece）。
 
-    从一个自由端（不与组内弯段相接的管端）沿"直段→弯段→直段"走链到另一
-    自由端，raw_length = Σ直段弦长 + Σ弯段弧长；CUT-PIECE-LENGTH 整根值
-    优先（各记录共享同一值，取一次即可，逐记录累加会重复计料）。走链失败
-    返回 None，调用方回退逐记录出件。
+    组内成员按端点吸附连成一条链后从头走到尾（允许两弯段切点直连、
+    链端落在弯段上），raw_length = Σ直段弦长 + Σ弯段弧长；CUT-PIECE-LENGTH
+    整根值优先（各记录共享同一值，取一次即可，逐记录累加会重复计料）。
+    不是单链（分叉/闭环/脱节）返回 None，调用方回退逐记录出件。
     """
-    pipe_eps = {i: comps[i].end_points for i in members}
-    bend_eps = {i: comps[i].end_points for i in bends}
-    if any(len(eps) < 2 for eps in pipe_eps.values()) \
-            or any(len(eps) < 2 for eps in bend_eps.values()):
-        return None
+    group = [*members, *bends]
+    eps = {i: comps[i].end_points for i in group}
+    if any(len(e) < 2 for e in eps.values()) \
+            or any(eps[i][0].distance_to(eps[i][1]) <= tolerance for i in group):
+        return None  # 端点不全或零长退化件：不硬并
 
     def near(p: Point, q: Point) -> bool:
         return p.distance_to(q) <= tolerance
 
-    # 自由端：不与组内任何弯段端点相接的管端
-    free = [(i, ep) for i in members for ep in pipe_eps[i]
-            if not any(near(ep, bep) for b in bends for bep in bend_eps[b])]
-    if len(free) != 2:
+    # 端点吸附成节点：同坐标的组内端点归同一节点，节点度=所挂端点数。
+    # 单链判定：全部节点度≤2 且恰好两个度 1（链的两端）。
+    end_node: dict[tuple[int, int], int] = {}
+    nodes: list[list[tuple[int, int]]] = []
+    for i in group:
+        for k, p in enumerate(eps[i]):
+            nid = next((n for n, occ in enumerate(nodes)
+                        if near(p, eps[occ[0][0]][occ[0][1]])), None)
+            if nid is None:
+                nid = len(nodes)
+                nodes.append([])
+            nodes[nid].append((i, k))
+            end_node[(i, k)] = nid
+    ends = [n for n, occ in enumerate(nodes) if len(occ) == 1]
+    if any(len(occ) > 2 for occ in nodes) or len(ends) != 2:
         return None
 
-    cur_i, start_pt = free[0]
-    used_pipes = {cur_i}
-    used_bends: set[int] = set()
-    chain: list[tuple[str, int, Point, Point]] = []
+    chain: list[tuple[int, Point, Point]] = []
+    used: set[int] = set()
+    nid = ends[0]
     while True:
-        eps = pipe_eps[cur_i]
-        if near(eps[0], start_pt if not chain else chain[-1][3]):
-            seg_from, seg_to = eps[0], eps[1]
-        elif near(eps[1], start_pt if not chain else chain[-1][3]):
-            seg_from, seg_to = eps[1], eps[0]
-        else:
-            return None  # 走链脱节
-        chain.append(("pipe", cur_i, seg_from, seg_to))
-        # 接在这条直段远端的组内弯段
-        nxt_bend = next((b for b in bends if b not in used_bends
-                         and (near(bend_eps[b][0], seg_to)
-                              or near(bend_eps[b][1], seg_to))), None)
-        if nxt_bend is None:
-            end_pt = seg_to  # 到达整管另一自由端
-            break
-        used_bends.add(nxt_bend)
-        beps = bend_eps[nxt_bend]
-        bend_to = beps[1] if near(beps[0], seg_to) else beps[0]
-        chain.append(("bend", nxt_bend, seg_to, bend_to))
-        # 弯段另一端接下一直段
-        nxt_pipe = next((i for i in members if i not in used_pipes
-                         and (near(pipe_eps[i][0], bend_to)
-                              or near(pipe_eps[i][1], bend_to))), None)
-        if nxt_pipe is None:
-            return None
-        cur_i = nxt_pipe
-        used_pipes.add(cur_i)
-    if used_pipes != set(members) or used_bends != set(bends):
-        return None  # 组内有成员没走到（分叉/悬空）：不硬并
+        i, k = next(o for o in nodes[nid] if o[0] not in used)
+        used.add(i)
+        chain.append((i, eps[i][k], eps[i][1 - k]))
+        far = end_node[(i, 1 - k)]
+        if len(nodes[far]) == 1:
+            break  # 到达另一链端
+        nid = far
+    if used != set(group):
+        return None  # 走完仍有成员没挂上（脱节的第二条链）：不硬并
 
+    member_set = set(members)
     raw_length = 0.0
     branches: list[BranchInfo] = []
-    for kind, i, frm, to in chain:
-        if kind == "pipe":
+    for i, frm, to in chain:
+        if i in member_set:
             # 分支位置从链方向上的近端量起，换算到整管自由端 1
             base = frm.distance_to(comps[i].end_points[0])
             for br in _branches_on(comps[i], comps, doc.units_bore, tolerance):
@@ -289,7 +280,7 @@ def _merge_bent_piece(
                 pass
     if length_source == "geometry":
         added = False
-        for i in members:
+        for i in group:
             for allowance in comps[i].get_all("CUT-PIECE-ALLOWANCE"):
                 tokens = allowance.split()
                 if len(tokens) >= 2:
@@ -301,16 +292,16 @@ def _merge_bent_piece(
         if added:
             length_source = "allowance"
 
-    first_i, last_i = chain[0][1], chain[-1][1]
-    info1 = _end_info(comps[first_i], chain[0][2], comps, graph, first_i,
+    first_i, last_i = chain[0][0], chain[-1][0]
+    info1 = _end_info(comps[first_i], chain[0][1], comps, graph, first_i,
                       tolerance, inch_factor)
-    info2 = _end_info(comps[last_i], chain[-1][3], comps, graph, last_i,
+    info2 = _end_info(comps[last_i], chain[-1][2], comps, graph, last_i,
                       tolerance, inch_factor)
 
-    # 方向/锚定记录取最长直段（弯制件整体方向无意义，锚在图上最长一段）
-    longest = max(members, key=lambda i: pipe_eps[i][0].distance_to(pipe_eps[i][1]))
+    # 方向/锚定记录取最长成员（弯制件整体方向无意义，锚在图上最长一段）
+    longest = max(group, key=lambda i: eps[i][0].distance_to(eps[i][1]))
     lcomp = comps[longest]
-    bore = chain[0][2].bore if chain[0][2].bore is not None else lcomp.bore
+    bore = chain[0][1].bore if chain[0][1].bore is not None else lcomp.bore
     return CutPiece(
         label="",
         item_code=lcomp.item_code,
@@ -319,13 +310,13 @@ def _merge_bent_piece(
         spool=lcomp.get("SPOOL-IDENTIFIER"),
         nps=format_bore(bore, doc.units_bore) if bore is not None else "?",
         bore=bore,
-        end1=chain[0][2],
-        end2=end_pt,
+        end1=chain[0][1],
+        end2=chain[-1][2],
         raw_length=raw_length,
         cut_length=cut_length,
         length_source=length_source,
         direction=geometry.direction_name(geometry.sub(
-            pipe_eps[longest][1].xyz, pipe_eps[longest][0].xyz)),
+            eps[longest][1].xyz, eps[longest][0].xyz)),
         end1_info=info1,
         end2_info=info2,
         branches=branches,
@@ -413,7 +404,8 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
     # 弯制整管合并：SP3D 把一根整料弯管按弯拆成多条 PIPE/BEND 记录，共享
     # 同一 UCI 与同一 CUT-PIECE-LENGTH（整根下料长、含弧段），段间无焊缝
     # （弯制非焊接）。同料号、同 SPOOL、经弯段相连的直管并成一件下料
-    # （直段长 + 弯段弧长）；独立弯头（料号不属管材）照旧单列。
+    # （直段长 + 弯段弧长）；两弯段切点直连（中间零直管）也算同根。
+    # 独立弯头（料号不属管材）照旧单列。
     pipe_codes = {c.item_code for c in comps
                   if classify(c.type, c.skey) == "PIPE" and c.item_code}
     uf = _UnionFind(len(comps))
@@ -426,7 +418,9 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
         spool = comp.get("SPOOL-IDENTIFIER")
         for nidx in graph.neighbours(idx):
             other = comps[nidx]
-            if classify(other.type, other.skey) != "PIPE" \
+            ncls = classify(other.type, other.skey)
+            # 邻居接受同料号直管或同料号弯制段（两弯直连中间零直管也同根）
+            if ncls not in ("PIPE", "ELBOW") \
                     or other.material_excluded() \
                     or other.item_code != comp.item_code \
                     or other.get("SPOOL-IDENTIFIER") != spool:
