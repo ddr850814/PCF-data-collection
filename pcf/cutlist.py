@@ -334,8 +334,65 @@ def _merge_bent_piece(
     )
 
 
+def _bend_piece(
+    comp: Component,
+    idx: int,
+    pipeline: str,
+    comps: list[Component],
+    graph: geometry.ConnectivityGraph,
+    doc: PcfDocument,
+    tolerance: float,
+    inch_factor: float,
+) -> CutPiece:
+    """孤立弯制段单独出件：默认长度取弧长 R·θ，CUT-PIECE-LENGTH 优先。"""
+    eps = comp.end_points
+    end1, end2 = eps[0], eps[1]
+    raw_length = bend_arc_len(comp)
+    length_source = "geometry"
+    cut_length = raw_length
+    override = comp.get("CUT-PIECE-LENGTH")
+    if override is not None:
+        try:
+            cut_length = float(override.split()[0])
+            length_source = "cut-piece-length"
+        except (ValueError, IndexError):
+            pass
+    if length_source == "geometry":
+        for allowance in comp.get_all("CUT-PIECE-ALLOWANCE"):
+            tokens = allowance.split()
+            if len(tokens) >= 2:
+                try:
+                    cut_length += float(tokens[1])
+                    length_source = "allowance"
+                except ValueError:
+                    pass
+    bore = end1.bore if end1.bore is not None else comp.bore
+    return CutPiece(
+        label="",
+        item_code=comp.item_code,
+        description=comp.description,
+        pipeline=pipeline,
+        spool=comp.get("SPOOL-IDENTIFIER"),
+        nps=format_bore(bore, doc.units_bore) if bore is not None else "?",
+        bore=bore,
+        end1=end1,
+        end2=end2,
+        raw_length=raw_length,
+        cut_length=cut_length,
+        length_source=length_source,
+        direction=geometry.direction_name(geometry.sub(end2.xyz, end1.xyz)),
+        end1_info=_end_info(comp, end1, comps, graph, idx, tolerance, inch_factor),
+        end2_info=_end_info(comp, end2, comps, graph, idx, tolerance, inch_factor),
+        branches=_branches_on(comp, comps, doc.units_bore, tolerance),
+        uci=comp.uci,
+        comp_index=idx,
+    )
+
+
 def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]:
-    """Compute cut pieces for every PIPE-class fabrication component.
+    """Compute cut pieces for every PIPE-class fabrication component, plus
+    standalone BEND segments (bent-tube records with no same-code pipe on
+    either side emit their own row so no material is lost).
 
     extra_gap: native-unit gap subtracted per end that has a zero-length
     WELD record (classic Isogen dialect). Leave at 0 when gaps are already
@@ -382,7 +439,21 @@ def build_cutlist(doc: PcfDocument, *, extra_gap: float = 0.0) -> list[CutPiece]
     pieces: list[CutPiece] = []
     emitted: set[int] = set()
     for idx, comp in enumerate(comps):
-        if classify(comp.type, comp.skey) != "PIPE" or idx in emitted:
+        cls = classify(comp.type, comp.skey)
+        if cls == "ELBOW":
+            # 没并进任何整料件的弯制段（两边没有同料号直管，或走链回退）：
+            # 单独一行出件——它是弯制管材不是采购弯头，下料必须有它。
+            if idx in emitted or comp.material_excluded():
+                continue
+            if comp.type.upper() != "BEND":
+                continue  # 采购弯头（ELBOW/ELBW 等）：管件不下料，只进 BOM
+            eps = comp.end_points
+            if len(eps) < 2:
+                continue
+            pieces.append(_bend_piece(comp, idx, pipeline_of[idx], comps,
+                                      graph, doc, tolerance, inch_factor))
+            continue
+        if cls != "PIPE" or idx in emitted:
             continue
         if comp.material_excluded():
             continue  # 对侧边界直管副本（CONTINUATION/EXCLUDE），不进本图切割表
