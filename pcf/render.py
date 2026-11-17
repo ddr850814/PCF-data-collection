@@ -4518,10 +4518,16 @@ def _across_v(proj: "Projector | None", run3: tuple | None,
     优先取管轴分量最小的世界轴：纯 X/Y/Z 管仍沿用原来的横轴规则，
     X/Z 空间斜管则稳定跨 Y。不能用“最大分量”决定横轴——理论等长的
     两个斜管分量只要有浮点尾数差，阀与法兰就会跨到不同世界轴。
+    排序前先把主轴万分之一以下的分量归零：纯轴管两端坐标常带
+    0.001mm 级浮点尾差（如 run3=(0.001,-178,0)），不量化会让 Z 排到
+    X 之前、符号横向被竖直轴接管，与相邻法兰/管口的横向族不一致。
     """
     if proj is None or run3 is None or wp is None:
         return None
-    for axis in sorted(range(3), key=lambda i: (abs(run3[i]), i)):
+    main = max(abs(c) for c in run3) if run3 else 0.0
+    weights = tuple(0.0 if abs(c) <= main * 1e-4 else abs(c) for c in run3) \
+        if main > 0 else (0.0, 0.0, 0.0)
+    for axis in sorted(range(3), key=lambda i: (weights[i], i)):
         across = tuple(1.0 if i == axis else 0.0 for i in range(3))
         # 点偏移只平移最终图面位置；方向两点必须同时取原始投影，
         # 否则单侧偏移会被误算成旋转。
